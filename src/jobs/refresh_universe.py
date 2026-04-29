@@ -268,3 +268,145 @@ def run(now: dt.datetime, sources: UniverseSources) -> SnapshotResult:
     )
 
 
+# ---------------------------------------------------------------------------
+# CLI shim — `python -m jobs.refresh_universe` (S2.2 follow-up; runs from
+# `ops/systemd/quinn-universe.service` on the daily timer + invoked manually
+# during local rehydration when `Universe.load_latest()` raises
+# `NoUniverseSnapshot`).
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_DB_PATH = "/var/lib/quinn/journal.db"
+
+
+def cli_main(
+    *,
+    argv: list[str] | None = None,
+    sec_fetcher: Callable[[], list[SecTicker]] | None = None,
+    alpaca_fetcher: Callable[[], list[AlpacaAsset]] | None = None,
+    market_data: MarketDataProvider | None = None,
+    clock: Callable[[], dt.datetime] | None = None,
+) -> int:
+    """Entrypoint for `python -m jobs.refresh_universe`. Returns the
+    process exit code.
+
+    Test seam: `sec_fetcher`, `alpaca_fetcher`, `market_data`, and `clock`
+    are injectable. Production calls with all four as None, which lazy-
+    builds the real SEC/Alpaca/yfinance dependencies from `Secrets` +
+    `AppConfig`. The lazy build is required so module import (and the
+    test suite) does not require `alpaca-py` or live secrets.
+
+    Exit codes:
+      0 — snapshot written, idempotent replay, or any other healthy run
+      2 — `run()` returned wrote=False with reason
+          `consecutive_degraded_threshold` (the operator-visible failure
+          mode: ≥ 3 prior consecutive degraded days + another degraded
+          day, per ADR-006 §4)
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="jobs.refresh_universe",
+        description="Run the daily universe refresh (SEC + Alpaca + yfinance).",
+    )
+    parser.add_argument("--db", default=_DEFAULT_DB_PATH)
+    parser.add_argument(
+        "--edgar-user-agent",
+        default=None,
+        help="Override the SEC User-Agent (default: read from quinn.toml).",
+    )
+    args = parser.parse_args(argv)
+
+    now = (clock or (lambda: dt.datetime.now(dt.UTC)))()
+    sec_call, alpaca_call, md = _resolve_sources(
+        sec_fetcher=sec_fetcher,
+        alpaca_fetcher=alpaca_fetcher,
+        market_data=market_data,
+        edgar_user_agent_override=args.edgar_user_agent,
+    )
+    sources = UniverseSources(
+        db_path=args.db,
+        fetch_sec_tickers=sec_call,
+        fetch_alpaca_assets=alpaca_call,
+        market_data=md,
+    )
+
+    result = run(now=now, sources=sources)
+    if not result.wrote and result.reason == "consecutive_degraded_threshold":
+        log.error(
+            "universe.cli_failed",
+            extra={
+                "event": "universe.cli_failed",
+                "reason": result.reason,
+                "yfinance_failures": result.yfinance_failures,
+            },
+        )
+        return 2
+    return 0
+
+
+def _resolve_sources(
+    *,
+    sec_fetcher: Callable[[], list[SecTicker]] | None,
+    alpaca_fetcher: Callable[[], list[AlpacaAsset]] | None,
+    market_data: MarketDataProvider | None,
+    edgar_user_agent_override: str | None,
+) -> tuple[
+    Callable[[], list[SecTicker]],
+    Callable[[], list[AlpacaAsset]],
+    MarketDataProvider,
+]:
+    """Return (sec_call, alpaca_call, market_data). Test path injects all
+    three; production path lazy-builds them from `Secrets` + `AppConfig`.
+
+    `alpaca-py`, `load_secrets`, `load_config`, and `YFinanceProvider`
+    are imported inside the production branch so module import stays
+    cheap and test runs need neither secrets nor `alpaca-py`."""
+    if (
+        sec_fetcher is not None
+        and alpaca_fetcher is not None
+        and market_data is not None
+    ):
+        return sec_fetcher, alpaca_fetcher, market_data
+
+    from config.loader import load_config
+    from config.secrets import load_secrets
+    from universe.alpaca_assets import fetch_alpaca_assets as alpaca_fetch
+    from universe.sec_tickers import fetch_sec_tickers as sec_fetch
+    from universe.yfinance_provider import YFinanceProvider
+
+    secrets = load_secrets()
+    cfg = load_config()
+    user_agent = edgar_user_agent_override or cfg.ingestion.edgar_user_agent
+
+    real_sec = sec_fetcher or (lambda: sec_fetch(user_agent))
+    real_alpaca = alpaca_fetcher or (
+        lambda: alpaca_fetch(_build_alpaca_client(secrets, cfg.execution.broker_mode))
+    )
+    real_md = market_data or YFinanceProvider(
+        min_interval_seconds=cfg.universe.yfinance_min_interval_seconds,
+    )
+    return real_sec, real_alpaca, real_md
+
+
+def _build_alpaca_client(secrets, broker_mode: str) -> object:  # noqa: ANN001 - Secrets type lazy
+    """Lazy-import `alpaca-py` and build a `TradingClient` from secrets.
+
+    Imported inside the function so the test suite (and module import)
+    does not require `alpaca-py` to be installed. Mirrors the lazy
+    pattern used by `jobs.backup._build_b2sdk_uploader` and the
+    construction-time-only mode plumbing in `app.composition`
+    (D-007: mode is set at wiring, never branched on at runtime)."""
+    from alpaca.trading.client import TradingClient  # type: ignore[import-not-found]
+
+    return TradingClient(
+        api_key=secrets.alpaca_api_key_id.get_secret_value(),
+        secret_key=secrets.alpaca_api_secret_key.get_secret_value(),
+        paper=(broker_mode == "paper"),
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via cli_main tests
+    import sys
+
+    sys.exit(cli_main())

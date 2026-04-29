@@ -40,3 +40,11 @@ ks3_consecutive_losses = 6
 [observability]
 log_level = "INFO"
 betterstack_endpoint = "https://in.logs.betterstack.com"
+
+[universe]
+# D-065 — per-call floor for the yfinance provider. Yahoo throttles
+# residential IPs above ~5 req/sec sustained, so 0.2s = 5 req/sec keeps
+# the daily refresh below the throttle band. Decrease only if observed
+# failure rate is consistently <5% and runtime matters; increase if
+# Yahoo tightens the threshold.
+yfinance_min_interval_seconds = 0.2

@@ -32,3 +32,6 @@ htmlcov/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Operator-local config (use config/quinn.example.toml as template)
+config/quinn.toml

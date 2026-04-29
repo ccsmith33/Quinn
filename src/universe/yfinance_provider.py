@@ -6,11 +6,18 @@ directly — substitution is local to this file.
 
 On any scrape failure or missing required field returns `None`; callers
 (S2.2's snapshot composer) decide whether the absence excludes the ticker.
+
+Local rate-limiting (D-065): a per-call minimum interval keeps sustained
+request rate below Yahoo's residential-IP throttle threshold (~5 req/sec).
+This is throttle prevention, not retry — D-035's no-retry stance for
+per-ticker failures is preserved (a `None` result still excludes the ticker
+from the day's snapshot).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -21,6 +28,8 @@ from .market_data import Fundamentals
 log = get_logger(__name__)
 
 _TickerFactory = Callable[[str], Any]
+_Monotonic = Callable[[], float]
+_Sleep = Callable[[float], None]
 
 
 def _default_ticker_factory(symbol: str) -> Any:
@@ -30,12 +39,29 @@ def _default_ticker_factory(symbol: str) -> Any:
 
 
 class YFinanceProvider:
-    """Fetches fundamentals via yfinance. Implements `MarketDataProvider`."""
+    """Fetches fundamentals via yfinance. Implements `MarketDataProvider`.
 
-    def __init__(self, ticker_factory: _TickerFactory | None = None) -> None:
+    `min_interval_seconds` enforces a token-bucket-of-one between successive
+    calls (D-065). Default 0.2s ≈ 5 req/sec, below Yahoo's observed throttle
+    threshold. Tests pass `min_interval_seconds=0.0` to skip the sleep path.
+    """
+
+    def __init__(
+        self,
+        ticker_factory: _TickerFactory | None = None,
+        *,
+        min_interval_seconds: float = 0.2,
+        monotonic: _Monotonic | None = None,
+        sleep: _Sleep | None = None,
+    ) -> None:
         self._ticker_factory = ticker_factory or _default_ticker_factory
+        self._min_interval = max(0.0, float(min_interval_seconds))
+        self._monotonic = monotonic or time.monotonic
+        self._sleep = sleep or time.sleep
+        self._last_call_at: float | None = None
 
     def fetch_fundamentals(self, ticker: str) -> Fundamentals | None:
+        self._wait_for_slot()
         try:
             t = self._ticker_factory(ticker)
             info = getattr(t, "info", None)
@@ -53,3 +79,14 @@ class YFinanceProvider:
         except Exception as e:
             log.debug("yfinance fetch failed", extra={"ticker": ticker, "error": str(e)})
             return None
+
+    def _wait_for_slot(self) -> None:
+        if self._min_interval <= 0.0:
+            return
+        now = self._monotonic()
+        if self._last_call_at is None:
+            self._sleep(0.0)
+        else:
+            remainder = self._min_interval - (now - self._last_call_at)
+            self._sleep(remainder if remainder > 0.0 else 0.0)
+        self._last_call_at = now

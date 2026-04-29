@@ -89,6 +89,18 @@ class DashboardConfig(_Section):
     auto_refresh_seconds: int = Field(default=30, gt=0)
 
 
+class UniverseConfig(_Section):
+    """D-065 — daily universe-refresh tunables.
+
+    `yfinance_min_interval_seconds` enforces a per-call floor on the
+    yfinance provider to stay below Yahoo's ~5 req/sec residential-IP
+    throttle threshold. Default 0.2s = 5 req/sec. Lower values risk
+    high failure rates; higher values lengthen daily refresh runtime.
+    """
+
+    yfinance_min_interval_seconds: float = Field(default=0.2, ge=0.0)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -100,6 +112,7 @@ class AppConfig(BaseModel):
     killswitch: KillSwitchConfig
     observability: ObservabilityConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
+    universe: UniverseConfig = Field(default_factory=UniverseConfig)
 
 
 _DEFAULT_PATHS = [

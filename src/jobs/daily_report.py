@@ -25,6 +25,7 @@ Design:
 from __future__ import annotations
 
 import datetime as _dt
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -307,3 +308,81 @@ def _proposals_by_kind(conn, start: _dt.datetime, end: _dt.datetime) -> dict[str
         (start, end),
     ).fetchall()
     return {r["kind"]: int(r["c"]) for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# CLI shim — `python -m jobs.daily_report` (S8.2 follow-up; runs from
+# `ops/systemd/quinn-daily-report.service` on the 16:30 ET timer).
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_DB_PATH = "/var/lib/quinn/journal.db"
+
+
+def cli_main(
+    *,
+    argv: list[str] | None = None,
+    telegram: Notifier | None = None,
+    clock: Callable[[], _dt.datetime] | None = None,
+) -> int:
+    """Entrypoint for `python -m jobs.daily_report`. Returns the process
+    exit code.
+
+    Test seam: `telegram` and `clock` are injectable. Production calls
+    with `telegram=None`, which lazy-builds a real `TelegramNotifier`
+    from `Secrets.telegram_bot_token` + `telegram_operator_chat_id`
+    (mirrors `app.composition.compose_agent`).
+
+    Exit codes:
+      0 — report composed and dispatched
+      2 — notifier raised on send (network outage, bad token, etc.)
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="jobs.daily_report",
+        description="Compose the daily roll-up report and dispatch it via Telegram.",
+    )
+    parser.add_argument("--db", default=_DEFAULT_DB_PATH)
+    args = parser.parse_args(argv)
+
+    now = (clock or (lambda: _dt.datetime.now(_dt.UTC)))()
+    journal = JournalRepo(args.db)
+    real_telegram = telegram if telegram is not None else _build_telegram_notifier()
+
+    reporter = DailyReporter(journal=journal, telegram=real_telegram)
+    try:
+        reporter.compose_and_send(now=now)
+    except Exception as exc:
+        log.error(
+            "daily_report.cli_failed",
+            extra={
+                "event": "daily_report.cli_failed",
+                "error_class": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        return 2
+    return 0
+
+
+def _build_telegram_notifier() -> Notifier:
+    """Lazy-build the production `TelegramNotifier` from `Secrets`.
+
+    Imported inside the function so the test suite can drive `cli_main`
+    without secrets configured. Mirrors `jobs.backup._resolve_uploader`.
+    """
+    from config.secrets import load_secrets
+    from observability.alerts import TelegramNotifier
+
+    secrets = load_secrets()
+    return TelegramNotifier(
+        bot_token=secrets.telegram_bot_token.get_secret_value(),
+        chat_id=secrets.telegram_operator_chat_id.get_secret_value(),
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via cli_main tests
+    import sys
+
+    sys.exit(cli_main())
