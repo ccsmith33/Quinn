@@ -1,0 +1,20 @@
+[Unit]
+Description=Quinn daily roll-up report (Telegram + optional email)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=quinn
+Group=quinn
+EnvironmentFile=/etc/quinn/secrets.env
+WorkingDirectory=/opt/quinn/app
+ExecStart=/opt/quinn/app/.venv/bin/python -m src.jobs.daily_report
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quinn /var/log/quinn

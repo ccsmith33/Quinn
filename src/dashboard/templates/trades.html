@@ -1,0 +1,42 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Trades</h2>
+<p>most-recent {{ rows | length }} executions.</p>
+
+{% if rows | length == 0 %}
+  <p>no executions yet.</p>
+{% else %}
+<table role="grid">
+  <thead>
+    <tr>
+      <th>decided_at</th>
+      <th>symbol</th>
+      <th>side</th>
+      <th>qty</th>
+      <th>fill price</th>
+      <th>slippage vs NBBO mid</th>
+      <th>decision</th>
+      <th>source proposal</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.decided_at }}</td>
+      <td>{{ row.symbol }}</td>
+      <td>{{ row.side }}</td>
+      <td>{{ row.qty }}</td>
+      <td>{% if row.fill_price is not none %}{{ '{:.4f}'.format(row.fill_price) }}{% else %}—{% endif %}</td>
+      <td>{% if row.slippage is not none %}{{ '{:+.4f}'.format(row.slippage) }}{% else %}—{% endif %}</td>
+      <td>{{ row.decision }}{% if row.reject_reason %} ({{ row.reject_reason }}){% endif %}</td>
+      <td>
+        {% if row.proposal_decision_id %}
+          <a href="/proposals?symbol={{ row.symbol }}">{{ row.proposal_decision_id }}</a>
+        {% else %}—{% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

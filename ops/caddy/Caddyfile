@@ -1,0 +1,45 @@
+# Caddy reverse-proxy config — fronts the operator dashboard with
+# automatic Let's Encrypt SSL on the operator's DuckDNS domain (S9.1
+# AC-10, D-063).
+#
+# Substitute `<your-name>` with the value of `DUCKDNS_DOMAIN` from the
+# secrets envelope. Caddy resolves the cert automatically on first boot.
+#
+# Install:
+#   apt-get install -y caddy
+#   install -m 0644 -o root -g root /opt/quinn/app/ops/caddy/Caddyfile /etc/caddy/Caddyfile
+#   systemctl reload caddy
+#
+# Verify:
+#   curl -I https://<your-name>.duckdns.org/  → expects HTTP/2 401 (auth required)
+#
+# The dashboard process binds to 127.0.0.1:8444 by default
+# (cfg.dashboard.bind_host / port — see src/config/loader.py). Caddy is
+# the only path the public internet sees.
+
+<your-name>.duckdns.org {
+    encode zstd gzip
+
+    # Strip Caddy default headers and pass through the basic-auth challenge
+    # from the dashboard process untouched. Caddy's own basicauth directive
+    # is NOT used — the dashboard owns auth (constant-time compare via
+    # `secrets.compare_digest`, S9.1 AC-2).
+    reverse_proxy 127.0.0.1:8444 {
+        header_up Host {host}
+        header_up X-Real-IP {remote}
+        header_up X-Forwarded-For {remote}
+        header_up X-Forwarded-Proto {scheme}
+    }
+
+    # Tighten content-type sniffing + frame embedding. Pico.css from CDN
+    # is the only external resource — `default-src 'self'` blocks the
+    # rest. Adjust if you self-host Pico.
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "no-referrer"
+        # Pico.css ships from jsdelivr; allow CSS-from there but no JS.
+        Content-Security-Policy "default-src 'self'; style-src 'self' https://cdn.jsdelivr.net 'unsafe-inline'; img-src 'self' data:; script-src 'none'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    }
+}

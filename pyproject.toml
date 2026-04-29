@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quinn"
+version = "0.1.0"
+description = "Quinn v1 — autonomous LLM swing-trading system. See CLAUDE.md and artifacts/design/architecture-quinn-v1.md."
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "aiohttp",
+    "httpx",
+    "anthropic",
+    "alpaca-py",
+    "python-telegram-bot",
+    "fastapi",
+    "uvicorn",
+    "jinja2",
+    "pydantic",
+    "structlog",
+    "scikit-learn",
+    "datasketch",
+    "lxml",
+    "beautifulsoup4",
+    "yfinance",
+    "tenacity",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ruff",
+    "mypy",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+files = ["src"]

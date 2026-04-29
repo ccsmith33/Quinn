@@ -1,0 +1,82 @@
+# Vector pipeline for Quinn — ships journald entries from the four
+# Quinn systemd units to Better Stack (NFR-9, NFR-17, FR-33).
+#
+# Architecture references: §10.1 Observability, §3 Deployment.
+#
+# Auth: the Better Stack source token comes from $LOG_SINK_TOKEN, set in
+# the Vector unit's EnvironmentFile. The token is NEVER stored in this
+# file (NFR-15).
+#
+# AC-5 (replay-on-outage): the sink declares a disk-backed buffer so
+# entries are persisted across restarts and re-delivered when the sink
+# returns. The application code emits to journald and never blocks on
+# off-box delivery — Vector owns durability.
+#
+# Install: `apt-get install vector` on the droplet (D-024 — git pull +
+# venv install, no Docker, no CI/CD). Validate locally with
+# `vector validate /etc/vector/quinn.toml`.
+
+[api]
+enabled = false
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+# Pull all four Quinn services from the systemd journal. S8.3 ships the
+# unit files; this config references them ahead of time.
+[sources.quinn_journald]
+type = "journald"
+include_units = [
+    "quinn-agent.service",
+    "quinn-bot.service",
+    "quinn-http.service",
+    "quinn-universe.service",
+]
+current_boot_only = false
+# Vector's journald source records its read cursor on disk so
+# entries are not lost across restarts.
+data_dir = "/var/lib/vector/quinn-journald"
+
+# ---------------------------------------------------------------------------
+# Transforms — parse the JSON payload that structlog emits, so individual
+# fields (decision_id, correlation_id, module, level) become first-class
+# in Better Stack rather than living inside the message body.
+# ---------------------------------------------------------------------------
+
+[transforms.parse_json]
+type = "remap"
+inputs = ["quinn_journald"]
+source = '''
+. |= object!(parse_json(.message) ?? {})
+'''
+
+# ---------------------------------------------------------------------------
+# Sinks — Better Stack via HTTP. Disk-buffered so a sink outage doesn't
+# drop logs (AC-5). The application never blocks: it writes to journald,
+# Vector reads journald, Vector queues to disk, Vector retries against
+# Better Stack until it succeeds.
+# ---------------------------------------------------------------------------
+
+[sinks.better_stack]
+type = "http"
+inputs = ["parse_json"]
+uri = "https://in.logs.betterstack.com"
+encoding.codec = "json"
+compression = "gzip"
+
+[sinks.better_stack.request.headers]
+Authorization = "Bearer ${LOG_SINK_TOKEN}"
+
+[sinks.better_stack.buffer]
+type = "disk"
+max_size = 268435456     # 256 MiB
+when_full = "block"
+
+[sinks.better_stack.batch]
+max_events = 1000
+timeout_secs = 5
+
+[sinks.better_stack.request]
+retry_attempts = -1      # retry forever — disk buffer is the durability
+retry_max_duration_secs = 60

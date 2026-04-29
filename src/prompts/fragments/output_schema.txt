@@ -1,0 +1,10 @@
+# Output schema
+
+Emit exactly one JSON object — either a `TradeProposal` or a `NoTradeRecord`.
+The full JSON schema follows as a separate block. Do not emit any text
+outside the JSON object. Do not include code fences, explanations, or
+preamble.
+
+If your structured output is malformed (fails schema validation), the
+proposal store rejects it; the journal records the failure and no trade is
+attempted. Always emit valid JSON conforming to the schema.

@@ -1,0 +1,12 @@
+[Unit]
+Description=Quinn daily backup timer (02:00 ET)
+
+[Timer]
+# 02:00 ET — well outside any market session and after the daily report
+# (16:30 ET) so the backup captures a complete trading day.
+OnCalendar=*-*-* 02:00:00 America/New_York
+Persistent=true
+Unit=quinn-backup.service
+
+[Install]
+WantedBy=timers.target

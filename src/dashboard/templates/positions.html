@@ -1,0 +1,32 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Open positions</h2>
+
+{% if rows | length == 0 %}
+  <p>no open positions.</p>
+{% else %}
+<p>total open exposure: {% if exposure_pct is not none %}{{ '{:.2f}'.format(exposure_pct) }}% of equity{% else %}—{% endif %}</p>
+<table role="grid">
+  <thead>
+    <tr>
+      <th>symbol</th>
+      <th>qty</th>
+      <th>avg entry</th>
+      <th>current quote</th>
+      <th>unrealized P&amp;L</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.symbol }}</td>
+      <td>{{ row.qty }}</td>
+      <td>{{ '{:.4f}'.format(row.avg_entry_price) }}</td>
+      <td>{% if row.current_quote is not none %}{{ '{:.4f}'.format(row.current_quote) }}{% else %}—{% endif %}</td>
+      <td>{{ '{:+.2f}'.format(row.unrealized_pnl) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

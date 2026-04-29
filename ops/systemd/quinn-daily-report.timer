@@ -1,0 +1,13 @@
+[Unit]
+Description=Quinn daily report timer (16:30 ET, weekdays)
+
+[Timer]
+# 16:30 ET on trading days. We fire daily; the daily reporter itself
+# is a no-op on non-trading days (the journal queries return zeros for
+# weekends/holidays, which is informative rather than wrong).
+OnCalendar=*-*-* 16:30:00 America/New_York
+Persistent=true
+Unit=quinn-daily-report.service
+
+[Install]
+WantedBy=timers.target

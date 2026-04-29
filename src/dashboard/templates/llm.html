@@ -1,0 +1,48 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>LLM spend</h2>
+
+<section>
+  <span class="tile">
+    <span class="label">MTD total</span>
+    <span class="value">${{ '{:.4f}'.format(mtd_total_usd) }}</span>
+  </span>
+</section>
+
+{% if rows | length == 0 %}
+  <p>no LLM calls in the current month yet.</p>
+{% else %}
+<table role="grid">
+  <thead>
+    <tr>
+      <th>model</th>
+      <th>calls</th>
+      <th>cost (USD)</th>
+      <th>input tok</th>
+      <th>output tok</th>
+      <th>cache read</th>
+      <th>cache create</th>
+      <th>cache hit %</th>
+      <th>p50 latency (ms)</th>
+      <th>p95 latency (ms)</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.model_id }}</td>
+      <td>{{ row.calls }}</td>
+      <td>{{ '{:.4f}'.format(row.cost_usd) }}</td>
+      <td>{{ row.input_tokens }}</td>
+      <td>{{ row.output_tokens }}</td>
+      <td>{{ row.cache_read_tokens }}</td>
+      <td>{{ row.cache_creation_tokens }}</td>
+      <td>{{ '{:.1f}'.format(row.cache_hit_pct) }}</td>
+      <td>{{ row.p50_latency_ms }}</td>
+      <td>{{ row.p95_latency_ms }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

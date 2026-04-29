@@ -1,0 +1,311 @@
+"""S5.6 AC-2 — agent-loop dependency wiring.
+
+`compose_agent` is the one place where every E2..E7 component is
+constructed and stitched together. Single code path for paper / live
+(D-007 sacred): broker_mode picks the credential payload, nothing else.
+
+Order of construction matters: the journal must exist first; the
+universe must already have a snapshot (load_latest raises otherwise);
+the kill-switch wraps the journal; the broker is built last because
+its credentials cross from `Secrets` into a live SDK client.
+
+Carry-forward S5.2 D-1 (medium): the composed prompt-version ids
+emitted by `PromptBuilder.prompt_version(...)` must be registered in
+the `prompts` table BEFORE the analyzer makes its first API call,
+otherwise the `proposals.prompt_version` FK fires AFTER the spend.
+This is `register_composed_prompt_versions(...)`. Reviewer-e5 will
+scrutinize the call site.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from analyzer.anthropic_client import AnthropicClient
+from analyzer.opus import OpusReviewer
+from analyzer.sonnet import SonnetAnalyzer
+from broker.alpaca import AlpacaBroker
+from broker.protocol import BrokerAdapter
+from config.loader import AppConfig
+from config.secrets import Secrets
+from execution.orders import OrderSubmitter
+from execution.sizing import SizingEngine
+from execution.validator import ProposalValidator
+from journal.models import FilingRow, PromptRow
+from journal.repo import JournalRepo, insert_prompt
+from killswitch.api import KillSwitch
+from killswitch.auto_halts import AutoHaltEvaluator
+from observability.alerts import AlertWatcher, TelegramNotifier
+from observability.log_port import get_logger
+from prefilter.orchestrator import Prefilter
+from prefilter.similarity import SimilarityChecker
+from prompts.loader import PromptBuilder
+from proposal.store import ProposalStore
+from reconciler.reconciler import Reconciler
+from universe.api import Universe
+
+log = get_logger(__name__)
+
+# Names whose composed pv must be registered before any LLM call. Maps
+# 1:1 to `_PROMPT_DEFS` in `prompts.loader`.
+_COMPOSED_PROMPT_NAMES: tuple[str, ...] = (
+    "sonnet_filing_analysis_v1",
+    "opus_proposal_review_v1",
+)
+
+
+@dataclass(frozen=True)
+class AgentComponents:
+    """Bundle of every dependency the agent loop coordinates.
+
+    The story's dev-notes list `execution: ExecutionLayer` as one field;
+    the actual surface in v1 is the validator + sizer + submitter trio
+    plus the broker. They're listed individually here so the loop can
+    call them in the order the story prescribes (validate → size →
+    submit). `execution` is kept as `None`-able for forward shape
+    parity with the story spec.
+    """
+
+    universe: Universe
+    prefilter: Prefilter
+    analyzer: SonnetAnalyzer
+    reviewer: OpusReviewer
+    proposal_store: ProposalStore
+    validator: ProposalValidator
+    sizer: SizingEngine
+    submitter: OrderSubmitter
+    execution: object | None  # placeholder per story dev-notes shape
+    broker: BrokerAdapter
+    reconciler: Any  # Reconciler in prod; stub in tests (start/stop)
+    killswitch: KillSwitch
+    ingestion_queue: asyncio.Queue[FilingRow]
+    journal: JournalRepo
+    auto_halt_evaluator: AutoHaltEvaluator | None = None
+    # S5.6 carry-fwd S8.2 wiring: AlertWatcher polled on the 60s tick.
+    alert_watcher: AlertWatcher | None = None
+
+
+def compose_agent(
+    config: AppConfig,
+    *,
+    secrets: Secrets,
+    journal: JournalRepo,
+    prompts_dir: Path,
+    similarity_artifact_dir: str,
+) -> Any:
+    """Construct the live agent. Returns an `AgentLoop`.
+
+    `prompts_dir` and `similarity_artifact_dir` are path-shaped values
+    plumbed from `src/app.py` (which reads them from runtime defaults
+    or env). Keeping them as parameters makes this function unit-
+    testable without monkey-patching the filesystem.
+
+    Single code path for paper / live (D-007): the only place we look
+    at `config.execution.broker_mode` is when constructing the broker
+    — to pick which credential pair Alpaca expects and which endpoint
+    to hit. No runtime branch reads it.
+    """
+    # Universe lookup (S2.3) — fail loud if no snapshot exists; the
+    # agent must not boot without a universe (story §"Crash recovery").
+    universe = Universe.load_latest(journal.db_path)
+
+    # Prefilter (S4.3) — the similarity checker depends on the journal
+    # path + an artifact dir for vectorizers + threshold from config.
+    similarity = SimilarityChecker(
+        db_path=journal.db_path,
+        artifact_dir=similarity_artifact_dir,
+        threshold=config.prefilter.similarity_threshold,
+    )
+    prefilter = Prefilter(
+        db_path=journal.db_path, universe=universe, similarity=similarity
+    )
+
+    # Anthropic client (S5.2) — single instance shared by analyzer +
+    # reviewer; purpose tag distinguishes their llm_calls rows.
+    anthropic = AnthropicClient(
+        api_key=secrets.anthropic_api_key,
+        default_model_id=config.analyzer.sonnet_model_id,
+        db_path=journal.db_path,
+    )
+
+    # Prompt registry → register composed pvs BEFORE first call.
+    prompt_builder = PromptBuilder(prompts_dir)
+    register_composed_prompt_versions(prompt_builder, journal.db_path)
+
+    # Proposal store (S5.5).
+    proposal_store = ProposalStore(db_path=journal.db_path)
+
+    # Opus reviewer (S5.4) — built first so the analyzer can hold it.
+    # `opus_max_output_tokens` plumb-through is the S5.6 carry-fwd
+    # resolution for S5.2 reviewer C-1 (D-052).
+    reviewer = OpusReviewer(
+        client=anthropic,
+        store=proposal_store,
+        prompt_builder=prompt_builder,
+        opus_model_id=config.analyzer.opus_model_id,
+        ks4_pct_cap=config.execution.ks4_pct_cap,
+        db_path=journal.db_path,
+        max_output_tokens=config.analyzer.opus_max_output_tokens,
+    )
+
+    # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
+    # lives in this constructor (D-047).
+    analyzer = SonnetAnalyzer(
+        client=anthropic,
+        store=proposal_store,
+        prompt_builder=prompt_builder,
+        opus_reviewer=reviewer,
+        sonnet_model_id=config.analyzer.sonnet_model_id,
+        opus_review_conviction_threshold=(
+            config.analyzer.opus_review_conviction_threshold
+        ),
+        db_path=journal.db_path,
+        max_output_tokens=config.analyzer.sonnet_max_output_tokens,
+    )
+
+    # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.
+    validator = ProposalValidator()
+    sizer = SizingEngine()
+    submitter = OrderSubmitter()
+
+    # Kill-switch read API (S7.1).
+    killswitch = KillSwitch(journal)
+    auto_halt = AutoHaltEvaluator()
+
+    # Broker — the SOLE credential seam. AlpacaBroker validates
+    # endpoint↔mode at construction time, so a misconfigured pair
+    # raises here, before any trading happens.
+    broker = AlpacaBroker(
+        mode=config.execution.broker_mode,
+        api_key_id=secrets.alpaca_api_key_id,
+        api_secret=secrets.alpaca_api_secret_key,
+        endpoint=secrets.alpaca_endpoint.get_secret_value(),
+    )
+
+    # Telegram outbound notifier. Single instance shared by reconciler
+    # (`notify(message)` via _TelegramAlerterAdapter) and AlertWatcher
+    # (`send(text)` directly). NFR-9: send is best-effort, never blocks.
+    telegram = TelegramNotifier(
+        bot_token=secrets.telegram_bot_token.get_secret_value(),
+        chat_id=secrets.telegram_operator_chat_id.get_secret_value(),
+    )
+
+    # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.
+    # S5.6 carry-fwd S6.5 reviewer M-3 (HIGH): wire the Telegram alerter
+    # at construction so position-discrepancy notifications reach the
+    # operator (not just structured logs).
+    reconciler = Reconciler(
+        broker=broker,
+        journal=journal,
+        ks=killswitch,
+        cfg=config.reconciler,
+        alerter=_TelegramAlerterAdapter(telegram),
+    )
+
+    # AlertWatcher (S8.2) — must be constructed AFTER migrations have
+    # run because it snapshots latest `kill_switch_state` to suppress
+    # the boot seed row firing a phantom flip. Migrations are run by
+    # `main()` BEFORE compose_agent, so we're safe here.
+    alert_watcher = AlertWatcher(journal=journal, notifier=telegram)
+
+    queue: asyncio.Queue[FilingRow] = asyncio.Queue()
+
+    components = AgentComponents(
+        universe=universe,
+        prefilter=prefilter,
+        analyzer=analyzer,
+        reviewer=reviewer,
+        proposal_store=proposal_store,
+        validator=validator,
+        sizer=sizer,
+        submitter=submitter,
+        execution=None,
+        broker=broker,
+        reconciler=reconciler,
+        killswitch=killswitch,
+        ingestion_queue=queue,
+        journal=journal,
+        auto_halt_evaluator=auto_halt,
+        alert_watcher=alert_watcher,
+    )
+
+    # Lazy import to keep `app/composition.py` testable without pulling
+    # `app/loop.py` (which has heavier asyncio surface).
+    from .loop import AgentLoop
+
+    return AgentLoop(
+        components=components,
+        config=config,
+        shutdown_grace_seconds=60.0,
+    )
+
+
+def register_composed_prompt_versions(
+    builder: PromptBuilder, db_path: str
+) -> None:
+    """Register every composed pv in the `prompts` table.
+
+    Required before the first `AnthropicClient.call` because
+    `proposals.prompt_version` is FK-enforced (S5.2 D-1 carry-forward).
+    Idempotent: PK collisions resolve to "already registered".
+    """
+    for name in _COMPOSED_PROMPT_NAMES:
+        version = builder.prompt_version(name)
+        composed_bytes = builder._composed_system_bytes(name)  # type: ignore[attr-defined]
+        import hashlib
+
+        digest = hashlib.sha256(composed_bytes).hexdigest()
+        try:
+            insert_prompt(
+                db_path,
+                PromptRow(
+                    prompt_version=version,
+                    name=name,
+                    file_path=str(Path(builder._dir) / f"{name}.txt"),  # type: ignore[attr-defined]
+                    content_hash=digest,
+                ),
+            )
+            log.info(
+                "composed prompt registered",
+                extra={
+                    "event": "compose.prompt_registered",
+                    "prompt_version": version,
+                    "prompt_name": name,
+                },
+            )
+        except sqlite3.IntegrityError:
+            log.debug(
+                "composed prompt already registered",
+                extra={
+                    "event": "compose.prompt_already_registered",
+                    "prompt_version": version,
+                    "prompt_name": name,
+                },
+            )
+
+
+class _TelegramAlerterAdapter:
+    """Bridge `Reconciler._AlerterLike.notify(message)` to
+    `Notifier.send(text)`.
+
+    The reconciler (S6.5) and AlertWatcher (S8.2) settled on different
+    method names for the same operation. Rather than churn either, this
+    one-line adapter satisfies the reconciler's structural Protocol.
+    """
+
+    def __init__(self, notifier: Any) -> None:
+        self._notifier = notifier
+
+    def notify(self, message: str) -> None:
+        self._notifier.send(message)
+
+
+__all__ = [
+    "AgentComponents",
+    "compose_agent",
+    "register_composed_prompt_versions",
+]

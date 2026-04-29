@@ -1,0 +1,13 @@
+[Unit]
+Description=Quinn daily universe refresh timer (07:00 ET)
+
+[Timer]
+# 07:00 America/New_York; systemd applies the host's timezone, so set
+# the unit's TZ via the calendar suffix where supported. With ET as the
+# host TZ (set in the rehydration runbook), this fires at 07:00 local.
+OnCalendar=*-*-* 07:00:00 America/New_York
+Persistent=true
+Unit=quinn-universe.service
+
+[Install]
+WantedBy=timers.target

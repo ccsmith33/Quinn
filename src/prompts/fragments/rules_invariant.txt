@@ -1,0 +1,13 @@
+# Invariant rules
+
+- Direction: long-only. Short positions are reserved for v2 and rejected by
+  the execution layer if proposed.
+- Position sizing: `size_pct_of_capital` is a fraction of total capital,
+  strict upper bound 0.20. The execution layer enforces a tighter per-position
+  cap (KS-4) at trade time; you should not exceed 0.20 in the proposal.
+- Conviction is an integer 1..10. Conviction below 7 routes to the `no_trade`
+  pathway (FR-18) — emit a `NoTradeRecord` for those, not a `TradeProposal`.
+- Time horizon: 1..60 days. Horizons above 14 days require an explicit reason
+  in the `thesis` field.
+- Universe membership is checked before you receive the filing; you may
+  assume the issuer is in-universe at analysis time.

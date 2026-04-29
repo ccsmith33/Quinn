@@ -1,0 +1,42 @@
+# Quinn v1 — example non-secret configuration.
+# Architecture §10.2. Production location: /opt/quinn/config/quinn.toml
+# Reload semantics: SIGHUP reloads hot values (poll cadences, similarity_threshold, log_level);
+# structural changes (broker_mode, feature flags) require a restart.
+
+[ingestion]
+rss_poll_seconds_market = 60
+rss_poll_seconds_offhours = 300
+reconciler_interval_seconds = 21600
+edgar_user_agent = "Quinn-Research/v1 contact@operator.example"
+
+[prefilter]
+similarity_threshold = 0.97
+minhash_perms = 128
+
+[analyzer]
+sonnet_model_id = "claude-sonnet-4-6"
+opus_model_id = "claude-opus-4-7"
+opus_review_conviction_threshold = 7
+sonnet_max_output_tokens = 4096
+opus_max_output_tokens = 4096
+
+[execution]
+broker_mode = "paper"             # 'paper' | 'live'
+ks4_pct_cap = 0.20
+ks4_absolute_cap_usd = 1000.0
+ks5_max_concurrent = 5
+ks7_cash_reserve_pct = 0.05
+sizing_mid_pct = 0.05
+sizing_high_pct = 0.10
+
+[reconciler]
+interval_seconds_market = 300
+
+[killswitch]
+ks1_daily_loss_pct = 0.03
+ks2_trailing_dd_pct = 0.10
+ks3_consecutive_losses = 6
+
+[observability]
+log_level = "INFO"
+betterstack_endpoint = "https://in.logs.betterstack.com"

@@ -1,0 +1,23 @@
+[Unit]
+Description=Quinn HMAC-signed webhook listener (kill-switch fallback)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=quinn
+Group=quinn
+EnvironmentFile=/etc/quinn/secrets.env
+WorkingDirectory=/opt/quinn/app
+ExecStart=/opt/quinn/app/.venv/bin/python -m src.http_listener
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/quinn /var/log/quinn
+
+[Install]
+WantedBy=multi-user.target

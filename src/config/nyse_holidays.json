@@ -1,0 +1,27 @@
+{
+  "_comment": "NYSE full-day closures, transcribed from NYSE-published schedule per D-025. Half-day early closes (typically the day after Thanksgiving and Christmas Eve) are NOT listed — RSS poll cadence treats them as full sessions, which is conservative against budget. Refresh yearly per architecture §11 #6.",
+  "_source": "https://www.nyse.com/markets/hours-calendars",
+  "_years_covered": [2026, 2027],
+  "holidays": [
+    "2026-01-01",
+    "2026-01-19",
+    "2026-02-16",
+    "2026-04-03",
+    "2026-05-25",
+    "2026-06-19",
+    "2026-07-03",
+    "2026-09-07",
+    "2026-11-26",
+    "2026-12-25",
+    "2027-01-01",
+    "2027-01-18",
+    "2027-02-15",
+    "2027-03-26",
+    "2027-05-31",
+    "2027-06-18",
+    "2027-07-05",
+    "2027-09-06",
+    "2027-11-25",
+    "2027-12-24"
+  ]
+}

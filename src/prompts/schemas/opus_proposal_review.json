@@ -1,0 +1,31 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OpusProposalReview",
+  "type": "object",
+  "required": ["decision", "rationale"],
+  "properties": {
+    "decision": {
+      "type": "string",
+      "enum": ["ratify", "modify", "reject"]
+    },
+    "rationale": {
+      "type": "string",
+      "minLength": 50,
+      "maxLength": 4000
+    },
+    "modifications": {
+      "type": "object",
+      "description": "Present when decision == 'modify'; partial TradeProposal overrides",
+      "properties": {
+        "size_pct_of_capital": { "type": "number" },
+        "stop_loss_price": { "type": "number" },
+        "take_profit_price": { "type": "number" },
+        "exit_conditions": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

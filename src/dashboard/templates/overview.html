@@ -1,0 +1,59 @@
+{% extends "layout.html" %}
+{% block content %}
+<h2>Overview</h2>
+
+<section>
+  <span class="tile">
+    <span class="label">Kill switch</span>
+    <span class="value {{ 'halted' if ks_state == 'halted' else 'active' }}">
+      {{ ks_state }}
+    </span>
+    {% if ks_state == 'halted' %}
+      <div>reason: {{ ks_reason }}</div>
+      <div>set at: {{ ks_set_at }}</div>
+    {% endif %}
+  </span>
+
+  <span class="tile">
+    <span class="label">Equity</span>
+    <span class="value">{% if equity is not none %}${{ '{:,.2f}'.format(equity) }}{% else %}—{% endif %}</span>
+  </span>
+
+  <span class="tile">
+    <span class="label">Day P&amp;L</span>
+    <span class="value">{% if daypl is not none %}{{ '{:+.2f}'.format(daypl) }}{% else %}—{% endif %}</span>
+  </span>
+
+  <span class="tile">
+    <span class="label">Auto-halt</span>
+    <span class="value">{{ auto_halt_status }}</span>
+  </span>
+</section>
+
+<section>
+  <h3>Today</h3>
+  <span class="tile">
+    <span class="label">Filings ingested</span>
+    <span class="value">{{ filings_today }}</span>
+  </span>
+  <span class="tile">
+    <span class="label">Proposals emitted</span>
+    <span class="value">{{ proposals_today }}</span>
+  </span>
+  <span class="tile">
+    <span class="label">Trades submitted</span>
+    <span class="value">{{ trades_today }}</span>
+  </span>
+</section>
+
+<section>
+  <h3>30d equity</h3>
+  {% if sparkline_points %}
+    <svg class="sparkline" width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg">
+      <polyline fill="none" stroke="currentColor" stroke-width="1.5" points="{{ sparkline_points }}" />
+    </svg>
+  {% else %}
+    <p>no equity history yet</p>
+  {% endif %}
+</section>
+{% endblock %}

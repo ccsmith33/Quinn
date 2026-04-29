@@ -1,0 +1,26 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "NoTradeRecord",
+  "type": "object",
+  "required": ["decision", "thesis_or_reason", "signals_considered"],
+  "properties": {
+    "decision": { "const": "no_trade" },
+    "thesis_or_reason": {
+      "type": "string",
+      "minLength": 50,
+      "maxLength": 2000
+    },
+    "signals_considered": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "prompt_version": {
+      "type": "string",
+      "description": "system_injected"
+    },
+    "source_filings": {
+      "type": "array",
+      "description": "same shape as TradeProposal.source_filings"
+    }
+  }
+}
