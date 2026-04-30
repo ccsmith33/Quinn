@@ -28,6 +28,8 @@ class IngestionConfig(_Section):
     rss_poll_seconds_offhours: int = Field(gt=0)
     reconciler_interval_seconds: int = Field(gt=0)
     edgar_user_agent: str
+    rss_cursor_path: str = Field(default="/var/lib/quinn/state/rss_cursor.json")
+    raw_filings_root: str = Field(default="/var/lib/quinn/raw")
 
 
 class PrefilterConfig(_Section):

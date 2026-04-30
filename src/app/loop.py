@@ -87,6 +87,8 @@ class AgentLoop:
         import asyncio as _asyncio
         self._halt_lock: _asyncio.Lock | None = None  # built lazily in run()
         self._auto_halt_task: _asyncio.Task | None = None
+        self._discovery_task: _asyncio.Task | None = None
+        self._detail_pump_task: _asyncio.Task | None = None
 
     # -- Public surface ----------------------------------------------------
 
@@ -123,6 +125,24 @@ class AgentLoop:
         self._set_state(AgentState.IDLE)
 
         consumer = asyncio.create_task(self._consume_loop(), name="agent-consumer")
+
+        # RSS discovery + detail-fetch pump — the production-bug fix.
+        # Without these tasks, `consumer` blocks forever on an empty
+        # `ingestion_queue` because no producer exists. The discovery
+        # loop polls EDGAR; the pump consumes `DiscoveredFiling`s,
+        # fetches the primary document, persists a `FilingRow`, and
+        # pushes it onto `ingestion_queue`. Both are best-effort: any
+        # error inside is logged and the task continues.
+        if (
+            self._components.rss_discovery_loop is not None
+            and self._components.detail_fetcher is not None
+            and self._components.discovered_queue is not None
+        ):
+            await self._components.rss_discovery_loop.start()
+            self._discovery_task = self._components.rss_discovery_loop._task  # type: ignore[attr-defined]
+            self._detail_pump_task = asyncio.create_task(
+                self._detail_pump_loop(), name="agent-detail-pump"
+            )
 
         # S5.6 carry-fwd S7.4 + S8.2 — single 60s tick driving the
         # AutoHaltEvaluator (KS-1/2/3) and the AlertWatcher condition
@@ -201,6 +221,69 @@ class AgentLoop:
                             "error": str(e),
                         },
                     )
+
+    async def _detail_pump_loop(self) -> None:
+        """Drain `discovered_queue` → `DetailFetcher` → `ingestion_queue`.
+
+        Bridges the RSS discovery output (`DiscoveredFiling`) into the
+        consumer's input shape (`FilingRow`). Runs until shutdown is
+        requested. Per-item errors are logged and the next item is
+        attempted; the pump never dies on a bad filing.
+        """
+        from journal.repo import get_filing_by_id
+
+        discovered = self._components.discovered_queue
+        fetcher = self._components.detail_fetcher
+        if discovered is None or fetcher is None:
+            return
+        while not self.shutdown_requested:
+            try:
+                discovered_filing = await discovered.get()
+            except asyncio.CancelledError:
+                break
+            if discovered_filing is None:
+                break
+            if self.shutdown_requested:
+                break
+            try:
+                filing_id = await fetcher.fetch_and_persist(discovered_filing)
+            except Exception as e:  # noqa: BLE001 — never kill the pump
+                log.error(
+                    "agent.detail_fetch_error",
+                    extra={
+                        "event": "agent.detail_fetch_error",
+                        "accession": discovered_filing.accession_number,
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
+                continue
+            row = get_filing_by_id(self._components.journal.db_path, filing_id)
+            if row is None:
+                log.error(
+                    "agent.detail_fetch_missing_row",
+                    extra={
+                        "event": "agent.detail_fetch_missing_row",
+                        "accession": discovered_filing.accession_number,
+                        "filing_id": filing_id,
+                    },
+                )
+                continue
+            # Skip partial-ingest rows: they have no usable raw_text and
+            # would only burn LLM spend on an empty input. The submissions
+            # reconciler (S3.4) is responsible for retrying these later.
+            if row.ingest_state != "ok":
+                log.info(
+                    "agent.detail_fetch_partial",
+                    extra={
+                        "event": "agent.detail_fetch_partial",
+                        "accession": discovered_filing.accession_number,
+                        "filing_id": filing_id,
+                        "ingest_state": row.ingest_state,
+                    },
+                )
+                continue
+            await self._components.ingestion_queue.put(row)
 
     def _serialize_halt(self) -> Any:
         """Process-local lock around any code path that writes a
@@ -918,6 +1001,36 @@ class AgentLoop:
             self._auto_halt_task.cancel()
             try:
                 await self._auto_halt_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+
+        # Stop RSS discovery (cancels its task and persists the cursor).
+        rss = self._components.rss_discovery_loop
+        if rss is not None:
+            try:
+                await asyncio.wait_for(
+                    rss.stop(),
+                    timeout=max(1.0, deadline - time.monotonic()),
+                )
+            except TimeoutError:
+                log.error(
+                    "agent.rss_stop_timeout",
+                    extra={"event": "agent.rss_stop_timeout"},
+                )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "agent.rss_stop_error",
+                    extra={"event": "agent.rss_stop_error", "error": str(e)},
+                )
+
+        # Cancel the detail-pump task (it's blocked on `discovered_queue.get()`).
+        if (
+            self._detail_pump_task is not None
+            and not self._detail_pump_task.done()
+        ):
+            self._detail_pump_task.cancel()
+            try:
+                await self._detail_pump_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
 

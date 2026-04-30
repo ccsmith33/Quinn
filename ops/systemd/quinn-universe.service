@@ -2,6 +2,8 @@
 Description=Quinn daily universe refresh (SEC + Alpaca + yfinance)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -12,8 +14,6 @@ WorkingDirectory=/opt/quinn/app
 ExecStart=/opt/quinn/app/.venv/bin/python -m src.jobs.refresh_universe
 Restart=on-failure
 RestartSec=10
-StartLimitIntervalSec=60
-StartLimitBurst=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

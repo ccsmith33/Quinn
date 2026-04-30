@@ -35,6 +35,9 @@ from config.secrets import Secrets
 from execution.orders import OrderSubmitter
 from execution.sizing import SizingEngine
 from execution.validator import ProposalValidator
+from ingestion.detail_fetcher import DetailFetcher
+from ingestion.edgar_client import EdgarClient
+from ingestion.rss_loop import DiscoveredFiling, RssDiscoveryLoop
 from journal.models import FilingRow, PromptRow
 from journal.repo import JournalRepo, insert_prompt
 from killswitch.api import KillSwitch
@@ -87,6 +90,14 @@ class AgentComponents:
     auto_halt_evaluator: AutoHaltEvaluator | None = None
     # S5.6 carry-fwd S8.2 wiring: AlertWatcher polled on the 60s tick.
     alert_watcher: AlertWatcher | None = None
+    # RSS-path wiring (production-bug fix): the discovery loop pushes
+    # `DiscoveredFiling` onto `discovered_queue`; a pump task drains it
+    # through `detail_fetcher` and forwards the resulting `FilingRow`
+    # onto `ingestion_queue` for the consumer. All three are optional
+    # so unit tests that exercise the consumer in isolation still work.
+    rss_discovery_loop: RssDiscoveryLoop | None = None
+    detail_fetcher: DetailFetcher | None = None
+    discovered_queue: asyncio.Queue[DiscoveredFiling] | None = None
 
 
 def compose_agent(
@@ -214,6 +225,27 @@ def compose_agent(
 
     queue: asyncio.Queue[FilingRow] = asyncio.Queue()
 
+    # RSS discovery path (S3.1 + S3.2 + S3.3) — the production bug-fix.
+    # A single shared `EdgarClient` is reused across discovery, detail
+    # fetch, and (via S3.4) the submissions reconciler per ADR-002 §6.
+    # The agent loop owns lifecycle: `start()` schedules the RSS poll
+    # task, `stop()` cancels it and persists the cursor.
+    edgar = EdgarClient(user_agent=config.ingestion.edgar_user_agent)
+    discovered_queue: asyncio.Queue[DiscoveredFiling] = asyncio.Queue()
+    rss_discovery_loop = RssDiscoveryLoop(
+        edgar=edgar,
+        universe=universe,
+        queue=discovered_queue,
+        cursor_path=Path(config.ingestion.rss_cursor_path),
+        poll_market_seconds=config.ingestion.rss_poll_seconds_market,
+        poll_offhours_seconds=config.ingestion.rss_poll_seconds_offhours,
+    )
+    detail_fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=journal.db_path,
+        raw_root=Path(config.ingestion.raw_filings_root),
+    )
+
     components = AgentComponents(
         universe=universe,
         prefilter=prefilter,
@@ -231,6 +263,9 @@ def compose_agent(
         journal=journal,
         auto_halt_evaluator=auto_halt,
         alert_watcher=alert_watcher,
+        rss_discovery_loop=rss_discovery_loop,
+        detail_fetcher=detail_fetcher,
+        discovered_queue=discovered_queue,
     )
 
     # Lazy import to keep `app/composition.py` testable without pulling

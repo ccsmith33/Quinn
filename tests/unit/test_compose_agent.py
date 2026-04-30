@@ -36,13 +36,23 @@ from journal.repo import (
 )
 
 
-def _config(*, broker_mode: str = "paper") -> AppConfig:
+def _config(
+    *, broker_mode: str = "paper", tmp_path: Path | None = None
+) -> AppConfig:
+    if tmp_path is not None:
+        cursor_path = str(tmp_path / "rss_cursor.json")
+        raw_root = str(tmp_path / "raw")
+    else:
+        cursor_path = "/var/lib/quinn/state/rss_cursor.json"
+        raw_root = "/var/lib/quinn/raw"
     return AppConfig(
         ingestion=IngestionConfig(
             rss_poll_seconds_market=60,
             rss_poll_seconds_offhours=300,
             reconciler_interval_seconds=21600,
             edgar_user_agent="Quinn-Test/v1 test@example.com",
+            rss_cursor_path=cursor_path,
+            raw_filings_root=raw_root,
         ),
         prefilter=PrefilterConfig(similarity_threshold=0.97, minhash_perms=128),
         analyzer=AnalyzerConfig(
@@ -136,7 +146,7 @@ def test_compose_agent_constructs_all_components(
     test (no live network)."""
     from app.composition import compose_agent
 
-    cfg = _config(broker_mode="paper")
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
     secrets = _secrets(paper=True)
     journal = JournalRepo(db_path)
 
@@ -183,7 +193,7 @@ def test_compose_agent_wires_telegram_alerter_into_reconciler(
     notifications reach Telegram, not just structured logs."""
     from app.composition import compose_agent
 
-    cfg = _config(broker_mode="paper")
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
     secrets = _secrets(paper=True)
     journal = JournalRepo(db_path)
     with (
@@ -219,7 +229,7 @@ def test_compose_agent_wires_alert_watcher(
     from app.composition import compose_agent
     from observability.alerts import AlertWatcher
 
-    cfg = _config(broker_mode="paper")
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
     secrets = _secrets(paper=True)
     journal = JournalRepo(db_path)
     with (
@@ -263,14 +273,14 @@ def test_compose_agent_paper_vs_live_only_differs_on_credentials(
         patch("broker.alpaca.StockHistoricalDataClient"),
     ):
         paper_loop = compose_agent(
-            _config(broker_mode="paper"),
+            _config(broker_mode="paper", tmp_path=tmp_path),
             secrets=paper_secrets,
             journal=journal,
             prompts_dir=prompts_dir,
             similarity_artifact_dir=str(tmp_path / "sim_paper"),
         )
         live_loop = compose_agent(
-            _config(broker_mode="live"),
+            _config(broker_mode="live", tmp_path=tmp_path),
             secrets=live_secrets,
             journal=journal,
             prompts_dir=prompts_dir,

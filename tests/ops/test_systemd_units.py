@@ -89,13 +89,27 @@ def test_service_has_required_sections(name: str) -> None:
 
 @pytest.mark.parametrize("name", REQUIRED_SERVICES)
 def test_service_has_restart_policy(name: str) -> None:
-    """NFR-4: Restart=on-failure + 10s wait + ≤ 5 restarts/min cap."""
+    """NFR-4: Restart=on-failure + 10s wait + ≤ 5 restarts/min cap.
+
+    `StartLimitIntervalSec` / `StartLimitBurst` belong in `[Unit]`, not
+    `[Service]`: systemd silently ignores them in `[Service]` (they are
+    Unit-scoped properties), which means the rate cap had no effect on
+    the prior layout. The other two restart-policy keys are correctly
+    `[Service]`-scoped per the systemd manual.
+    """
     cfg = _parse_unit((SYSTEMD / name).read_text())
     svc = cfg["Service"]
+    unit = cfg.get("Unit", {})
     assert svc.get("Restart") == "on-failure", svc.get("Restart")
     assert svc.get("RestartSec") == "10", svc.get("RestartSec")
-    assert svc.get("StartLimitIntervalSec") == "60", svc.get("StartLimitIntervalSec")
-    assert svc.get("StartLimitBurst") == "5", svc.get("StartLimitBurst")
+    assert unit.get("StartLimitIntervalSec") == "60", (
+        f"{name}: StartLimitIntervalSec must live in [Unit], got "
+        f"{unit.get('StartLimitIntervalSec')!r}"
+    )
+    assert unit.get("StartLimitBurst") == "5", (
+        f"{name}: StartLimitBurst must live in [Unit], got "
+        f"{unit.get('StartLimitBurst')!r}"
+    )
 
 
 @pytest.mark.parametrize("name", REQUIRED_SERVICES)
