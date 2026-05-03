@@ -35,6 +35,7 @@ class IngestionConfig(_Section):
 class PrefilterConfig(_Section):
     similarity_threshold: float = Field(ge=0.0, le=1.0)
     minhash_perms: int = Field(gt=0)
+    form_4_enabled: bool = Field(default=True)
 
 
 class AnalyzerConfig(_Section):

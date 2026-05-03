@@ -132,7 +132,10 @@ def compose_agent(
         threshold=config.prefilter.similarity_threshold,
     )
     prefilter = Prefilter(
-        db_path=journal.db_path, universe=universe, similarity=similarity
+        db_path=journal.db_path,
+        universe=universe,
+        similarity=similarity,
+        form_4_enabled=config.prefilter.form_4_enabled,
     )
 
     # Anthropic client (S5.2) — single instance shared by analyzer +

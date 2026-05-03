@@ -22,6 +22,7 @@ Architectural notes:
 from __future__ import annotations
 
 import datetime as _dt
+import json as _json
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from broker.protocol import BrokerAdapter
+from config.calendar import ET
 from journal.repo import JournalRepo
 from killswitch.api import KillSwitch, KillSwitchUninitialized
 from observability.log_port import get_logger
@@ -62,8 +64,15 @@ class _QuoteCache:
         return float(q.last)
 
 
-def _today_utc_start(now: _dt.datetime) -> _dt.datetime:
-    return _dt.datetime(now.year, now.month, now.day, tzinfo=_dt.UTC)
+def _today_et_start(now: _dt.datetime) -> _dt.datetime:
+    """Start of the current ET calendar day, returned as a UTC-aware datetime.
+
+    The trading-day boundary is midnight America/New_York, not UTC midnight.
+    Mirrors `jobs.daily_report._session_bounds_utc`.
+    """
+    et_now = now.astimezone(ET) if now.tzinfo is not None else now.replace(tzinfo=ET)
+    et_start = _dt.datetime.combine(et_now.date(), _dt.time(0, 0), tzinfo=ET)
+    return et_start.astimezone(_dt.UTC)
 
 
 def _sparkline_points(snaps: list[Any], *, width: int = 600, height: int = 80) -> str:
@@ -128,7 +137,7 @@ def build_app(
         request: Request, _auth: None = Depends(auth)
     ) -> HTMLResponse:
         now = _dt.datetime.now(_dt.UTC)
-        today = _today_utc_start(now)
+        today = _today_et_start(now)
         try:
             ks_row = ks.state()
             ks_state = ks_row.state
@@ -204,15 +213,29 @@ def build_app(
         for p in rows:
             review = journal.get_review_for_proposal(p.id) if p.id else None
             execrow = journal.get_execution_for_proposal(p.id) if p.id else None
+            display_thesis = p.thesis
+            if display_thesis is None and p.raw_response:
+                # No-trade rows store NULL in p.thesis; the reason lives in
+                # raw_response.thesis_or_reason. Parse once per row.
+                try:
+                    parsed = _json.loads(p.raw_response)
+                except (ValueError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    val = parsed.get("thesis_or_reason") or parsed.get("thesis")
+                    if isinstance(val, str):
+                        display_thesis = val
             enriched.append(
                 {
                     "id": p.id,
                     "created_at": p.created_at.isoformat() if p.created_at else "",
                     "decision_id": p.decision_id,
+                    "kind": p.kind,
                     "symbol": p.symbol,
                     "direction": p.direction,
                     "conviction": p.conviction,
                     "thesis": p.thesis,
+                    "display_thesis": display_thesis,
                     "raw_response": p.raw_response,
                     "review": review,
                     "execution_decision": execrow.decision if execrow else None,

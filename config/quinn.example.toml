@@ -12,6 +12,12 @@ edgar_user_agent = "Quinn-Research/v1 contact@operator.example"
 [prefilter]
 similarity_threshold = 0.97
 minhash_perms = 128
+# Toggle Form 4 ingestion. Default true preserves existing behavior. Set
+# false to reject every Form 4 with rule_fired="form_4_disabled" — useful
+# once we have prose-form data and want to evaluate the cost/benefit of
+# Form 4 LLM analysis without a code change. Structural change: requires
+# restart, not SIGHUP.
+form_4_enabled = true
 
 [analyzer]
 sonnet_model_id = "claude-sonnet-4-6"

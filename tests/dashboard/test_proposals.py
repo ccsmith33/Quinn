@@ -7,7 +7,12 @@ Sonnet `raw_response` + Opus review (if any). Filterable by `?symbol=` and
 
 from __future__ import annotations
 
+import json
+
 from fastapi.testclient import TestClient
+
+from journal.models import ProposalRow
+from journal.repo import insert_proposal
 
 from .conftest import (
     auth_headers,
@@ -86,3 +91,81 @@ def test_proposals_limit_param_caps_at_1000(client: TestClient) -> None:
 def test_proposals_negative_limit_rejected(client: TestClient) -> None:
     resp = client.get("/proposals?limit=-1", headers=auth_headers())
     assert resp.status_code == 400
+
+
+def test_proposals_no_trade_row_renders_kind_and_thesis_or_reason(
+    client: TestClient, journal, db_path: str
+) -> None:
+    """P4: no-trade rows store NULL for symbol/direction/conviction/thesis;
+    the operator-visible reason lives in `raw_response.thesis_or_reason`.
+    The dashboard must surface `kind` and fall back to the parsed reason
+    so the row isn't blank.
+    """
+    seed_prompt(db_path)
+    fids = seed_filings(db_path, n=1)
+    reason = (
+        "Filing is a routine S-1/A registration amendment with no new "
+        "operating data, no guidance, and no insider transactions. Pass."
+    )
+    raw = json.dumps(
+        {
+            "decision": "no_trade",
+            "thesis_or_reason": reason,
+            "signals_considered": ["form_type", "no_financials"],
+        }
+    )
+    insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fids[0],
+            decision_id="d-no-trade-1",
+            model_id="claude-sonnet-4-6",
+            prompt_version="sonnet:v1#abc",
+            raw_response=raw,
+            kind="no_trade",
+            symbol=None,
+            direction=None,
+            size_pct_requested=None,
+            conviction=None,
+            thesis=None,
+            input_tokens=1000,
+            output_tokens=200,
+            cache_read_tokens=400,
+            cache_creation_tokens=600,
+            latency_ms=2500,
+            cost_usd=0.012,
+        ),
+    )
+    resp = client.get("/proposals", headers=auth_headers())
+    assert resp.status_code == 200
+    body = resp.text
+    assert "no_trade" in body
+    assert "routine S-1/A registration" in body
+    assert "thesis / reason" in body
+
+
+def test_proposals_no_trade_row_with_invalid_raw_response_does_not_500(
+    client: TestClient, journal, db_path: str
+) -> None:
+    """If raw_response is malformed JSON, we render an empty thesis cell —
+    not a 500. (Defensive — the page is read-only operator UI.)"""
+    seed_prompt(db_path)
+    fids = seed_filings(db_path, n=1)
+    insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fids[0],
+            decision_id="d-no-trade-broken",
+            model_id="claude-sonnet-4-6",
+            prompt_version="sonnet:v1#abc",
+            raw_response="<<<not json>>>",
+            kind="no_trade",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_usd=0.0,
+        ),
+    )
+    resp = client.get("/proposals", headers=auth_headers())
+    assert resp.status_code == 200
+    assert "no_trade" in resp.text

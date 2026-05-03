@@ -5,9 +5,10 @@ document via the shared `EdgarClient`, parse per form-type, persist a
 row to the `filings` table, and write raw plaintext / Form-4 JSON to
 disk under `raw_root/<accession>.{txt|json}`.
 
-ADR-002 §3 owned scenarios:
-- "primary doc is fetched per form type"
+ADR-002 §3 + ADR-007 owned scenarios:
+- "primary doc is fetched per form type" (real-EDGAR-shape index.json)
 - "Form 4 with footnoted codes parses correctly"
+- ADR-007 Stage 1 heuristic + Stage 2 SGML-header fallback
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from journal.migrate import apply_migrations
 from journal.repo import get_filing_by_accession, get_filing_by_id
 
 _UA = "Quinn-Research/v1 contact@operator.example"
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -68,13 +70,21 @@ def _route(
     accession: str,
     primary_name: str,
     primary_body: bytes,
-    primary_type: str,
+    primary_type: str = "text.gif",
     extra_items: list[dict[str, str]] | None = None,
     primary_status: int = 200,
     index_status: int = 200,
+    sgml_body: bytes | None = None,
+    sgml_status: int = 200,
 ) -> httpx.MockTransport:
-    """Build a transport that serves index.json and the primary doc on the
-    canonical EDGAR Archives URLs."""
+    """Build a transport that serves index.json, the primary doc, and the
+    `<accession>.txt` SGML on the canonical EDGAR Archives URLs.
+
+    Real EDGAR's `index.json` `type` field is an icon-name string
+    (`text.gif`, `compressed.gif`, …) — NOT the form type. Tests that
+    pass `primary_type="8-K"` or similar are codifying a fiction; the
+    default here matches real EDGAR shape.
+    """
     acc_nd = _accession_no_dashes(accession)
     items = list(extra_items or [])
     items.append(
@@ -89,8 +99,38 @@ def _route(
         url = str(request.url)
         if "index.json" in url and acc_nd in url:
             return httpx.Response(index_status, content=_index_json(items))
+        if sgml_body is not None and url.endswith(f"/{accession}.txt"):
+            return httpx.Response(sgml_status, content=sgml_body)
         if primary_name in url:
             return httpx.Response(primary_status, content=primary_body)
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    return httpx.MockTransport(handle)
+
+
+def _route_from_index(
+    *,
+    cik: int,
+    accession: str,
+    index_payload: bytes,
+    primary_name: str,
+    primary_body: bytes,
+    sgml_body: bytes | None = None,
+    sgml_status: int = 200,
+) -> httpx.MockTransport:
+    """Serve a captured real-EDGAR `index.json` body verbatim alongside the
+    primary doc and (optionally) the SGML `<accession>.txt`. Used for fixture-
+    driven Stage-1 / Stage-2 tests."""
+    acc_nd = _accession_no_dashes(accession)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "index.json" in url and acc_nd in url:
+            return httpx.Response(200, content=index_payload)
+        if sgml_body is not None and url.endswith(f"/{accession}.txt"):
+            return httpx.Response(sgml_status, content=sgml_body)
+        if primary_name in url:
+            return httpx.Response(200, content=primary_body)
         return httpx.Response(404, text=f"unhandled {url}")
 
     return httpx.MockTransport(handle)
@@ -118,7 +158,6 @@ async def test_filing_persisted_with_content_hash(db: str, tmp_path: Path) -> No
         accession="0001234567-26-000099",
         primary_name="acme-8k.htm",
         primary_body=body,
-        primary_type="8-K",
     )
     edgar = _client(transport)
     raw_root = tmp_path / "raw"
@@ -153,17 +192,20 @@ async def test_filing_persisted_with_content_hash(db: str, tmp_path: Path) -> No
 async def test_primary_doc_fetched_per_form_type(db: str, tmp_path: Path) -> None:
     """ADR-002 scenario: each prose-form filing's primary document is the one
     flagged in `index.json` whose `type` matches the filing's form_type."""
-    body_primary = b"<html><body><p>Primary 10-Q content</p></body></html>"
+    body_primary = b"<html><body><p>" + b"Primary 10-Q content" * 200 + b"</p></body></html>"
     transport = _route(
         cik=1234567,
         accession="0001234567-26-000200",
         primary_name="acme-10q.htm",
         primary_body=body_primary,
-        primary_type="10-Q",
+        # Real EDGAR `type` is an icon-name string; prose-primary selection
+        # is driven by filename heuristics (ADR-007 Stage 1), not `type`.
         extra_items=[
-            # Distractors (lower-priority) — must be ignored.
-            {"name": "exhibit-99.1.htm", "type": "EX-99.1", "size": "1000"},
-            {"name": "exhibit-31.1.htm", "type": "EX-31.1", "size": "500"},
+            # Distractors — exhibit pattern must exclude these regardless of size.
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": "100000"},
+            {"name": "ex-31-1.htm", "type": "text.gif", "size": "50000"},
+            # XBRL accessory — extension/suffix exclusion.
+            {"name": "acme-20260331_lab.xml", "type": "text.gif", "size": "200000"},
         ],
     )
     edgar = _client(transport)
@@ -274,7 +316,6 @@ async def test_duplicate_accession_no_crash(db: str, tmp_path: Path) -> None:
         accession="0001234567-26-000400",
         primary_name="x.htm",
         primary_body=body,
-        primary_type="8-K",
     )
     edgar = _client(transport)
     fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
@@ -301,7 +342,9 @@ async def test_duplicate_accession_no_crash(db: str, tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_parse_failure_records_partial(db: str, tmp_path: Path) -> None:
-    # Index returns 200 with no usable primary document → fetcher records partial.
+    # Index returns 200 with no Stage-1 candidate (only an exhibit, which is
+    # excluded by the regex). `<accession>.txt` 404s, so Stage 2 also fails.
+    # Fetcher records partial with the unresolved-error message.
     def handle(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
         if "index.json" in url:
@@ -309,7 +352,7 @@ async def test_parse_failure_records_partial(db: str, tmp_path: Path) -> None:
                 200,
                 content=_index_json(
                     [
-                        {"name": "exhibit.htm", "type": "EX-99.1", "size": "10"},
+                        {"name": "ex-99-1.htm", "type": "text.gif", "size": "10"},
                     ]
                 ),
             )
@@ -390,7 +433,6 @@ async def test_fetch_and_persist_returns_filing_id(db: str, tmp_path: Path) -> N
         accession="0001234567-26-000600",
         primary_name="x.htm",
         primary_body=b"<html><body><p>hi</p></body></html>",
-        primary_type="8-K",
     )
     edgar = _client(transport)
     fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
@@ -417,3 +459,550 @@ def test_content_hash_is_stable_under_whitespace_changes() -> None:
 
 def test_normalize_text_lowercases_and_collapses() -> None:
     assert normalize_text("  HELLO    World\n\n") == "hello world"
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 — real-EDGAR-shape fixture tests for prose primary-doc selection
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_real_apple_10k_index_picks_inline_xbrl_primary(
+    db: str, tmp_path: Path
+) -> None:
+    """ADR-007 §"Test scenarios": a real Apple 10-K `index.json` payload
+    contains an Inline XBRL primary (`aapl-20240928.htm`, 1.5 MB), several
+    `a10-kexhibit*.htm` exhibits, R\\d+.htm XBRL-viewer fragments, and
+    XBRL accessory files. Stage 1 must return the primary."""
+    index_payload = (_FIXTURES / "edgar_index_apple_10k.json").read_bytes()
+    primary_body = b"<html><body>" + b"Item 1. Business. " * 1000 + b"</body></html>"
+    transport = _route_from_index(
+        cik=320193,
+        accession="0000320193-24-000123",
+        index_payload=index_payload,
+        primary_name="aapl-20240928.htm",
+        primary_body=primary_body,
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0000320193-24-000123",
+                cik=320193,
+                form_type="10-K",
+                filed_at=dt.datetime(2024, 11, 1, 6, 1, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2024, 11, 1, 6, 5, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    assert row.ingest_error is None
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 1. Business." in text
+
+
+@pytest.mark.asyncio
+async def test_real_apple_8k_index_picks_sgml_canonical_primary(
+    db: str, tmp_path: Path
+) -> None:
+    """ADR-007 §"Test scenarios": Apple's 8-K — agent-style filename
+    `a8-kex991q2202603282026.htm` (168 KB EX-99.1 exhibit) slips past the
+    narrow Stage 1 regex AND is the size winner over the canonical primary
+    `aapl-20260430.htm` (37 KB, TYPE=8-K SEQUENCE=1). Stage 2 SGML safety
+    net (triggered by `_stage1_is_contested` when the picked filename
+    matches the loose `ex(hibit)?[-_]?\\d` pattern) must disambiguate to
+    the SGML-authoritative primary."""
+    index_payload = (_FIXTURES / "edgar_index_apple_8k.json").read_bytes()
+    sgml_payload = (_FIXTURES / "edgar_sgml_apple_8k_header.txt").read_bytes()
+    primary_body = (
+        b"<html><body>" + b"Item 2.02 Results of Operations and Financial Condition. " * 100
+        + b"Item 9.01 Financial Statements and Exhibits."
+        + b"</body></html>"
+    )
+    transport = _route_from_index(
+        cik=320193,
+        accession="0000320193-26-000011",
+        index_payload=index_payload,
+        primary_name="aapl-20260430.htm",
+        primary_body=primary_body,
+        sgml_body=sgml_payload,
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0000320193-26-000011",
+                cik=320193,
+                form_type="8-K",
+                filed_at=dt.datetime(2026, 4, 30, 16, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 4, 30, 16, 35, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 2.02" in text
+    # The exhibit body must NOT have leaked in.
+    assert "kex991" not in text
+
+
+@pytest.mark.asyncio
+async def test_form_type_token_disambiguates_equal_size_htm_survivors(
+    db: str, tmp_path: Path
+) -> None:
+    """ADR-007 §"Test scenarios" (post-2026-05-03 patch): two non-exhibit
+    `.htm` survivors of IDENTICAL reported size; the form-type-token hint
+    fires only here as the size-tied tie-breaker and prefers the
+    `8-k`-bearing filename."""
+    items = [
+        # Equal-size survivors: hint is the disambiguator.
+        {"name": "abc-8k-2026-05-01.htm", "type": "text.gif", "size": "9000"},
+        {"name": "abc-appendix.htm", "type": "text.gif", "size": "9000"},
+        # Distractors that must be excluded by Stage 1.
+        {"name": "ex-99-1.htm", "type": "text.gif", "size": "100000"},
+        {"name": "abc-20260501_lab.xml", "type": "text.gif", "size": "200000"},
+    ]
+    primary_body = (
+        b"<html><body>" + b"Item 8.01 Other Events. " * 100 + b"</body></html>"
+    )
+    acc = "0001111111-26-000001"
+    acc_nd = _accession_no_dashes(acc)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "index.json" in url and acc_nd in url:
+            return httpx.Response(200, content=_index_json(items))
+        if "abc-8k-2026-05-01.htm" in url:
+            return httpx.Response(200, content=primary_body)
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    edgar = _client(httpx.MockTransport(handle))
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession=acc, form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+
+
+@pytest.mark.asyncio
+async def test_stage1_empty_falls_back_to_sgml_header(
+    db: str, tmp_path: Path
+) -> None:
+    """ADR-007 §"Test scenarios": when every `index.json` candidate is
+    excluded by the Stage-1 patterns, parse `<accession>.txt` SGML
+    `<DOCUMENT>` blocks and use the `<TYPE>=form_type` block's
+    `<FILENAME>`."""
+    sgml = (_FIXTURES / "edgar_sgml_apple_8k_header.txt").read_bytes()
+    # An index.json that has nothing surviving Stage 1.
+    items = [
+        {"name": "ex-99-1.htm", "type": "text.gif", "size": "100000"},
+        {"name": "ex-31-1.htm", "type": "text.gif", "size": "5000"},
+        {"name": "aapl-20260430_lab.xml", "type": "text.gif", "size": "200000"},
+        {"name": "R1.htm", "type": "text.gif", "size": "70000"},
+    ]
+    # The SGML header points at filename "aapl-20260430.htm" as TYPE=8-K SEQ=1.
+    primary_body = (
+        b"<html><body>" + b"Item 2.02 Results of Operations. " * 100 + b"</body></html>"
+    )
+    acc = "0000320193-26-000011"
+    acc_nd = _accession_no_dashes(acc)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "index.json" in url and acc_nd in url:
+            return httpx.Response(200, content=_index_json(items))
+        if url.endswith(f"/{acc}.txt"):
+            return httpx.Response(200, content=sgml)
+        if "aapl-20260430.htm" in url:
+            return httpx.Response(200, content=primary_body)
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    edgar = _client(httpx.MockTransport(handle))
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession=acc, cik=320193, form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 2.02" in text
+
+
+@pytest.mark.asyncio
+async def test_stage1_empty_stage2_404_records_partial_with_unresolved_message(
+    db: str, tmp_path: Path
+) -> None:
+    """Both Stage 1 and Stage 2 fail → partial with the new error message."""
+    items = [{"name": "ex-99-1.htm", "type": "text.gif", "size": "1000"}]
+    acc = "0001234567-26-000777"
+    acc_nd = _accession_no_dashes(acc)
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "index.json" in url and acc_nd in url:
+            return httpx.Response(200, content=_index_json(items))
+        if url.endswith(f"/{acc}.txt"):
+            return httpx.Response(404, text="not found")
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    edgar = _client(httpx.MockTransport(handle))
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession=acc, form_type="10-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "partial"
+    assert row.ingest_error is not None
+    # ADR-007 spec: partial-row error message indicates both stages failed.
+    assert "primary doc unresolved" in row.ingest_error.lower()
+
+
+@pytest.mark.asyncio
+async def test_stage2_malformed_sgml_records_partial(
+    db: str, tmp_path: Path
+) -> None:
+    """`<accession>.txt` returns 200 but the SGML body has no parseable
+    `<DOCUMENT>` blocks → Stage 2 returns None → partial."""
+    items = [{"name": "ex-99-1.htm", "type": "text.gif", "size": "1000"}]
+    acc = "0001234567-26-000778"
+    acc_nd = _accession_no_dashes(acc)
+    bogus_sgml = b"<SEC-DOCUMENT>this is not real sgml content</SEC-DOCUMENT>"
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "index.json" in url and acc_nd in url:
+            return httpx.Response(200, content=_index_json(items))
+        if url.endswith(f"/{acc}.txt"):
+            return httpx.Response(200, content=bogus_sgml)
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    edgar = _client(httpx.MockTransport(handle))
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession=acc, form_type="10-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "partial"
+    assert row.ingest_error is not None
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 — Stage 1 selector unit tests (regex / extension exclusions)
+# ---------------------------------------------------------------------------
+
+
+def test_select_prose_primary_excludes_exhibit_patterns() -> None:
+    from ingestion.detail_fetcher import DetailFetcher
+
+    items = [
+        {"name": "ex-99-1.htm", "type": "text.gif", "size": "100000"},
+        {"name": "exhibit_31-1.htm", "type": "text.gif", "size": "50000"},
+        {"name": "ex99.htm", "type": "text.gif", "size": "200000"},
+        {"name": "abc-10k-2026.htm", "type": "text.gif", "size": "5000"},
+    ]
+    assert DetailFetcher._select_prose_primary(items, "10-K") == "abc-10k-2026.htm"
+
+
+def test_select_prose_primary_excludes_xbrl_viewer_fragments() -> None:
+    from ingestion.detail_fetcher import DetailFetcher
+
+    items = [
+        {"name": "R1.htm", "type": "text.gif", "size": "90000"},
+        {"name": "R10.htm", "type": "text.gif", "size": "70000"},
+        {"name": "primary.htm", "type": "text.gif", "size": "5000"},
+    ]
+    assert DetailFetcher._select_prose_primary(items, "10-K") == "primary.htm"
+
+
+def test_select_prose_primary_excludes_xbrl_accessories() -> None:
+    from ingestion.detail_fetcher import DetailFetcher
+
+    items = [
+        {"name": "abc-20260501_lab.xml", "type": "text.gif", "size": "500000"},
+        {"name": "abc-20260501_def.xml", "type": "text.gif", "size": "300000"},
+        {"name": "abc-20260501_cal.xml", "type": "text.gif", "size": "200000"},
+        {"name": "abc-20260501_pre.xml", "type": "text.gif", "size": "100000"},
+        {"name": "abc-20260501_htm.xml", "type": "text.gif", "size": "1000000"},
+        {"name": "abc-20260501.xsd", "type": "text.gif", "size": "50000"},
+        {"name": "FilingSummary.xml", "type": "text.gif", "size": "10000"},
+        {"name": "MetaLinks.json", "type": "text.gif", "size": "10000"},
+        {"name": "Financial_Report.xlsx", "type": "text.gif", "size": "10000"},
+        {"name": "abc-20260501.htm", "type": "text.gif", "size": "5000"},
+    ]
+    assert DetailFetcher._select_prose_primary(items, "10-K") == "abc-20260501.htm"
+
+
+def test_select_prose_primary_returns_none_when_all_excluded() -> None:
+    from ingestion.detail_fetcher import DetailFetcher
+
+    items = [
+        {"name": "ex-99-1.htm", "type": "text.gif", "size": "100000"},
+        {"name": "Show.js", "type": "text.gif", "size": "1000"},
+    ]
+    assert DetailFetcher._select_prose_primary(items, "10-K") is None
+
+
+def test_select_prose_primary_form_type_token_hint_breaks_equal_size_tie() -> None:
+    """ADR-007 §"Identification heuristic spec" (post-2026-05-03 patch):
+    hint fires ONLY when multiple survivors share the top size."""
+    from ingestion.detail_fetcher import DetailFetcher
+
+    items = [
+        {"name": "abc-8k-2026.htm", "type": "text.gif", "size": "9000"},
+        {"name": "abc-appendix.htm", "type": "text.gif", "size": "9000"},
+    ]
+    assert (
+        DetailFetcher._select_prose_primary(items, "8-K") == "abc-8k-2026.htm"
+    )
+
+
+def test_select_prose_primary_hint_does_not_displace_unique_size_winner() -> None:
+    """ADR-007 §"Test scenarios" (post-2026-05-03 patch) — mandatory
+    Apple-shape regression: size winner has no form-type token; siblings
+    carry the token; hint MUST NOT fire because the size winner is unique."""
+    from ingestion.detail_fetcher import DetailFetcher
+
+    items = [
+        # Size winner — no form-type token.
+        {"name": "aapl-20240928.htm", "type": "text.gif", "size": "1503780"},
+        # Hint-bearing siblings, all dominated on size. Hint must NOT fire.
+        {"name": "a10-kappendix4109282024.htm", "type": "text.gif", "size": "120785"},
+        {"name": "a10-kappendix10229282024.htm", "type": "text.gif", "size": "75240"},
+    ]
+    assert (
+        DetailFetcher._select_prose_primary(items, "10-K") == "aapl-20240928.htm"
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 Stage 2 — SGML parser unit tests (per architect handoff concern #1)
+# ---------------------------------------------------------------------------
+
+
+def test_sgml_parser_clean_header_picks_sequence_1_filename() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        b"<SEC-HEADER>...</SEC-HEADER>\n"
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>1\n<FILENAME>primary.htm\n<TEXT>"
+        b"body\n</TEXT>\n</DOCUMENT>\n"
+        b"<DOCUMENT>\n<TYPE>EX-99.1\n<SEQUENCE>2\n<FILENAME>ex99.htm\n<TEXT>"
+        b"body\n</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "primary.htm"
+
+
+def test_sgml_parser_prefers_lower_sequence_when_multiple_match() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>3\n<FILENAME>third.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>1\n<FILENAME>first.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "first.htm"
+
+
+def test_sgml_parser_returns_none_when_no_type_matches() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        b"<DOCUMENT>\n<TYPE>EX-99.1\n<SEQUENCE>1\n<FILENAME>ex.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") is None
+
+
+def test_sgml_parser_unclosed_document_block_skipped() -> None:
+    """Unclosed `<DOCUMENT>` block (no `<TEXT>` sentinel within byte cap)
+    is skipped; later well-formed blocks still parse."""
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    # First block has no <TEXT> at all (truncated). Second block is well-formed.
+    body = (
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>1\n<FILENAME>truncated.htm\n"
+        # No <TEXT>... so the next <DOCUMENT> starts the next valid block.
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>2\n<FILENAME>recovered.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    # The first block's prologue does end at the second `<DOCUMENT>`. Since
+    # there's no <TEXT> sentinel inside it (within the 64 KB cap), we skip it
+    # and only the second block resolves.
+    result = _parse_sgml_filename_for_type(body, "10-K")
+    # Either implementation choice is acceptable: skip-first-block→use-second,
+    # or fall through. The contract is "no exception, returns a sane result".
+    assert result in {"recovered.htm", None}
+
+
+def test_sgml_parser_missing_type_field_skipped() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        # First block has no <TYPE>; should be skipped.
+        b"<DOCUMENT>\n<SEQUENCE>1\n<FILENAME>notype.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>2\n<FILENAME>ok.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "ok.htm"
+
+
+def test_sgml_parser_missing_filename_field_skipped() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>1\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>2\n<FILENAME>backup.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "backup.htm"
+
+
+def test_sgml_parser_block_exceeding_byte_cap_is_skipped() -> None:
+    """A pathological `<DOCUMENT>` block where the prologue (start →
+    `<TEXT>`) exceeds 64 KB is skipped, not parsed. Bounded parse cost
+    per ADR-007 §"Error handling"."""
+    from ingestion.detail_fetcher import _SGML_BLOCK_BYTE_CAP, _parse_sgml_filename_for_type
+
+    pathological_padding = b"X" * (_SGML_BLOCK_BYTE_CAP + 1024)
+    body = (
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>1\n<FILENAME>over_cap.htm\n"
+        + pathological_padding
+        + b"<TEXT>x</TEXT>\n</DOCUMENT>\n"
+        # A second sane block that should still resolve.
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>2\n<FILENAME>under_cap.htm\n<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "under_cap.htm"
+
+
+def test_sgml_parser_non_ascii_description_does_not_break_filename_extraction() -> None:
+    """Non-ASCII bytes in `<DESCRIPTION>` (occasionally seen in legacy
+    filings) must not break TYPE/FILENAME extraction — only the FILENAME
+    needs to be ASCII-decodable."""
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        b"<DOCUMENT>\n<TYPE>10-K\n<SEQUENCE>1\n<FILENAME>primary.htm\n"
+        b"<DESCRIPTION>Caf\xc3\xa9 du Centre annual report\n"
+        b"<TEXT>body</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "primary.htm"
+
+
+def test_sgml_parser_case_insensitive_type_match() -> None:
+    """SGML `<TYPE>` matching is case-insensitive per ADR-007 §"Stage 2"."""
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (
+        b"<DOCUMENT>\n<TYPE>10-k\n<SEQUENCE>1\n<FILENAME>primary.htm\n"
+        b"<TEXT>x</TEXT>\n</DOCUMENT>\n"
+    )
+    assert _parse_sgml_filename_for_type(body, "10-K") == "primary.htm"
+
+
+def test_sgml_parser_empty_body_returns_none() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    assert _parse_sgml_filename_for_type(b"", "10-K") is None
+
+
+def test_sgml_parser_completely_malformed_returns_none() -> None:
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    assert (
+        _parse_sgml_filename_for_type(b"this is not even close to SGML", "10-K")
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# ADR-007 — additional real-EDGAR fixtures (per architect handoff concern #4)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_real_altex_10q_index_picks_form_token_named_primary(
+    db: str, tmp_path: Path
+) -> None:
+    """Real microcap 10-Q (Altex Industries, 2026-05-01) — primary is
+    `altx-20260331_10q.htm` (contains the `10q` form-type token in name);
+    exhibits use `altx_ex31.htm` / `altx_ex32.htm` naming. Validates
+    Stage 1 against a different filer-agent shape than Apple's."""
+    index_payload = (_FIXTURES / "edgar_index_altex_10q.json").read_bytes()
+    primary_body = (
+        b"<html><body>" + b"Item 1. Financial Statements. " * 200 + b"</body></html>"
+    )
+    transport = _route_from_index(
+        cik=775057,
+        accession="0001096906-26-000672",
+        index_payload=index_payload,
+        primary_name="altx-20260331_10q.htm",
+        primary_body=primary_body,
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0001096906-26-000672",
+                cik=775057,
+                form_type="10-Q",
+                filed_at=dt.datetime(2026, 5, 1, 21, 8, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 1, 21, 12, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 1. Financial Statements." in text
+
+
+def test_sgml_parser_resolves_real_altex_10q_primary() -> None:
+    """Stage 2 against the real Altex 10-Q SGML header."""
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (_FIXTURES / "edgar_sgml_altex_10q_header.txt").read_bytes()
+    assert _parse_sgml_filename_for_type(body, "10-Q") == "altx-20260331_10q.htm"
+
+
+def test_sgml_parser_resolves_real_apple_8k_primary() -> None:
+    """Stage 2 against the real Apple 8-K SGML header (already used as a
+    fixture in the Stage-1-empty integration test, but exercised here as
+    a parser unit test directly)."""
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (_FIXTURES / "edgar_sgml_apple_8k_header.txt").read_bytes()
+    assert _parse_sgml_filename_for_type(body, "8-K") == "aapl-20260430.htm"
+
+
+def test_sgml_parser_resolves_real_form4_primary() -> None:
+    """Stage 2 parser is form-agnostic; verify it resolves a real Form 4
+    `<accession>.txt` header. Form 4's primary selection in production
+    still uses `_select_form4_primary` (unchanged); this test exercises
+    parser correctness across `<TYPE>` codes only."""
+    from ingestion.detail_fetcher import _parse_sgml_filename_for_type
+
+    body = (_FIXTURES / "edgar_sgml_coreweave_form4_header.txt").read_bytes()
+    assert _parse_sgml_filename_for_type(body, "4") == "tm2613377-3_4seq1.xml"

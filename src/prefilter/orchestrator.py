@@ -77,10 +77,12 @@ class Prefilter:
         db_path: str,
         universe: Universe,
         similarity: SimilarityChecker,
+        form_4_enabled: bool = True,
     ) -> None:
         self.db_path = db_path
         self.universe = universe
         self.similarity = similarity
+        self.form_4_enabled = form_4_enabled
         self._item_code = ItemCodePrefilter()
 
     # ------------------------------------------------------------------
@@ -145,6 +147,11 @@ class Prefilter:
 
         # Stage 3 — Form 4 universe-only per PRD §8.3 / D-014.
         if filing.form_type == "4":
+            if not self.form_4_enabled:
+                return PrefilterDecision(
+                    decision="reject",
+                    rule_fired="form_4_disabled",
+                )
             return PrefilterDecision(
                 decision="accept",
                 rule_fired="form_4_universe_only",

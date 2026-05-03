@@ -25,10 +25,11 @@
     <tr>
       <th>created_at</th>
       <th>decision_id</th>
+      <th>kind</th>
       <th>symbol</th>
       <th>direction</th>
       <th>conviction</th>
-      <th>thesis</th>
+      <th>thesis / reason</th>
       <th>execution</th>
       <th>raw + review</th>
     </tr>
@@ -38,10 +39,23 @@
     <tr>
       <td>{{ row.created_at }}</td>
       <td>{{ row.decision_id }}</td>
+      <td><span class="kind-badge kind-{{ row.kind }}">{{ row.kind }}</span></td>
       <td>{{ row.symbol or '' }}</td>
       <td>{{ row.direction or '' }}</td>
       <td>{{ row.conviction if row.conviction is not none else '' }}</td>
-      <td>{{ row.thesis or '' }}</td>
+      <td>
+        {% set text = row.thesis or row.display_thesis %}
+        {% if text %}
+          {% if text|length > 200 %}
+            <details>
+              <summary>{{ text[:200] }}…</summary>
+              <p>{{ text }}</p>
+            </details>
+          {% else %}
+            {{ text }}
+          {% endif %}
+        {% endif %}
+      </td>
       <td>{{ row.execution_decision or '—' }}</td>
       <td>
         <details>

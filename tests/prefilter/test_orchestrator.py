@@ -244,6 +244,62 @@ def test_form_4_accepted_no_similarity_call(
 
 
 # ---------------------------------------------------------------------------
+# P1.5 — form_4_enabled feature flag
+# ---------------------------------------------------------------------------
+
+
+def test_form_4_disabled_rejects_with_persisted_decision(
+    db_path: str, universe: Universe
+) -> None:
+    """When the `form_4_enabled` flag is False, every Form 4 filing rejects
+    with `rule_fired="form_4_disabled"` and the decision is persisted to
+    `prefilter_decisions` consistently with other reject paths."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(
+        db_path=db_path,
+        universe=universe,
+        similarity=sim_spy,
+        form_4_enabled=False,
+    )
+
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000001",
+        cik=320193,
+        form_type="4",
+    )
+    decision = pref.evaluate(f, "any text")
+
+    assert decision.decision == "reject"
+    assert decision.rule_fired == "form_4_disabled"
+    sim_spy.check.assert_not_called()
+
+    persisted = get_prefilter_decision_by_filing(db_path, f.id or 0)
+    assert persisted is not None
+    assert persisted.decision == "reject"
+    assert persisted.rule_fired == "form_4_disabled"
+
+
+def test_form_4_enabled_default_unchanged_behavior(
+    db_path: str, universe: Universe
+) -> None:
+    """Default `form_4_enabled=True` preserves the existing accept path."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000002",
+        cik=320193,
+        form_type="4",
+    )
+    decision = pref.evaluate(f, "any text")
+
+    assert decision.decision == "accept"
+    assert decision.rule_fired == "form_4_universe_only"
+
+
+# ---------------------------------------------------------------------------
 # AC-2.5 — 10-Q near-duplicate rejected by similarity
 # ---------------------------------------------------------------------------
 
