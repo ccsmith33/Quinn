@@ -1,5 +1,48 @@
 {% extends "layout.html" %}
 {% block content %}
+<style>
+  /* Proposals page widens main to give the thesis column real estate. */
+  main { max-width: 1600px; }
+  table.proposals-table { table-layout: fixed; width: 100%; }
+  table.proposals-table th, table.proposals-table td {
+    vertical-align: top;
+    overflow-wrap: anywhere;
+  }
+  table.proposals-table .col-thesis {
+    /* Wide enough for 3-6 lines of typical thesis text without
+       per-character wrapping. */
+    min-width: 360px;
+    max-width: 480px;
+    white-space: normal;
+    word-break: normal;
+    overflow-wrap: break-word;
+  }
+  table.proposals-table .col-when { width: 11ch; }
+  table.proposals-table .col-decision-id { width: 18ch; }
+  table.proposals-table .col-kind { width: 7em; }
+  table.proposals-table .col-symbol { width: 6em; }
+  table.proposals-table .col-direction { width: 5em; }
+  table.proposals-table .col-conviction { width: 5em; }
+  table.proposals-table .col-execution { width: 7em; }
+  table.proposals-table .col-raw { width: 14em; }
+  /* On narrower viewports, fall back to auto layout so columns reflow. */
+  @media (max-width: 900px) {
+    table.proposals-table { table-layout: auto; }
+    table.proposals-table .col-thesis { min-width: 0; max-width: none; }
+  }
+  /* No-trade rows have NULL direction/conviction/execution. Mute those
+     cells (and the symbol fallback when shown) so the eye flows past
+     them to the thesis. CSS only — no conditional rendering. */
+  table.proposals-table tr.row-no_trade .col-direction,
+  table.proposals-table tr.row-no_trade .col-conviction,
+  table.proposals-table tr.row-no_trade .col-execution {
+    color: var(--pico-muted-color);
+    font-size: 0.85em;
+  }
+  table.proposals-table tr.row-no_trade .col-symbol .filing-ticker {
+    color: var(--pico-muted-color);
+  }
+</style>
 <h2>Proposals</h2>
 
 <form method="get" action="/proposals">
@@ -20,30 +63,36 @@
 {% if rows | length == 0 %}
   <p>no proposals match.</p>
 {% else %}
-<table role="grid">
+<table role="grid" class="proposals-table">
   <thead>
     <tr>
-      <th>created_at</th>
-      <th>decision_id</th>
-      <th>kind</th>
-      <th>symbol</th>
-      <th>direction</th>
-      <th>conviction</th>
-      <th>thesis / reason</th>
-      <th>execution</th>
-      <th>raw + review</th>
+      <th class="col-when">created_at</th>
+      <th class="col-decision-id">decision_id</th>
+      <th class="col-kind">kind</th>
+      <th class="col-symbol">symbol</th>
+      <th class="col-direction">direction</th>
+      <th class="col-conviction">conviction</th>
+      <th class="col-thesis">thesis / reason</th>
+      <th class="col-execution">execution</th>
+      <th class="col-raw">raw + review</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
-    <tr>
-      <td>{{ row.created_at }}</td>
-      <td>{{ row.decision_id }}</td>
-      <td><span class="kind-badge kind-{{ row.kind }}">{{ row.kind }}</span></td>
-      <td>{{ row.symbol or '' }}</td>
-      <td>{{ row.direction or '' }}</td>
-      <td>{{ row.conviction if row.conviction is not none else '' }}</td>
-      <td>
+    <tr class="row-{{ row.kind }}">
+      <td class="col-when">{{ row.created_at }}</td>
+      <td class="col-decision-id">{{ row.decision_id }}</td>
+      <td class="col-kind"><span class="kind-badge kind-{{ row.kind }}">{{ row.kind }}</span></td>
+      <td class="col-symbol">
+        {% if row.symbol %}
+          <strong>{{ row.symbol }}</strong>
+        {% elif row.filing_ticker %}
+          <em class="filing-ticker" title="from filing issuer">{{ row.filing_ticker }}</em>
+        {% endif %}
+      </td>
+      <td class="col-direction">{{ row.direction or '—' }}</td>
+      <td class="col-conviction">{{ row.conviction if row.conviction is not none else '—' }}</td>
+      <td class="col-thesis">
         {% set text = row.thesis or row.display_thesis %}
         {% if text %}
           {% if text|length > 200 %}
@@ -56,8 +105,8 @@
           {% endif %}
         {% endif %}
       </td>
-      <td>{{ row.execution_decision or '—' }}</td>
-      <td>
+      <td class="col-execution">{{ row.execution_decision or '—' }}</td>
+      <td class="col-raw">
         <details>
           <summary>show raw_response + opus review</summary>
           <h4>Sonnet raw_response</h4>
