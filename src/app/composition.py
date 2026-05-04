@@ -38,6 +38,7 @@ from execution.validator import ProposalValidator
 from ingestion.detail_fetcher import DetailFetcher
 from ingestion.edgar_client import EdgarClient
 from ingestion.rss_loop import DiscoveredFiling, RssDiscoveryLoop
+from ingestion.ticker_resolver import TickerResolver
 from journal.models import FilingRow, PromptRow
 from journal.repo import JournalRepo, insert_prompt
 from killswitch.api import KillSwitch
@@ -243,10 +244,21 @@ def compose_agent(
         poll_market_seconds=config.ingestion.rss_poll_seconds_market,
         poll_offhours_seconds=config.ingestion.rss_poll_seconds_offhours,
     )
+    # Hotfix 2026-05-04: prose-form ingestion (8-K / 10-Q / 425 / 424B5 /
+    # DEF 14A) historically wrote NULL `issuer_ticker`, which made the
+    # analyzer treat every issuer as not-in-universe and refuse all
+    # proposals. The resolver consults SEC's `company_tickers.json` (with
+    # local cache) and is shared via the existing `EdgarClient` so SEC
+    # rate-limits and User-Agent headers are honored.
+    ticker_resolver = TickerResolver(
+        edgar=edgar,
+        cache_path=Path(config.ingestion.ticker_cache_path),
+    )
     detail_fetcher = DetailFetcher(
         edgar=edgar,
         db_path=journal.db_path,
         raw_root=Path(config.ingestion.raw_filings_root),
+        ticker_resolver=ticker_resolver,
     )
 
     components = AgentComponents(

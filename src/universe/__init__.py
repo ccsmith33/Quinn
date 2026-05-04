@@ -3,7 +3,12 @@
 from .alpaca_assets import AlpacaAsset, fetch_alpaca_assets
 from .api import NoUniverseSnapshot, Universe, UniverseMember
 from .market_data import Fundamentals, MarketDataProvider
-from .sec_tickers import SEC_TICKERS_URL, SecTicker, fetch_sec_tickers
+from .sec_tickers import (
+    SEC_TICKERS_URL,
+    SecTicker,
+    fetch_sec_tickers,
+    parse_company_tickers_payload,
+)
 from .yfinance_provider import YFinanceProvider
 
 __all__ = [
@@ -18,4 +23,5 @@ __all__ = [
     "YFinanceProvider",
     "fetch_alpaca_assets",
     "fetch_sec_tickers",
+    "parse_company_tickers_payload",
 ]
