@@ -27,6 +27,7 @@ import datetime as dt
 import json
 import re
 from pathlib import Path
+from typing import Protocol
 
 from ingestion.edgar_client import EdgarClient, EdgarUnavailable
 from ingestion.normalize import content_hash
@@ -37,6 +38,14 @@ from ingestion.rss_loop import DiscoveredFiling
 from journal.models import FilingRow
 from journal.repo import DuplicateAccession, insert_filing
 from observability.log_port import get_logger
+
+
+class _TickerResolverProto(Protocol):
+    """Minimal contract for the CIK→ticker resolver. See
+    `ingestion.ticker_resolver.TickerResolver` for the production impl.
+    """
+
+    async def resolve(self, cik: int) -> str | None: ...
 
 _log = get_logger(__name__)
 _ARCHIVES_BASE = "https://www.sec.gov/Archives/edgar/data"
@@ -236,11 +245,16 @@ class DetailFetcher:
         edgar: EdgarClient,
         db_path: str,
         raw_root: Path,
+        ticker_resolver: _TickerResolverProto | None = None,
     ) -> None:
         self._edgar = edgar
         self._db_path = db_path
         self._raw_root = Path(raw_root)
         self._raw_root.mkdir(parents=True, exist_ok=True)
+        # Optional CIK→ticker resolver; when None, prose-form filings land
+        # with `issuer_ticker=None` (legacy behavior). Production wiring
+        # injects an `ingestion.ticker_resolver.TickerResolver`.
+        self._ticker_resolver = ticker_resolver
 
     async def fetch_and_persist(self, filing: DiscoveredFiling) -> int:
         """Fetch + parse + persist one filing. Returns the journal `filings.id`.
@@ -327,6 +341,11 @@ class DetailFetcher:
         if filing.form_type == "8-K":
             codes = extract_item_codes(text)
             item_codes_json = json.dumps(codes)
+        # Hotfix 2026-05-04: prose-form filings (8-K, 10-Q, 425, 424B5,
+        # DEF 14A, …) historically landed with NULL ticker, blocking the
+        # analyzer's universe gate. When a resolver is wired, consult it;
+        # any failure falls through to NULL (the ingest must complete).
+        issuer_ticker = await self._resolve_ticker(filing.cik)
         row = FilingRow(
             accession_number=filing.accession_number,
             cik=filing.cik,
@@ -336,11 +355,31 @@ class DetailFetcher:
             raw_text_path=str(raw_path),
             content_hash=content_hash(text),
             item_codes=item_codes_json,
-            issuer_ticker=None,
+            issuer_ticker=issuer_ticker,
             ingest_state="ok",
             ingest_error=None,
         )
         return insert_filing(self._db_path, row)
+
+    async def _resolve_ticker(self, cik: int) -> str | None:
+        """Best-effort CIK→ticker via the injected resolver.
+
+        Never raises: a resolver-internal exception falls through to
+        `issuer_ticker=None` rather than blocking ingest.
+        """
+        if self._ticker_resolver is None:
+            return None
+        try:
+            return await self._ticker_resolver.resolve(cik)
+        except Exception:  # noqa: BLE001 — defensive at the resolver boundary
+            _log.exception(
+                "detail_fetcher.ticker_resolver_error",
+                extra={
+                    "event": "detail_fetcher.ticker_resolver_error",
+                    "cik": cik,
+                },
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Helpers

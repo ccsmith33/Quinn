@@ -30,6 +30,9 @@ class IngestionConfig(_Section):
     edgar_user_agent: str
     rss_cursor_path: str = Field(default="/var/lib/quinn/state/rss_cursor.json")
     raw_filings_root: str = Field(default="/var/lib/quinn/raw")
+    # Hotfix 2026-05-04 — local persistence of SEC `company_tickers.json`
+    # so the resolver survives SEC outages with a warm cache.
+    ticker_cache_path: str = Field(default="/var/lib/quinn/cache/cik_ticker_map.json")
 
 
 class PrefilterConfig(_Section):

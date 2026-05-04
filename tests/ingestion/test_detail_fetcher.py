@@ -1006,3 +1006,328 @@ def test_sgml_parser_resolves_real_form4_primary() -> None:
 
     body = (_FIXTURES / "edgar_sgml_coreweave_form4_header.txt").read_bytes()
     assert _parse_sgml_filename_for_type(body, "4") == "tm2613377-3_4seq1.xml"
+
+
+# ---------------------------------------------------------------------------
+# Production hotfix (2026-05-04): non-Form-4 paths must populate
+# `issuer_ticker` via `TickerResolver`. Without this, every 8-K / 10-Q /
+# 425 / 424B5 / DEF 14A landed with NULL ticker, the analyzer's universe
+# context-builder declared the issuer not-in-universe, and Sonnet refused
+# every proposal.
+# ---------------------------------------------------------------------------
+
+
+class _StaticResolver:
+    """Test double for `TickerResolver` — a fixed map, no I/O."""
+
+    def __init__(self, m: dict[int, str]) -> None:
+        self._m = m
+        self.calls: list[int] = []
+
+    async def resolve(self, cik: int) -> str | None:
+        self.calls.append(cik)
+        return self._m.get(int(cik))
+
+
+@pytest.mark.asyncio
+async def test_prose_form_populates_issuer_ticker_via_resolver(
+    db: str, tmp_path: Path
+) -> None:
+    """An 8-K from a known CIK must land with `issuer_ticker` populated by
+    the resolver — fixes the production bug where this field was NULL."""
+    body = b"<html><body><p>Item 8.01 Other Events.</p></body></html>"
+    transport = _route(
+        cik=320193,
+        accession="0000320193-26-000050",
+        primary_name="aapl-8k.htm",
+        primary_body=body,
+    )
+    edgar = _client(transport)
+    resolver = _StaticResolver({320193: "AAPL"})
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+        ticker_resolver=resolver,
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0000320193-26-000050",
+                cik=320193,
+                form_type="8-K",
+                filed_at=dt.datetime(2026, 5, 4, 13, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 4, 13, 31, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    assert row.issuer_ticker == "AAPL"
+    # Resolver was actually consulted (vs. some other path setting it).
+    assert resolver.calls == [320193]
+
+
+@pytest.mark.asyncio
+async def test_prose_form_unresolvable_cik_leaves_ticker_null(
+    db: str, tmp_path: Path
+) -> None:
+    """CIK not in the resolver's map → `issuer_ticker=NULL` and ingest
+    completes successfully (no crash, no partial)."""
+    body = b"<html><body><p>Item 8.01.</p></body></html>"
+    transport = _route(
+        cik=999_999_999,
+        accession="0099999999-26-000001",
+        primary_name="x.htm",
+        primary_body=body,
+    )
+    edgar = _client(transport)
+    resolver = _StaticResolver({320193: "AAPL"})  # 999_999_999 absent
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+        ticker_resolver=resolver,
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0099999999-26-000001",
+                cik=999_999_999,
+                form_type="8-K",
+                filed_at=dt.datetime(2026, 5, 4, 13, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 4, 13, 31, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    assert row.issuer_ticker is None
+
+
+@pytest.mark.asyncio
+async def test_prose_form_resolver_raising_does_not_crash_ingest(
+    db: str, tmp_path: Path
+) -> None:
+    """If the resolver itself raises (it shouldn't — but defense in depth),
+    ingest must still complete. NULL ticker is acceptable; crashing the
+    agent loop is not."""
+
+    class _BrokenResolver:
+        async def resolve(self, cik: int) -> str | None:  # noqa: ARG002
+            raise RuntimeError("resolver internal error")
+
+    body = b"<html><body><p>Item 1.01.</p></body></html>"
+    transport = _route(
+        cik=320193,
+        accession="0000320193-26-000051",
+        primary_name="x.htm",
+        primary_body=body,
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+        ticker_resolver=_BrokenResolver(),
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0000320193-26-000051",
+                cik=320193,
+                form_type="8-K",
+                filed_at=dt.datetime(2026, 5, 4, 13, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 4, 13, 31, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    # Acceptable outcomes: ok with NULL ticker, OR partial. NOT a crash
+    # of the caller. We assert "row landed AND ticker is None".
+    assert row.issuer_ticker is None
+
+
+@pytest.mark.asyncio
+async def test_form4_ticker_unaffected_by_resolver(
+    db: str, tmp_path: Path
+) -> None:
+    """Form 4 already extracts ticker from `issuerTradingSymbol` in the
+    XML; the resolver must not override that path."""
+    transport = _route(
+        cik=1234567,
+        accession="0001234567-26-000310",
+        primary_name="form4.xml",
+        primary_body=_FORM4_XML,
+        primary_type="4",
+    )
+    edgar = _client(transport)
+    # Resolver returns a DIFFERENT ticker for the same CIK — Form 4 path
+    # should ignore the resolver entirely.
+    resolver = _StaticResolver({1234567: "WRONG"})
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+        ticker_resolver=resolver,
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000310", form_type="4")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    # Form 4 XML's `issuerTradingSymbol` is "ACME" — must not be overwritten
+    # by the resolver's "WRONG".
+    assert row.issuer_ticker == "ACME"
+    # Form 4 path should not have called the resolver at all.
+    assert resolver.calls == []
+
+
+@pytest.mark.asyncio
+async def test_partial_ingest_does_not_call_resolver(
+    db: str, tmp_path: Path
+) -> None:
+    """When ingest fails before the success row is built (e.g. index 404),
+    the resolver should not be consulted — partial rows have NULL ticker
+    by definition and we don't want spurious SEC traffic on the error path.
+    """
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, text="not found")
+
+    transport = httpx.MockTransport(handle)
+    edgar = _client(transport)
+    resolver = _StaticResolver({320193: "AAPL"})
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+        ticker_resolver=resolver,
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0000320193-26-000052",
+                cik=320193,
+                form_type="10-K",
+                filed_at=dt.datetime(2026, 5, 4, 13, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 4, 13, 31, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "partial"
+    assert row.issuer_ticker is None
+    assert resolver.calls == []  # never called on the error path
+
+
+@pytest.mark.asyncio
+async def test_no_resolver_keeps_existing_behavior_null_ticker(
+    db: str, tmp_path: Path
+) -> None:
+    """Backwards compatibility: when no resolver is wired (None), prose
+    forms still ingest fine, just with NULL ticker — exactly the prior
+    behavior before the hotfix. This guards the optional-arg contract."""
+    body = b"<html><body><p>Item 8.01.</p></body></html>"
+    transport = _route(
+        cik=320193,
+        accession="0000320193-26-000053",
+        primary_name="x.htm",
+        primary_body=body,
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number="0000320193-26-000053",
+                cik=320193,
+                form_type="8-K",
+                filed_at=dt.datetime(2026, 5, 4, 13, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 4, 13, 31, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok"
+    assert row.issuer_ticker is None
+
+
+@pytest.mark.asyncio
+async def test_real_resolver_sec_unreachable_ingest_completes_with_null(
+    db: str, tmp_path: Path
+) -> None:
+    """End-to-end safety check (reviewer-flagged): when the REAL
+    `TickerResolver` is wired and SEC's `company_tickers.json` endpoint is
+    unreachable AND the on-disk cache is missing, ingest must complete
+    successfully with `issuer_ticker=NULL` — never crash the agent loop.
+    """
+    from ingestion.ticker_resolver import TickerResolver
+
+    body = b"<html><body><p>Item 8.01.</p></body></html>"
+    accession = "0000320193-26-000099"
+    acc_nd = accession.replace("-", "")
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        # Fail every company_tickers.json request — simulating SEC down.
+        if "company_tickers.json" in url:
+            raise httpx.ConnectError("simulated DNS failure")
+        # Normal index + primary doc routing for the filing under test.
+        if "index.json" in url and acc_nd in url:
+            items = [{"name": "x.htm", "type": "text.gif", "size": str(len(body))}]
+            return httpx.Response(
+                200,
+                content=json.dumps({"directory": {"item": items, "name": "f"}}).encode(),
+            )
+        if "x.htm" in url:
+            return httpx.Response(200, content=body)
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    edgar = _client(httpx.MockTransport(handle))
+    cache_path = tmp_path / "cache" / "cik_ticker_map.json"
+    # Cache deliberately absent → resolver must give up gracefully.
+    assert not cache_path.exists()
+    resolver = TickerResolver(edgar=edgar, cache_path=cache_path)
+
+    fetcher = DetailFetcher(
+        edgar=edgar,
+        db_path=db,
+        raw_root=tmp_path / "raw",
+        ticker_resolver=resolver,
+    )
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            DiscoveredFiling(
+                accession_number=accession,
+                cik=320193,
+                form_type="8-K",
+                filed_at=dt.datetime(2026, 5, 4, 13, 30, tzinfo=dt.UTC),
+                discovered_at=dt.datetime(2026, 5, 4, 13, 31, tzinfo=dt.UTC),
+            )
+        )
+    finally:
+        await edgar.aclose()
+
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    # The two reviewer-required assertions (NOT just "no exception"):
+    assert row.ingest_state == "ok", row.ingest_error
+    assert row.issuer_ticker is None
