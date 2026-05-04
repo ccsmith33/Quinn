@@ -901,14 +901,27 @@ class JournalRepo:
         limit: int = 100,
         symbol: str | None = None,
         decision_status: str | None = None,
-    ) -> list[ProposalRow]:
+    ) -> list[tuple[ProposalRow, str | None]]:
         """Most-recent proposals (created_at DESC) with optional filters.
+
+        Each result is a `(ProposalRow, filing_ticker)` tuple: the second
+        element is the LEFT-JOINed `filings.issuer_ticker` so the dashboard
+        can fall back to the filing-issuer ticker when `proposals.symbol`
+        is NULL (typical for `kind='no_trade'`).
 
         `decision_status` filters on the JOINed `executions.decision` column
         (None when no execution row exists yet — those rows are dropped from
         the result when this filter is set).
+
+        `symbol` matches against EITHER `proposals.symbol` OR
+        `filings.issuer_ticker` (exact match), so an operator searching for
+        "AAPL" finds rows where AAPL appears as either the analyzer-chosen
+        trade symbol or the filing issuer.
         """
-        sql = "SELECT p.* FROM proposals p"
+        sql = (
+            "SELECT p.*, f.issuer_ticker AS filing_ticker FROM proposals p "
+            "LEFT JOIN filings f ON f.id = p.filing_id"
+        )
         params: list[object] = []
         wheres: list[str] = []
         if decision_status is not None:
@@ -916,7 +929,8 @@ class JournalRepo:
             wheres.append("e.decision = ?")
             params.append(decision_status)
         if symbol is not None:
-            wheres.append("p.symbol = ?")
+            wheres.append("(p.symbol = ? OR f.issuer_ticker = ?)")
+            params.append(symbol)
             params.append(symbol)
         if wheres:
             sql += " WHERE " + " AND ".join(wheres)
@@ -924,7 +938,12 @@ class JournalRepo:
         params.append(int(limit))
         with connect(self.db_path) as conn:
             rows = conn.execute(sql, tuple(params)).fetchall()
-        return [ProposalRow(**dict(r)) for r in rows]
+        out: list[tuple[ProposalRow, str | None]] = []
+        for r in rows:
+            d = dict(r)
+            ticker = d.pop("filing_ticker", None)
+            out.append((ProposalRow(**d), ticker))
+        return out
 
     def get_review_for_proposal(
         self, proposal_id: int

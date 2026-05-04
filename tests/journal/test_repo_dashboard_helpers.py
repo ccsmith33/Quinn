@@ -218,10 +218,10 @@ def test_list_recent_proposals_with_filters(
     assert len(all_rows) == 3
     only_ab1 = journal.list_recent_proposals(limit=100, symbol="AB1")
     assert len(only_ab1) == 1
-    assert only_ab1[0].symbol == "AB1"
+    assert only_ab1[0][0].symbol == "AB1"
     accepted = journal.list_recent_proposals(limit=100, decision_status="accepted")
     assert len(accepted) == 1
-    assert accepted[0].decision_id == "d-0"
+    assert accepted[0][0].decision_id == "d-0"
 
 
 def test_list_recent_executions_with_orders(

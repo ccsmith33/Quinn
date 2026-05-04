@@ -210,7 +210,7 @@ def build_app(
             limit=limit, symbol=sym, decision_status=eff_status
         )
         enriched: list[dict[str, Any]] = []
-        for p in rows:
+        for p, filing_ticker in rows:
             review = journal.get_review_for_proposal(p.id) if p.id else None
             execrow = journal.get_execution_for_proposal(p.id) if p.id else None
             display_thesis = p.thesis
@@ -232,6 +232,7 @@ def build_app(
                     "decision_id": p.decision_id,
                     "kind": p.kind,
                     "symbol": p.symbol,
+                    "filing_ticker": filing_ticker,
                     "direction": p.direction,
                     "conviction": p.conviction,
                     "thesis": p.thesis,

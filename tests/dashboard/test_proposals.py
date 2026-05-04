@@ -169,3 +169,100 @@ def test_proposals_no_trade_row_with_invalid_raw_response_does_not_500(
     resp = client.get("/proposals", headers=auth_headers())
     assert resp.status_code == 200
     assert "no_trade" in resp.text
+
+
+def test_proposals_no_trade_row_renders_filing_ticker_as_symbol_fallback(
+    client: TestClient, journal, db_path: str
+) -> None:
+    """When `proposals.symbol` is NULL (typical for `kind='no_trade'`) but
+    the underlying filing has a populated `issuer_ticker`, the symbol
+    column on `/proposals` must fall back to the filing's ticker so the
+    operator can scan rows by ticker. The fallback must be visually
+    distinguishable from a `proposals.symbol` value (italics or a
+    "(filing)" prefix is acceptable).
+    """
+    seed_prompt(db_path)
+    # seed_filings populates issuer_ticker as "AB0", "AB1", ...
+    fids = seed_filings(db_path, n=1)
+    insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fids[0],
+            decision_id="d-no-trade-fallback",
+            model_id="claude-sonnet-4-6",
+            prompt_version="sonnet:v1#abc",
+            raw_response='{"decision":"no_trade","thesis_or_reason":"pass"}',
+            kind="no_trade",
+            symbol=None,
+            direction=None,
+            conviction=None,
+            thesis=None,
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_usd=0.0,
+        ),
+    )
+    resp = client.get("/proposals", headers=auth_headers())
+    assert resp.status_code == 200
+    body = resp.text
+    # Filing ticker must reach the page in lieu of proposals.symbol.
+    assert "AB0" in body
+    # Visual distinction: the fallback must be wrapped in <em> (italics)
+    # so the operator can tell it came from the filing, not the analyzer.
+    # The <em> wrapper may carry attributes; just assert <em ... >AB0</em>.
+    import re as _re
+    assert _re.search(r"<em[^>]*>AB0</em>", body) is not None
+
+
+def test_proposals_symbol_filter_matches_filing_issuer_ticker(
+    client: TestClient, journal, db_path: str
+) -> None:
+    """`?symbol=` must match either `proposals.symbol` or the JOINed
+    `filings.issuer_ticker`, so an operator searching for "AB0" finds
+    no_trade rows where AB0 is the filing issuer even though the
+    proposal itself has NULL symbol.
+    """
+    seed_prompt(db_path)
+    fids = seed_filings(db_path, n=2)  # AB0, AB1
+    # No-trade proposal on filing 0 (issuer_ticker AB0), NULL symbol.
+    insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fids[0],
+            decision_id="d-filter-fallback",
+            model_id="claude-sonnet-4-6",
+            prompt_version="sonnet:v1#abc",
+            raw_response='{"decision":"no_trade","thesis_or_reason":"pass"}',
+            kind="no_trade",
+            symbol=None,
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_usd=0.0,
+        ),
+    )
+    # No-trade proposal on filing 1 (issuer_ticker AB1), NULL symbol.
+    insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fids[1],
+            decision_id="d-filter-other",
+            model_id="claude-sonnet-4-6",
+            prompt_version="sonnet:v1#abc",
+            raw_response='{"decision":"no_trade","thesis_or_reason":"pass"}',
+            kind="no_trade",
+            symbol=None,
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_usd=0.0,
+        ),
+    )
+    resp = client.get("/proposals?symbol=AB0", headers=auth_headers())
+    assert resp.status_code == 200
+    body = resp.text
+    # The AB0 filing-ticker proposal must match.
+    assert "d-filter-fallback" in body
+    # The AB1 filing-ticker proposal must be filtered out.
+    assert "d-filter-other" not in body
