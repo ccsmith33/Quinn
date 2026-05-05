@@ -18,6 +18,7 @@ import random
 import time
 from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -37,6 +38,20 @@ _DEFAULT_CIRCUIT_COOLDOWN_SECONDS = 300.0  # 5 min
 
 class EdgarUnavailable(Exception):
     """Raised when retries are exhausted on 429/5xx responses or transport errors."""
+
+
+@dataclass(frozen=True)
+class BoundedResponse:
+    """Result of `EdgarClient.get_bounded`. `body` holds bytes read so
+    far (may be partial when `truncated=True`); `truncated=True` means
+    the server attempted to send more than `max_bytes`, the connection
+    was aborted, and `body` should NOT be used (it's a partial document).
+    Callers must treat truncated responses as a fetch failure.
+    """
+
+    status_code: int
+    body: bytes
+    truncated: bool
 
 
 class CircuitOpen(Exception):
@@ -208,6 +223,113 @@ class EdgarClient:
     ) -> bytes:
         resp = await self._request("GET", url, params=params)
         return resp.content
+
+    async def get_bounded(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        params: Mapping[str, Any] | None = None,
+    ) -> BoundedResponse:
+        """Streamed GET that bounds memory at `max_bytes`.
+
+        Why this exists: `httpx.AsyncClient.request()` (used by `get` /
+        `get_bytes`) buffers the entire response body before returning.
+        For EDGAR exhibit fetches (ADR-008), an adversarial filing
+        attaching a 500 MB Exhibit 99 would OOM the agent loop before
+        any post-fetch size check. This method streams the response and
+        aborts the connection the moment cumulative bytes exceed
+        `max_bytes`, so memory is bounded regardless of server behavior.
+
+        Behavior:
+          - Goes through the same rate limiter + circuit breaker as `get`.
+          - Retries on 429/5xx / transport errors per `_max_attempts`.
+          - On 2xx + body ≤ max_bytes: returns
+            `BoundedResponse(status, body, truncated=False)`.
+          - On 2xx + body > max_bytes: aborts the read, returns
+            `BoundedResponse(status, partial_body, truncated=True)`.
+            Callers MUST treat `truncated=True` as a fetch failure
+            (partial HTML is misleading to downstream parsers).
+          - On non-2xx that survives retries: returns
+            `BoundedResponse(status, b"", truncated=False)` so callers
+            can branch on status without catching exceptions.
+          - On retry exhaustion / transport failure: raises
+            `EdgarUnavailable` (same contract as `get`).
+        """
+        if max_bytes <= 0:
+            raise ValueError("max_bytes must be positive")
+        self._breaker.before_call()
+        try:
+            result = await self._send_streamed_with_retries(url, params, max_bytes)
+        except EdgarUnavailable:
+            self._breaker.record_failure()
+            raise
+        self._breaker.record_success()
+        return result
+
+    async def _send_streamed_with_retries(
+        self,
+        url: str,
+        params: Mapping[str, Any] | None,
+        max_bytes: int,
+    ) -> BoundedResponse:
+        last_status: int | None = None
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            await self._limiter.acquire()
+            try:
+                # `stream` is the streaming-context-manager API; we
+                # iterate chunks and break out the moment we exceed the
+                # budget. The async-with closes the connection cleanly
+                # in both the success and abort paths.
+                async with self._client.stream(
+                    "GET", url, params=params
+                ) as resp:
+                    if _is_retryable_status(resp.status_code):
+                        last_status = resp.status_code
+                        last_exc = None
+                    else:
+                        chunks: list[bytes] = []
+                        cumulative = 0
+                        truncated = False
+                        async for chunk in resp.aiter_bytes():
+                            cumulative += len(chunk)
+                            if cumulative > max_bytes:
+                                truncated = True
+                                break
+                            chunks.append(chunk)
+                        return BoundedResponse(
+                            status_code=resp.status_code,
+                            body=b"".join(chunks) if not truncated else b"",
+                            truncated=truncated,
+                        )
+            except httpx.HTTPError as exc:
+                last_exc = exc
+                last_status = None
+            if attempt >= self._max_attempts:
+                break
+            self.retry_count += 1
+            self._on_event(
+                "retry",
+                {
+                    "attempt": attempt,
+                    "url": url,
+                    "status": last_status,
+                    "error": type(last_exc).__name__ if last_exc else None,
+                },
+            )
+            await asyncio.sleep(self._backoff_seconds(attempt))
+        # Retries exhausted without a non-retryable status. If the last
+        # outcome was a 4xx/5xx we know the status — surface it so the
+        # caller can branch (matches `get`'s posture for terminal 4xx).
+        if last_status is not None:
+            return BoundedResponse(
+                status_code=last_status, body=b"", truncated=False
+            )
+        raise EdgarUnavailable(
+            f"EDGAR streamed call failed after {self._max_attempts} attempts: "
+            f"url={url} last_status={last_status} last_error={last_exc!r}"
+        )
 
     async def _request(
         self,
