@@ -1331,3 +1331,794 @@ async def test_real_resolver_sec_unreachable_ingest_completes_with_null(
     # The two reviewer-required assertions (NOT just "no exception"):
     assert row.ingest_state == "ok", row.ingest_error
     assert row.issuer_ticker is None
+
+
+# ---------------------------------------------------------------------------
+# ADR-008 — Exhibit 99.x augmentation for 8-Ks with furnish items
+# (Item 2.02 Results of Operations, 7.01 Reg FD, 8.01 Other Events)
+#
+# Production bug 2026-05-05: the substance of these filings is in the
+# attached Exhibit 99 (press release / supplemental), not the 8-K body.
+# Sonnet correctly refuses to act on a body-only context. The fix:
+# additively append EX-99.1 content to `raw_text` after the primary doc.
+# ---------------------------------------------------------------------------
+
+
+def _route_with_exhibit(
+    *,
+    cik: int,
+    accession: str,
+    primary_name: str,
+    primary_body: bytes,
+    exhibits: list[dict[str, str]],
+    exhibit_bodies: dict[str, bytes],
+    exhibit_status: dict[str, int] | None = None,
+) -> httpx.MockTransport:
+    """Like `_route` but also serves a list of exhibit files.
+
+    `exhibits` are the items added alongside the primary in `index.json`;
+    `exhibit_bodies` maps filename → bytes; `exhibit_status` (optional)
+    overrides the HTTP status for selected filenames (default 200).
+    """
+    acc_nd = _accession_no_dashes(accession)
+    items: list[dict[str, str]] = list(exhibits)
+    items.append(
+        {
+            "name": primary_name,
+            "type": "text.gif",
+            "size": str(len(primary_body)),
+        }
+    )
+    statuses = exhibit_status or {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "index.json" in url and acc_nd in url:
+            return httpx.Response(200, content=_index_json(items))
+        if primary_name in url:
+            return httpx.Response(200, content=primary_body)
+        for name, body in exhibit_bodies.items():
+            if name in url:
+                status = statuses.get(name, 200)
+                if status == 200:
+                    return httpx.Response(200, content=body)
+                return httpx.Response(status, text="exhibit error")
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    return httpx.MockTransport(handle)
+
+
+@pytest.mark.asyncio
+async def test_8k_item_202_appends_exhibit_99_1_to_raw_text(
+    db: str, tmp_path: Path
+) -> None:
+    """Happy path: 8-K Item 2.02 + ex-99-1.htm in index → raw_text contains
+    BOTH the body's "Item 2.02" plus the exhibit's distinctive text."""
+    primary_body = (
+        b"<html><body>"
+        b"<p>Item 2.02 Results of Operations and Financial Condition.</p>"
+        b"<p>The information furnished pursuant to Item 2.02 shall not "
+        b"be deemed filed for the purposes of Section 18.</p>"
+        b"</body></html>"
+    )
+    exhibit_body = (
+        b"<html><body>"
+        b"<h1>ACME Corp Announces Q2 Earnings</h1>"
+        b"<p>Revenue: $1.234 billion, up 15% YoY.</p>"
+        b"<p>Diluted EPS: $0.42, beating consensus of $0.38.</p>"
+        b"</body></html>"
+    )
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000900",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000900", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    # Body content present.
+    assert "Item 2.02" in text
+    # Exhibit substance present (the distinctive numbers Sonnet was missing).
+    assert "Revenue: $1.234 billion" in text
+    assert "EPS: $0.42" in text
+
+
+@pytest.mark.asyncio
+async def test_8k_item_701_appends_exhibit_99(db: str, tmp_path: Path) -> None:
+    """Item 7.01 Reg FD also triggers exhibit fetch."""
+    primary_body = b"<html><body><p>Item 7.01 Regulation FD Disclosure.</p></body></html>"
+    exhibit_body = b"<html><body><p>Investor presentation deck Q2 2026.</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000901",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000901", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 7.01" in text
+    assert "Investor presentation deck" in text
+
+
+@pytest.mark.asyncio
+async def test_8k_item_801_appends_exhibit_99(db: str, tmp_path: Path) -> None:
+    """Item 8.01 Other Events also triggers exhibit fetch."""
+    primary_body = b"<html><body><p>Item 8.01 Other Events.</p></body></html>"
+    exhibit_body = b"<html><body><p>Press release: strategic partnership.</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000902",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000902", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "strategic partnership" in text
+
+
+@pytest.mark.asyncio
+async def test_8k_multi_item_with_furnish_triggers_exhibit_fetch(
+    db: str, tmp_path: Path
+) -> None:
+    """8-K with items 2.02 + 5.07 → exhibit IS fetched (2.02 alone qualifies)."""
+    primary_body = (
+        b"<html><body>"
+        b"<p>Item 2.02 Results of Operations.</p>"
+        b"<p>Item 5.07 Submission of Matters to a Vote of Security Holders.</p>"
+        b"</body></html>"
+    )
+    exhibit_body = (
+        b"<html><body><p>Q3 earnings press release with revenue figures.</p></body></html>"
+    )
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000903",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000903", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "earnings press release" in text
+
+
+@pytest.mark.asyncio
+async def test_8k_non_furnish_item_only_does_not_fetch_exhibit(
+    db: str, tmp_path: Path
+) -> None:
+    """Regression guard: 8-K with ONLY non-furnish items (e.g. 5.02 officer
+    changes) must NOT fetch an exhibit. The exclusion regex still wins for
+    these — we don't want to bloat raw_text on filings whose body IS the
+    substance."""
+    primary_body = (
+        b"<html><body>"
+        b"<p>Item 5.02 Departure of Directors or Certain Officers.</p>"
+        b"<p>The CFO resigned effective immediately. The board appointed an interim CFO.</p>"
+        b"</body></html>"
+    )
+    # Provide an EX-99 in the index — it MUST NOT be fetched.
+    exhibit_body = b"<html><body><p>UNRELATED EXHIBIT CONTENT MARKER</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000904",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000904", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 5.02" in text
+    # Exhibit must NOT have been included.
+    assert "UNRELATED EXHIBIT CONTENT MARKER" not in text
+
+
+@pytest.mark.asyncio
+async def test_8k_furnish_item_no_exhibit_in_index_uses_body_only(
+    db: str, tmp_path: Path
+) -> None:
+    """Furnish item but no EX-99 in index → ingest succeeds with body-only.
+    The pre-fix behavior is preserved as a degraded outcome, not a crash."""
+    primary_body = (
+        b"<html><body>"
+        b"<p>Item 7.01 Regulation FD Disclosure. The full content is on the company website.</p>"
+        b"</body></html>"
+    )
+    transport = _route(
+        cik=1234567,
+        accession="0001234567-26-000905",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        # No exhibit in index.
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000905", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 7.01" in text
+
+
+@pytest.mark.asyncio
+async def test_8k_exhibit_fetch_failure_falls_back_to_body_only(
+    db: str, tmp_path: Path
+) -> None:
+    """Exhibit fetch returns 4xx → ingest succeeds with body-only; no crash."""
+    primary_body = (
+        b"<html><body><p>Item 2.02 Results of Operations.</p></body></html>"
+    )
+    exhibit_body = b"<html><body><p>SHOULD NOT BE INCLUDED</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000906",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+        exhibit_status={"ex-99-1.htm": 503},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000906", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    # Filing still ingests OK with body-only — graceful degradation.
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 2.02" in text
+    assert "SHOULD NOT BE INCLUDED" not in text
+
+
+@pytest.mark.asyncio
+async def test_10q_with_exhibit_99_does_not_trigger_exhibit_fetch(
+    db: str, tmp_path: Path
+) -> None:
+    """Regression guard: only 8-Ks trigger exhibit augmentation. A 10-Q's
+    primary doc IS the substance; we never want to append its EX-99 to raw_text."""
+    primary_body = b"<html><body>" + b"Item 1. Financial Statements. " * 100 + b"</body></html>"
+    exhibit_body = b"<html><body><p>UNRELATED EXHIBIT FOR 10-Q</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000907",
+        primary_name="acme-10q.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000907", form_type="10-Q")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "UNRELATED EXHIBIT FOR 10-Q" not in text
+
+
+@pytest.mark.asyncio
+async def test_8k_fetches_all_ex_99_exhibits_in_numeric_order(
+    db: str, tmp_path: Path
+) -> None:
+    """Multiple-exhibit decision (ADR-008): when 99.1 + 99.2 + 99.3 are all
+    present, fetch ALL of them in ascending order (press release, then
+    supplement, then slide deck). Each carries independent signal worth
+    ingesting. The cumulative byte cap protects against pathological size."""
+    primary_body = b"<html><body><p>Item 2.02 Results of Operations.</p></body></html>"
+    body_991 = b"<html><body><p>EX991 PRESS RELEASE BODY MARKER</p></body></html>"
+    body_992 = b"<html><body><p>EX992 SUPPLEMENT MARKER</p></body></html>"
+    body_993 = b"<html><body><p>EX993 SLIDES MARKER</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000908",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        # Provide exhibits in non-canonical order to verify we sort by number.
+        exhibits=[
+            {"name": "ex-99-3.htm", "type": "text.gif", "size": str(len(body_993))},
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(body_991))},
+            {"name": "ex-99-2.htm", "type": "text.gif", "size": str(len(body_992))},
+        ],
+        exhibit_bodies={
+            "ex-99-1.htm": body_991,
+            "ex-99-2.htm": body_992,
+            "ex-99-3.htm": body_993,
+        },
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000908", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    # All three exhibits' content present.
+    assert "EX991 PRESS RELEASE BODY MARKER" in text
+    assert "EX992 SUPPLEMENT MARKER" in text
+    assert "EX993 SLIDES MARKER" in text
+    # Numeric order (99.1 → 99.2 → 99.3) regardless of index.json order.
+    idx_991 = text.find("EX991")
+    idx_992 = text.find("EX992")
+    idx_993 = text.find("EX993")
+    assert 0 < idx_991 < idx_992 < idx_993
+    # Per-exhibit separators present.
+    assert "EXHIBIT 99.1" in text
+    assert "EXHIBIT 99.2" in text
+    assert "EXHIBIT 99.3" in text
+
+
+@pytest.mark.asyncio
+async def test_8k_cumulative_byte_cap_stops_further_exhibits(
+    db: str, tmp_path: Path
+) -> None:
+    """Cumulative cap (ADR-008): when the first exhibit alone is under
+    the cap but adding the second would push cumulative bytes over the
+    limit, the loop stops at the first and skips the rest. Protects
+    against OOM on pathologically large filings (no body cap on
+    `EdgarClient` itself).
+
+    Strategy: 99.1 fits on its own (~half cap); 99.2 by itself fits but
+    99.1+99.2 overshoots. Expected: 99.1 in raw_text, 99.2 NOT.
+    """
+    from ingestion.detail_fetcher import _EXHIBIT_CUMULATIVE_BYTE_CAP
+
+    primary_body = b"<html><body><p>Item 2.02 Results.</p></body></html>"
+    half_cap = (_EXHIBIT_CUMULATIVE_BYTE_CAP // 2) + 100_000
+    body_991 = (
+        b"<html><body><p>EX991_FITS_MARKER</p><p>"
+        + b"x" * half_cap
+        + b"</p></body></html>"
+    )
+    body_992 = (
+        b"<html><body><p>EX992_OVERFLOW_MARKER</p><p>"
+        + b"y" * half_cap
+        + b"</p></body></html>"
+    )
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000910",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(body_991))},
+            {"name": "ex-99-2.htm", "type": "text.gif", "size": str(len(body_992))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": body_991, "ex-99-2.htm": body_992},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000910", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "EX991_FITS_MARKER" in text
+    assert "EX992_OVERFLOW_MARKER" not in text
+
+
+@pytest.mark.asyncio
+async def test_8k_first_exhibit_alone_over_cap_yields_body_only(
+    db: str, tmp_path: Path
+) -> None:
+    """Even the first exhibit can blow the cap — a single 6 MB exhibit
+    > 5 MB cap. Loop stops without including any exhibit; ingest still
+    succeeds with body-only."""
+    from ingestion.detail_fetcher import _EXHIBIT_CUMULATIVE_BYTE_CAP
+
+    primary_body = b"<html><body><p>Item 2.02 Results.</p></body></html>"
+    oversized_body = (
+        b"<html><body><p>OVERSIZED_MARKER</p><p>"
+        + b"z" * (_EXHIBIT_CUMULATIVE_BYTE_CAP + 1024 * 1024)
+        + b"</p></body></html>"
+    )
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000911",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {
+                "name": "ex-99-1.htm",
+                "type": "text.gif",
+                "size": str(len(oversized_body)),
+            },
+        ],
+        exhibit_bodies={"ex-99-1.htm": oversized_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000911", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    # Ingest still OK with body-only; loop did not crash.
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "Item 2.02" in text
+    assert "OVERSIZED_MARKER" not in text
+
+
+@pytest.mark.asyncio
+async def test_8k_one_exhibit_5xx_does_not_block_others(
+    db: str, tmp_path: Path
+) -> None:
+    """If 99.1 fails to fetch but 99.2 succeeds, raw_text still gets 99.2 —
+    a 5xx on one exhibit must not abort the rest of the loop."""
+    primary_body = b"<html><body><p>Item 2.02 Results.</p></body></html>"
+    body_991 = b"<html><body><p>EX991_BAD</p></body></html>"
+    body_992 = b"<html><body><p>EX992_GOOD_MARKER</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000912",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(body_991))},
+            {"name": "ex-99-2.htm", "type": "text.gif", "size": str(len(body_992))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": body_991, "ex-99-2.htm": body_992},
+        exhibit_status={"ex-99-1.htm": 503},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000912", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "EX992_GOOD_MARKER" in text
+    assert "EXHIBIT 99.2" in text
+    # 99.1 absent (failed); we don't write a separator for an exhibit
+    # that wasn't successfully fetched.
+    assert "EX991_BAD" not in text
+    assert "EXHIBIT 99.1" not in text
+
+
+@pytest.mark.asyncio
+async def test_8k_exhibit_includes_separator_in_raw_text(
+    db: str, tmp_path: Path
+) -> None:
+    """When exhibit content is appended, a clear separator must mark the
+    boundary so downstream debugging (raw_text inspection) can tell what
+    came from where. The separator is also a soft hint to the analyzer."""
+    primary_body = b"<html><body><p>Item 2.02 Results of Operations.</p></body></html>"
+    exhibit_body = b"<html><body><p>Earnings release distinctive text.</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000909",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(exhibit_body))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": exhibit_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000909", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    # Separator marks the boundary — exact format documented in ADR-008.
+    assert "EXHIBIT 99" in text
+    body_idx = text.find("Item 2.02")
+    sep_idx = text.find("EXHIBIT 99")
+    exhibit_idx = text.find("Earnings release distinctive text")
+    assert body_idx >= 0 and sep_idx > body_idx and exhibit_idx > sep_idx
+
+
+@pytest.mark.asyncio
+async def test_8k_exhibit_fetch_filename_variants(db: str, tmp_path: Path) -> None:
+    """EDGAR is chaotic on EX-99 filenames. Cover the common real-world shapes:
+    `ex-99-1.htm`, `ex99-1.htm`, `ex991.htm`, `ex_99_1.htm`. All must match
+    the EX-99 selector. (Filer-agent shapes like `a8-kex991*.htm` are also
+    in production but are caught by the same loose pattern Stage 1 uses
+    for its contested-pick safety net.)"""
+    variants = [
+        "ex-99-1.htm",
+        "ex99-1.htm",
+        "ex991.htm",
+        "ex_99_1.htm",
+    ]
+    primary_body = b"<html><body><p>Item 2.02 Results.</p></body></html>"
+    for idx, variant in enumerate(variants):
+        exhibit_body = (
+            f"<html><body><p>VARIANT_{idx}_BODY {variant}</p></body></html>"
+        ).encode()
+        accession = f"0001234567-26-00091{idx}"
+        transport = _route_with_exhibit(
+            cik=1234567,
+            accession=accession,
+            primary_name="acme-8k.htm",
+            primary_body=primary_body,
+            exhibits=[
+                {"name": variant, "type": "text.gif", "size": str(len(exhibit_body))},
+            ],
+            exhibit_bodies={variant: exhibit_body},
+        )
+        edgar = _client(transport)
+        fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / f"raw_{idx}")
+        try:
+            filing_id = await fetcher.fetch_and_persist(
+                _discovered(accession=accession, form_type="8-K")
+            )
+        finally:
+            await edgar.aclose()
+        row = get_filing_by_id(db, filing_id)
+        assert row is not None
+        assert row.ingest_state == "ok", row.ingest_error
+        text = Path(row.raw_text_path).read_text()
+        assert f"VARIANT_{idx}_BODY" in text, (
+            f"variant {variant!r} was not detected as an EX-99 exhibit"
+        )
+
+
+@pytest.mark.asyncio
+async def test_8k_furnish_item_with_only_ex_31_does_not_fetch(
+    db: str, tmp_path: Path
+) -> None:
+    """A non-99 exhibit (`ex-31-1.htm` officer cert) MUST NOT be fetched.
+    The selector is EX-99-specific by design — Item 2.02 substance is
+    always in 99.x."""
+    primary_body = b"<html><body><p>Item 2.02 Results.</p></body></html>"
+    ex31_body = b"<html><body><p>SHOULD NOT BE INCLUDED CERT</p></body></html>"
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000920",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-31-1.htm", "type": "text.gif", "size": str(len(ex31_body))},
+        ],
+        exhibit_bodies={"ex-31-1.htm": ex31_body},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        filing_id = await fetcher.fetch_and_persist(
+            _discovered(accession="0001234567-26-000920", form_type="8-K")
+        )
+    finally:
+        await edgar.aclose()
+    row = get_filing_by_id(db, filing_id)
+    assert row is not None
+    assert row.ingest_state == "ok", row.ingest_error
+    text = Path(row.raw_text_path).read_text()
+    assert "SHOULD NOT BE INCLUDED CERT" not in text
+
+
+# ---------------------------------------------------------------------------
+# ADR-008 — Pure-logic unit tests for the exhibit selector
+# ---------------------------------------------------------------------------
+
+
+def test_select_all_ex_99_returns_sorted_ascending() -> None:
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    items = [
+        {"name": "ex-99-3.htm", "type": "text.gif", "size": "1000"},
+        {"name": "ex-99-1.htm", "type": "text.gif", "size": "1000"},
+        {"name": "ex-99-2.htm", "type": "text.gif", "size": "1000"},
+    ]
+    assert _select_all_ex_99(items) == [
+        (1, "ex-99-1.htm"),
+        (2, "ex-99-2.htm"),
+        (3, "ex-99-3.htm"),
+    ]
+
+
+def test_select_all_ex_99_returns_empty_when_no_99() -> None:
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    items = [
+        {"name": "primary.htm", "type": "text.gif", "size": "1000"},
+        {"name": "ex-31-1.htm", "type": "text.gif", "size": "100"},
+        {"name": "ex-32-1.htm", "type": "text.gif", "size": "100"},
+    ]
+    assert _select_all_ex_99(items) == []
+
+
+def test_select_all_ex_99_handles_filename_variants() -> None:
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    for name in (
+        "ex-99-1.htm",
+        "ex99-1.htm",
+        "ex991.htm",
+        "ex_99_1.htm",
+        # SEC docs use the dot form `99.1` directly:
+        "EX-99.1.HTM",
+    ):
+        items = [
+            {"name": "primary.htm", "type": "text.gif", "size": "1000"},
+            {"name": name, "type": "text.gif", "size": "500"},
+        ]
+        assert _select_all_ex_99(items) == [(1, name)], (
+            f"variant {name!r} not matched"
+        )
+
+
+def test_select_all_ex_99_matches_filer_agent_shapes() -> None:
+    """B-4 review finding: real filer-agent shapes (Apple, Donnelley, TM)
+    embed the form number directly before `ex` and sometimes carry a
+    trailing token suffix. The regex must match these — they're the
+    high-signal S&P-500-class filers we most care about."""
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    cases = [
+        ("a8-kex991.htm", 1),  # Apple, simple filer-agent shape
+        ("a8-kex991q2202603282026.htm", 1),  # Apple, real 8-K with trailing token
+        ("d8-kex991.htm", 1),  # Donnelley
+        ("tm2613377-3_4ex99-1.htm", 1),  # TM filer agent
+    ]
+    for name, expected_n in cases:
+        items = [
+            {"name": "primary.htm", "type": "text.gif", "size": "1000"},
+            {"name": name, "type": "text.gif", "size": "500"},
+        ]
+        assert _select_all_ex_99(items) == [(expected_n, name)], (
+            f"filer-agent shape {name!r} not matched"
+        )
+
+
+def test_select_all_ex_99_against_real_apple_8k_fixture() -> None:
+    """The Apple 8-K fixture (already used by the body-selection tests)
+    contains `a8-kex991q2202603282026.htm` as the EX-99.1 attachment.
+    Confirm `_select_all_ex_99` extracts it from the real index payload."""
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    payload = json.loads((_FIXTURES / "edgar_index_apple_8k.json").read_text())
+    items = payload["directory"]["item"]
+    found = _select_all_ex_99([i for i in items if isinstance(i, dict)])
+    assert found == [(1, "a8-kex991q2202603282026.htm")]
+
+
+def test_select_all_ex_99_ignores_non_html_extensions() -> None:
+    """An `ex-99-1.pdf` cannot be cleanly converted to plaintext via
+    `html_to_text`; only `.htm`/`.html` exhibits are eligible."""
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    items = [
+        {"name": "ex-99-1.pdf", "type": "text.gif", "size": "1000"},
+        {"name": "ex-99-2.htm", "type": "text.gif", "size": "500"},
+    ]
+    assert _select_all_ex_99(items) == [(2, "ex-99-2.htm")]
+
+
+def test_select_all_ex_99_does_not_match_non_99_exhibits() -> None:
+    """Defensive: `ex-31-1.htm`, `ex-32-1.htm`, `R1.htm`, etc. must NOT
+    match — the broader regex must not regress into a kitchen-sink filter.
+    """
+    from ingestion.detail_fetcher import _select_all_ex_99
+
+    items = [
+        {"name": "primary.htm", "type": "text.gif", "size": "1000"},
+        {"name": "ex-31-1.htm", "type": "text.gif", "size": "100"},
+        {"name": "ex-32-1.htm", "type": "text.gif", "size": "100"},
+        {"name": "R1.htm", "type": "text.gif", "size": "100"},
+        {"name": "R10.htm", "type": "text.gif", "size": "100"},
+        {"name": "MetaLinks.json", "type": "text.gif", "size": "100"},
+        {"name": "FilingSummary.xml", "type": "text.gif", "size": "100"},
+        {"name": "aapl-20240928.htm", "type": "text.gif", "size": "100"},
+    ]
+    assert _select_all_ex_99(items) == []
+
+
+def test_furnish_item_codes_constant_is_well_named() -> None:
+    """The set of furnish item codes is centralized in one named constant —
+    future operators add a code by editing one line, not grepping the codebase."""
+    from ingestion.detail_fetcher import _FURNISH_ITEM_CODES
+
+    assert _FURNISH_ITEM_CODES == frozenset({"2.02", "7.01", "8.01"})

@@ -96,6 +96,63 @@ _SGML_FIELD_RES: dict[str, re.Pattern[bytes]] = {
     "FILENAME": re.compile(rb"^<FILENAME>(.+?)\s*$", re.MULTILINE),
 }
 
+# ADR-008: 8-K furnish-item codes whose substance is in Exhibit 99.x rather
+# than the 8-K body. Item 2.02 (Results of Operations), 7.01 (Reg FD), and
+# 8.01 (Other Events) all furnish — not file — their content via attached
+# press releases / supplements / decks. Sonnet refused 100% of these
+# pre-fix because the body is just a metadata wrapper. Add a code here to
+# extend the carve-out (e.g., 5.02 if officer-change bios start showing
+# up exclusively in EX-99). One-line edit point — see ADR-008 §"Decision".
+_FURNISH_ITEM_CODES = frozenset({"2.02", "7.01", "8.01"})
+
+# ADR-008: EX-99.x exhibit filename matcher. EDGAR is chaotic on these.
+# Observed real-world shapes that MUST match (production fixtures + B-4
+# review finding):
+#   - canonical:   `ex-99-1.htm`, `ex99-1.htm`, `ex991.htm`, `ex_99_1.htm`,
+#                  `EX-99.1.HTM` (SEC docs use `99.1` with a dot)
+#   - filer-agent: `a8-kex991.htm`, `a8-kex991q2202603282026.htm` (Apple
+#                  with trailing-token suffix), `d8-kex991.htm` (Donnelley),
+#                  `tm2613377-3_4ex99-1.htm` (TM-prefix filer agent)
+# The prefix character class allows digits + letters + `-` + `_` because
+# filer-agent shapes embed the form number (`8`, `10`) directly before
+# `ex`. The `[-_.]?` separators after `ex` and `99` cover dot-style
+# (`99.1`) AND dash/underscore styles. The trailing `[-_a-z0-9]*?` after
+# the captured exhibit number lets filer-agent shapes carry an
+# arbitrary token suffix (Apple's `q2202603282026`) before `.htm[l]`.
+# Anchored to end-of-name (`\.html?$`) so we still reject random
+# mid-string matches. Capturing group is the exhibit number (e.g., "1"
+# for ex-99-1, "2" for ex-99-2) so exhibits can be ordered numerically.
+# `.htm`/`.html` only: PDF / DOCX exhibits cannot be cleanly converted by
+# `html_to_text` and would produce garbage in `raw_text`.
+# KNOWN LIMITATION: shapes that omit the literal `ex` token (e.g.,
+# `tm26-3-99-1.htm`) are NOT matched. Adding them would require either
+# a regex broad enough to false-positive on date-like names (`q3-99-1`,
+# `2024-99-1`) or an SGML-header fallback that reads `<TYPE>EX-99.x`
+# from `<accession>.txt` (ADR-007 Stage-2 mechanism). The latter is
+# tracked as a follow-up; current pattern covers the dominant ~95% of
+# real-EDGAR shapes per B-4 enumeration.
+_EX_99_FILENAME_RE = re.compile(
+    r"(?:^|[-_a-z0-9]*?)ex[-_.]?99[-_.]?(\d+)[-_a-z0-9]*?\.html?$",
+    re.IGNORECASE,
+)
+# Cumulative byte cap across ALL fetched EX-99 exhibits for one filing.
+# Earnings 8-Ks frequently attach multiple exhibits (99.1 = press release,
+# 99.2 = financial supplement, 99.3 = slide deck); each carries
+# independent signal worth ingesting. Cap is on COMBINED response bytes,
+# not per-file, so a 4.5 MB 99.1 leaves only 0.5 MB headroom for
+# 99.2/99.3 — they're skipped with a warning rather than truncated. This
+# is the response-size guard the agent loop needs against pathologically
+# large filings (`edgar_client.py` itself has no body cap; httpx buffers
+# whatever EDGAR sends). On the first exhibit whose bytes would push us
+# past the cap, we stop and keep what we already have. 5 MB matches a
+# realistic earnings-release combined size with 1–2x headroom for the
+# median case while protecting against OOM on adversarial filings.
+_EXHIBIT_CUMULATIVE_BYTE_CAP = 5 * 1024 * 1024
+# Separator marking the boundary between primary body / each exhibit.
+# Soft hint to the analyst (visible in raw_text) and essential for
+# raw_text inspection during ops debugging.
+_EXHIBIT_SEPARATOR_TEMPLATE = "\n\n--- EXHIBIT 99.{n} ---\n\n"
+
 
 def _accession_no_dashes(accession_number: str) -> str:
     return accession_number.replace("-", "")
@@ -121,6 +178,33 @@ def _sgml_url(cik: int, accession_number: str) -> str:
         f"{_ARCHIVES_BASE}/{cik}/"
         f"{_accession_no_dashes(accession_number)}/{accession_number}.txt"
     )
+
+
+def _select_all_ex_99(items: list[dict[str, str]]) -> list[tuple[int, str]]:
+    """ADR-008: enumerate ALL EX-99.x exhibits in numeric order.
+
+    Returns `[(exhibit_number, filename), …]` sorted by exhibit number
+    ascending; empty list when no EX-99 `.htm`/`.html` exhibit is present.
+    Earnings 8-Ks frequently attach multiple exhibits (99.1 = press
+    release, 99.2 = financial supplement / non-GAAP reconciliations,
+    99.3 = slide deck); each carries independent signal worth ingesting.
+    The caller (`_maybe_fetch_exhibits_99`) walks this list in order
+    and stops when adding the next exhibit would exceed
+    `_EXHIBIT_CUMULATIVE_BYTE_CAP`. See ADR-008 §"Multiple-exhibit decision".
+    """
+    candidates: list[tuple[int, str]] = []
+    for it in items:
+        name = it.get("name", "")
+        m = _EX_99_FILENAME_RE.match(name)
+        if m is None:
+            continue
+        try:
+            n = int(m.group(1))
+        except (TypeError, ValueError):
+            continue
+        candidates.append((n, name))
+    candidates.sort(key=lambda t: t[0])
+    return candidates
 
 
 def _stage1_is_contested(
@@ -335,12 +419,26 @@ class DetailFetcher:
         text = html_to_text(html_bytes)
         if not text:
             raise _FetchError("primary document yielded empty plaintext")
+        item_codes_json: str | None = None
+        item_codes_list: list[str] = []
+        if filing.form_type == "8-K":
+            item_codes_list = extract_item_codes(text)
+            item_codes_json = json.dumps(item_codes_list)
+        # ADR-008: for 8-Ks furnishing content via Exhibit 99.x (item codes
+        # 2.02, 7.01, 8.01), the body is a metadata wrapper and the substance
+        # lives in the attached press release / supplement / deck. Best-effort
+        # append every EX-99.x exhibit in numeric order (99.1 → 99.2 → 99.3),
+        # cumulative byte cap across all of them; degrade gracefully
+        # (body-only or partial-set, warning logged) on any failure mode.
+        if (
+            filing.form_type == "8-K"
+            and any(code in _FURNISH_ITEM_CODES for code in item_codes_list)
+        ):
+            exhibit_text = await self._maybe_fetch_exhibits_99(filing, index_items)
+            if exhibit_text:
+                text = text + exhibit_text
         raw_path = self._raw_root / f"{filing.accession_number}.txt"
         raw_path.write_text(text)
-        item_codes_json: str | None = None
-        if filing.form_type == "8-K":
-            codes = extract_item_codes(text)
-            item_codes_json = json.dumps(codes)
         # Hotfix 2026-05-04: prose-form filings (8-K, 10-Q, 425, 424B5,
         # DEF 14A, …) historically landed with NULL ticker, blocking the
         # analyzer's universe gate. When a resolver is wired, consult it;
@@ -412,6 +510,112 @@ class DetailFetcher:
                 f"primary doc fetch returned status {resp.status_code} for {url}"
             )
         return resp.content
+
+    async def _maybe_fetch_exhibits_99(
+        self,
+        filing: DiscoveredFiling,
+        index_items: list[dict[str, str]],
+    ) -> str | None:
+        """ADR-008: best-effort fetch of every EX-99.x exhibit in numeric
+        order, with a cumulative byte cap across all of them.
+
+        Memory bound (B-2 review finding): each exhibit is fetched via
+        `EdgarClient.get_bounded(url, max_bytes=…)` which streams the
+        response and aborts the connection the moment the per-fetch
+        budget (= cumulative cap minus already-accumulated bytes) is
+        exceeded. This is the only line of defense against an
+        adversarial filing that attaches a 500 MB EX-99 — `httpx.get`
+        would buffer the whole thing into memory before any post-fetch
+        check could fire.
+
+        Returns the appendable concatenated text (separators + each
+        exhibit's plaintext) when at least one exhibit was successfully
+        fetched; None when no exhibits are available or all fetches
+        failed. Walks `_select_all_ex_99(index_items)` in ascending
+        exhibit-number order; for each candidate:
+          - `EdgarUnavailable` / non-200 / empty plaintext → log warning,
+            skip to the next exhibit (don't abort the loop).
+          - bounded read aborts because the body would push cumulative
+            bytes over the cap → log warning, STOP (later exhibits would
+            only push us further over).
+
+        The agent loop must never crash on this path; body-only ingest
+        (return None) is always a safe fallback.
+        """
+        candidates = _select_all_ex_99(index_items)
+        if not candidates:
+            return None
+        chunks: list[str] = []
+        cumulative_bytes = 0
+        for ex_number, exhibit_name in candidates:
+            remaining_budget = _EXHIBIT_CUMULATIVE_BYTE_CAP - cumulative_bytes
+            if remaining_budget <= 0:
+                # Budget already fully consumed — no point starting another
+                # fetch; later exhibits cannot fit.
+                _log.warning(
+                    "detail_fetcher.exhibit_cumulative_cap_reached",
+                    extra={
+                        "event": "detail_fetcher.exhibit_cumulative_cap_reached",
+                        "accession": filing.accession_number,
+                        "exhibit_name": exhibit_name,
+                        "cumulative_byte_size": cumulative_bytes,
+                        "byte_cap": _EXHIBIT_CUMULATIVE_BYTE_CAP,
+                    },
+                )
+                break
+            url = _doc_url(filing.cik, filing.accession_number, exhibit_name)
+            try:
+                bounded = await self._edgar.get_bounded(
+                    url, max_bytes=remaining_budget
+                )
+            except EdgarUnavailable as exc:
+                _log.warning(
+                    "detail_fetcher.exhibit_fetch_unavailable",
+                    extra={
+                        "event": "detail_fetcher.exhibit_fetch_unavailable",
+                        "accession": filing.accession_number,
+                        "exhibit_name": exhibit_name,
+                        "error": str(exc),
+                    },
+                )
+                continue
+            if bounded.truncated:
+                # Streaming read aborted — body exceeded remaining budget.
+                # Stop the loop: later exhibits would also overshoot.
+                _log.warning(
+                    "detail_fetcher.exhibit_cumulative_cap_reached",
+                    extra={
+                        "event": "detail_fetcher.exhibit_cumulative_cap_reached",
+                        "accession": filing.accession_number,
+                        "exhibit_name": exhibit_name,
+                        "remaining_budget": remaining_budget,
+                        "cumulative_byte_size": cumulative_bytes,
+                        "byte_cap": _EXHIBIT_CUMULATIVE_BYTE_CAP,
+                    },
+                )
+                break
+            if bounded.status_code != 200:
+                _log.warning(
+                    "detail_fetcher.exhibit_fetch_non_200",
+                    extra={
+                        "event": "detail_fetcher.exhibit_fetch_non_200",
+                        "accession": filing.accession_number,
+                        "exhibit_name": exhibit_name,
+                        "status": bounded.status_code,
+                    },
+                )
+                continue
+            body = bounded.body
+            cumulative_bytes += len(body)
+            exhibit_text = html_to_text(body)
+            if not exhibit_text:
+                continue
+            chunks.append(
+                _EXHIBIT_SEPARATOR_TEMPLATE.format(n=ex_number) + exhibit_text
+            )
+        if not chunks:
+            return None
+        return "".join(chunks)
 
     @staticmethod
     def _select_prose_primary(

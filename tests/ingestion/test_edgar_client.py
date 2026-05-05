@@ -17,6 +17,7 @@ import httpx
 import pytest
 
 from ingestion.edgar_client import (
+    BoundedResponse,
     CircuitOpen,
     EdgarClient,
     EdgarUnavailable,
@@ -274,3 +275,142 @@ async def test_get_passes_query_params() -> None:
         await client.aclose()
     assert seen[0].url.params["action"] == "getcurrent"
     assert seen[0].url.params["type"] == "8-K"
+
+
+# ---------------------------------------------------------------------------
+# get_bounded — streamed memory-bounded fetch (B-2 review fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_bounded_returns_full_body_under_cap() -> None:
+    """Body fits comfortably under the cap → full body returned, not truncated."""
+    payload = b"<html><body>" + b"x" * 1024 + b"</body></html>"
+
+    def handle(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    transport = httpx.MockTransport(handle)
+    client = EdgarClient(user_agent=_UA, transport=transport)
+    try:
+        result = await client.get_bounded(
+            "https://www.sec.gov/x.htm", max_bytes=10 * 1024
+        )
+    finally:
+        await client.aclose()
+    assert isinstance(result, BoundedResponse)
+    assert result.status_code == 200
+    assert result.body == payload
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_get_bounded_aborts_when_body_exceeds_cap() -> None:
+    """Body larger than cap → returns `truncated=True`, body=b'', and the
+    full server payload was NEVER buffered into the result. The cap is the
+    only line of defense against an OOM from an oversized exhibit."""
+    cap = 4 * 1024
+    # Server tries to send 10x the cap — get_bounded must abort early.
+    payload = b"x" * (cap * 10)
+
+    def handle(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    transport = httpx.MockTransport(handle)
+    client = EdgarClient(user_agent=_UA, transport=transport)
+    try:
+        result = await client.get_bounded(
+            "https://www.sec.gov/big.htm", max_bytes=cap
+        )
+    finally:
+        await client.aclose()
+    assert result.status_code == 200
+    assert result.truncated is True
+    assert result.body == b""
+
+
+@pytest.mark.asyncio
+async def test_get_bounded_non_2xx_returns_status_with_empty_body() -> None:
+    """4xx/5xx (non-retryable 4xx in this case) → callers branch on status
+    code; no exception. Streaming machinery still applies but no body is
+    emitted because the status is the signal."""
+    def handle(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, content=b"not found")
+
+    transport = httpx.MockTransport(handle)
+    client = EdgarClient(user_agent=_UA, transport=transport)
+    try:
+        result = await client.get_bounded(
+            "https://www.sec.gov/missing.htm", max_bytes=1024
+        )
+    finally:
+        await client.aclose()
+    assert result.status_code == 404
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_get_bounded_5xx_retries_then_succeeds() -> None:
+    """503 → retry → 200. Streaming variant honors the same retry posture
+    as `get`."""
+    calls = {"n": 0}
+
+    def handle(_r: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(503, content=b"")
+        return httpx.Response(200, content=b"ok-body")
+
+    transport = httpx.MockTransport(handle)
+    client = EdgarClient(user_agent=_UA, transport=transport, retry_base_seconds=0.0)
+    try:
+        result = await client.get_bounded(
+            "https://www.sec.gov/x.htm", max_bytes=1024
+        )
+    finally:
+        await client.aclose()
+    assert calls["n"] == 2
+    assert result.status_code == 200
+    assert result.body == b"ok-body"
+    assert result.truncated is False
+
+
+@pytest.mark.asyncio
+async def test_get_bounded_rejects_non_positive_max_bytes() -> None:
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, content=b""))
+    client = EdgarClient(user_agent=_UA, transport=transport)
+    try:
+        with pytest.raises(ValueError):
+            await client.get_bounded("https://www.sec.gov/x.htm", max_bytes=0)
+        with pytest.raises(ValueError):
+            await client.get_bounded("https://www.sec.gov/x.htm", max_bytes=-1)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_bounded_emitted_bytes_do_not_exceed_cap_plus_chunk() -> None:
+    """B-2 regression test: even when the server tries to emit far more
+    than the cap, `get_bounded` must not retain the full payload. We
+    inspect the returned `body` length: it must be either the full
+    payload (if ≤ cap) or empty bytes (if truncated). The streaming
+    contract guarantees we never accumulate past the cap."""
+    cap = 8 * 1024
+    payload = b"y" * (cap * 100)  # 100x the cap — adversarial size
+
+    def handle(_r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload)
+
+    transport = httpx.MockTransport(handle)
+    client = EdgarClient(user_agent=_UA, transport=transport)
+    try:
+        result = await client.get_bounded(
+            "https://www.sec.gov/huge.htm", max_bytes=cap
+        )
+    finally:
+        await client.aclose()
+    # Two valid outcomes: truncated with empty body, or non-truncated
+    # with body ≤ cap. NEVER body length > cap.
+    assert len(result.body) <= cap
+    if result.truncated:
+        assert result.body == b""
