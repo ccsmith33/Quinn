@@ -12,17 +12,19 @@ This is a manual diagnostic for the question "would Sonnet propose a
 trade if it had the exhibit content?" — answer it without waiting for
 the next market open.
 
-Usage on the droplet:
+**RUN LOCALLY, NOT ON THE DROPLET.** A counterfactual `--include-exhibits`
+run holds 50-150KB of augmented filing text in memory plus the Anthropic
+SDK; the production droplet (1 GB RAM, no swap, ~100 MB available with
+the agent running) will OOM-kill the agent. The script refuses to run
+when MemAvailable < 250 MB unless `--force` is passed. Local usage:
 
-    /opt/quinn/app/.venv/bin/python ops/scripts/dryrun_analyzer.py \\
+    # from the project root, after copying the journal DB locally:
+    scp root@quinn-stocks:/var/lib/quinn/journal.db ./journal-snapshot.db
+    set -a; . .env; set +a
+    python ops/scripts/dryrun_analyzer.py --db ./journal-snapshot.db \\
         --filing-id 487 --include-exhibits
 
-    /opt/quinn/app/.venv/bin/python ops/scripts/dryrun_analyzer.py \\
-        --accession 0001193125-26-206496 --include-exhibits
-
-Requires `ANTHROPIC_API_KEY` in the environment (the systemd service
-already has it via /etc/quinn/secrets.env, or you can `set -a; . .env;
-set +a` from a shell session).
+Requires `ANTHROPIC_API_KEY` in the environment.
 """
 
 from __future__ import annotations
@@ -51,7 +53,33 @@ DEFAULT_PROMPT_DIR = _REPO_ROOT / "src" / "prompts"
 EX99_RE = re.compile(r"ex-?99[-_]?\d*", re.IGNORECASE)
 SONNET_MODEL = "claude-sonnet-4-6"
 DEFAULT_USER_AGENT = "Quinn-Research/v1 ccsmith33@crimson.ua.edu"
-DEFAULT_EXHIBIT_CAP_BYTES = 1_000_000
+DEFAULT_EXHIBIT_CAP_BYTES = 256_000  # 256KB per exhibit; reduced from 1MB after droplet OOM
+MIN_FREE_MEMORY_MB = 250  # refuse to run below this on Linux unless --force
+
+
+def check_memory_or_exit(force: bool) -> None:
+    """Refuse to run on a memory-tight host (e.g. the production droplet)
+    unless --force is passed. Reads /proc/meminfo on Linux; no-op elsewhere.
+    """
+    meminfo = Path("/proc/meminfo")
+    if not meminfo.exists():
+        return
+    available_kb: int | None = None
+    for line in meminfo.read_text().splitlines():
+        if line.startswith("MemAvailable:"):
+            available_kb = int(line.split()[1])
+            break
+    if available_kb is None:
+        return
+    available_mb = available_kb / 1024
+    if available_mb < MIN_FREE_MEMORY_MB and not force:
+        raise SystemExit(
+            f"REFUSED: only {available_mb:.0f} MB available, need "
+            f"{MIN_FREE_MEMORY_MB} MB. Run on a host with more RAM, or "
+            f"pass --force if you accept the OOM risk. The production "
+            f"droplet (1 GB total) cannot run --include-exhibits — copy "
+            f"the journal DB locally and run from your dev machine instead."
+        )
 
 
 def fetch_filing_row(
@@ -208,7 +236,14 @@ def main() -> None:
     )
     p.add_argument("--user-agent", default=DEFAULT_USER_AGENT)
     p.add_argument("--max-tokens", type=int, default=4096)
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Bypass the low-memory refusal (default: refuse if <250 MB available)",
+    )
     args = p.parse_args()
+
+    check_memory_or_exit(force=args.force)
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
