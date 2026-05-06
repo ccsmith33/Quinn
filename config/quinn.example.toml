@@ -36,11 +36,21 @@ opus_max_output_tokens = 4096
 
 [execution]
 broker_mode = "paper"             # 'paper' | 'live'
-ks4_pct_cap = 0.20
+# Tightened from 0.20 (2026-05-06): paper-aggressive utilization knob.
+# Lower per-position cap as we widen book to ks5_max_concurrent=10.
+# Revisit before live.
+ks4_pct_cap = 0.15
 ks4_absolute_cap_usd = 1000.0
-ks5_max_concurrent = 5
-ks7_cash_reserve_pct = 0.05
-sizing_mid_pct = 0.05
+# Raised from 5 (2026-05-06): paper-aggressive utilization knob.
+# Wider book = more diversification across daily proposals. Revisit before live.
+ks5_max_concurrent = 10
+# Lowered from 0.05 (2026-05-06): paper-aggressive utilization knob.
+# Frees ~2% equity for deployment; min liquid reserve. Revisit before live.
+ks7_cash_reserve_pct = 0.03
+# Raised from 0.05 (2026-05-06): paper-aggressive utilization knob.
+# cv5-6 per-position size. Targets ~70% baseline deployed at full book.
+# Revisit before live.
+sizing_mid_pct = 0.07
 sizing_high_pct = 0.10
 
 [reconciler]
