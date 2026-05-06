@@ -67,7 +67,20 @@ def _applied_versions(conn: sqlite3.Connection) -> set[int]:
 
 
 def apply_migrations(db_path: str) -> int:
-    """Apply any unapplied migration files in lexical order; return final schema version."""
+    """Apply any unapplied migration files in lexical order; return final schema version.
+
+    Each migration runs with `PRAGMA foreign_keys=OFF` so table-rebuild
+    migrations (DROP + recreate the table other tables FK to) don't trip
+    on the existing FK references. After the migration's transaction
+    commits we run `PRAGMA foreign_key_check` to surface any rows that
+    would have been orphaned — if violations exist we raise
+    `SchemaMismatch` so the agent process refuses to start (per
+    architecture §2.9). `foreign_keys=ON` is restored unconditionally
+    via `finally` whether the migration succeeded or failed.
+
+    The PRAGMA toggles MUST live outside the BEGIN/COMMIT — SQLite
+    silently ignores `PRAGMA foreign_keys` mid-transaction.
+    """
     conn = _connect(db_path)
     try:
         discovered = _discover_migrations()
@@ -79,19 +92,29 @@ def apply_migrations(db_path: str) -> int:
                 continue
             sql = path.read_text(encoding="utf-8")
             statements = _split_sql_statements(sql)
+            conn.execute("PRAGMA foreign_keys=OFF")
             try:
-                conn.execute("BEGIN")
-                for stmt in statements:
-                    conn.execute(stmt)
-                conn.execute(
-                    "INSERT INTO meta(schema_version, applied_at) "
-                    "VALUES (?, CURRENT_TIMESTAMP)",
-                    (version,),
-                )
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+                try:
+                    conn.execute("BEGIN")
+                    for stmt in statements:
+                        conn.execute(stmt)
+                    conn.execute(
+                        "INSERT INTO meta(schema_version, applied_at) "
+                        "VALUES (?, CURRENT_TIMESTAMP)",
+                        (version,),
+                    )
+                    conn.execute("COMMIT")
+                except Exception:
+                    conn.execute("ROLLBACK")
+                    raise
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise SchemaMismatch(
+                        f"FK violations after migration {version}: "
+                        f"{[tuple(v) for v in violations]}"
+                    )
+            finally:
+                conn.execute("PRAGMA foreign_keys=ON")
         return max(v for v, _ in discovered)
     finally:
         conn.close()
