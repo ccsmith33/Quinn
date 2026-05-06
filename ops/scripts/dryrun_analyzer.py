@@ -21,14 +21,14 @@ Modes:
     python ops/scripts/dryrun_analyzer.py --filing-id 487 --include-exhibits \\
         --model claude-sonnet-4-6
 
-    # batch over today's filings (cost-capped at ~\$3 unless --force)
+    # batch over today's filings (cost-capped at ~$3 unless --force)
     python ops/scripts/dryrun_analyzer.py --batch-today --include-exhibits
 
     # batch over the last two days
     python ops/scripts/dryrun_analyzer.py --batch-today --since 2026-05-05
 
 The script enforces a 250 MB memory floor (refuses on tight hosts) and a
-\$3 batch-cost ceiling (override with `--force`). On the production
+$3 batch-cost ceiling (override with `--force`). On the production
 droplet (2 GB RAM post-resize) both gates pass for typical batches.
 
 Requires `ANTHROPIC_API_KEY` in the environment.
@@ -53,6 +53,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 
 from journal.models import FilingRow  # noqa: E402
 from prompts.loader import AnalyzerContext, PromptBuilder  # noqa: E402
+from analyzer.parse import ResponseParseError, extract_json_object  # noqa: E402
 
 EDGAR_BASE = "https://www.sec.gov/Archives/edgar/data"
 DEFAULT_DB = "/var/lib/quinn/journal.db"
@@ -361,7 +362,9 @@ def analyze_one(
     symbol: str | None = None
     thesis = ""
     try:
-        parsed = json.loads(text)
+        # Use the production parser — strips ```json fences and handles
+        # other shapes the LLM occasionally emits.
+        parsed = extract_json_object(text)
         decision = parsed.get("decision") or (
             "trade_proposal"
             if "symbol" in parsed and "direction" in parsed
@@ -370,7 +373,7 @@ def analyze_one(
         conviction = parsed.get("conviction")
         symbol = parsed.get("symbol")
         thesis = parsed.get("thesis") or parsed.get("thesis_or_reason") or ""
-    except json.JSONDecodeError:
+    except ResponseParseError:
         pass
 
     if verbose:
