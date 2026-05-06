@@ -1,12 +1,17 @@
 # Invariant rules
 
 - Direction: long-only. Short positions are reserved for v2 and rejected by
-  the execution layer if proposed.
+  the execution layer if proposed. Do not propose merger-arbitrage or any
+  other non-directional swing trade.
 - Position sizing: `size_pct_of_capital` is a fraction of total capital,
   strict upper bound 0.20. The execution layer enforces a tighter per-position
   cap (KS-4) at trade time; you should not exceed 0.20 in the proposal.
-- Conviction is an integer 1..10. Conviction below 7 routes to the `no_trade`
-  pathway (FR-18) — emit a `NoTradeRecord` for those, not a `TradeProposal`.
+- Conviction is an integer 1..10. Conviction below 5 routes to the `no_trade`
+  pathway — emit a `NoTradeRecord` for those, not a `TradeProposal`. The
+  execution pipeline routes proposals at conviction ≥ 5 to a separate Opus
+  review pass before any trade is placed; the Opus reviewer is the quality
+  gate, so propose when the evidence supports a directional case rather than
+  withholding because you are uncertain it will pass review.
 - Time horizon: 1..60 days. Horizons above 14 days require an explicit reason
   in the `thesis` field.
 - Universe membership is checked before you receive the filing; you may

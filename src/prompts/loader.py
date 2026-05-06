@@ -19,8 +19,18 @@ from pathlib import Path
 from typing import Literal
 
 from journal.models import FilingRow, ProposalRow
+from observability.log_port import get_logger
 
 _HASH_PREFIX_LEN = 12
+
+# 400KB ≈ 100K tokens — leaves headroom for system blocks + prompt scaffolding
+# under Anthropic's 200K context limit. Applied at prompt-build time so the
+# persisted raw filing on disk is preserved for audit/replay; only what the
+# model sees is truncated. Same pattern as the exhibit cap (ADR-008).
+_FILING_BODY_BYTE_CAP = 400_000
+_FILING_BODY_TRUNCATION_MARKER = "\n[...TRUNCATED AT BODY CAP...]"
+
+_log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +213,7 @@ class PromptBuilder:
         )
 
     def _filing_payload(self, filing: FilingRow, raw_text: str) -> str:
+        body = self._cap_body(filing, raw_text)
         return (
             f"# Filing under analysis\n"
             f"accession_number: {filing.accession_number}\n"
@@ -212,8 +223,31 @@ class PromptBuilder:
             f"item_codes: {filing.item_codes or '[]'}\n"
             f"issuer_ticker: {filing.issuer_ticker or ''}\n"
             f"---\n"
-            f"{raw_text}\n"
+            f"{body}\n"
         )
+
+    @staticmethod
+    def _cap_body(filing: FilingRow, raw_text: str) -> str:
+        original = len(raw_text.encode("utf-8"))
+        if original <= _FILING_BODY_BYTE_CAP:
+            return raw_text
+        # Truncate by bytes — encode, slice, decode with errors='ignore' to
+        # avoid splitting a multi-byte sequence mid-character.
+        truncated = (
+            raw_text.encode("utf-8")[:_FILING_BODY_BYTE_CAP]
+            .decode("utf-8", errors="ignore")
+        )
+        _log.info(
+            "filing_body_truncated_at_cap",
+            extra={
+                "event": "filing_body_truncated_at_cap",
+                "filing_id": filing.id,
+                "accession": filing.accession_number,
+                "original_size": original,
+                "cap": _FILING_BODY_BYTE_CAP,
+            },
+        )
+        return truncated + _FILING_BODY_TRUNCATION_MARKER
 
     def _proposal_payload(self, proposal: ProposalRow, source_text_summary: str) -> str:
         return (
