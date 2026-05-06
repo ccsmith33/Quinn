@@ -255,3 +255,282 @@ def test_connect_returns_context_manager(db: str) -> None:
     with connect(db) as conn:
         assert isinstance(conn, sqlite3.Connection)
         conn.execute("SELECT 1")
+
+
+# ---------------------------------------------------------------------------
+# Feature C — retro-fill helpers
+# ---------------------------------------------------------------------------
+
+def _proposal(
+    db: str,
+    *,
+    prompt_version: str,
+    decision_id: str,
+    symbol: str = "ACME",
+    conviction: int = 9,
+    kind: str = "trade_proposal",
+    created_at: dt.datetime | None = None,
+    seed_pending_capacity: bool = True,
+) -> int:
+    """Insert a proposal for retro-fill tests. Optionally back-date
+    `created_at` (the SQL helper enforces freshness by created_at).
+
+    By default also seeds the `pending_capacity` execution row that
+    Feature B writes when its capacity gate fires — that row is the
+    deterministic signal `find_retro_candidate` keys on. Pass
+    `seed_pending_capacity=False` for tests that simulate other
+    lifecycle states (e.g., proposal already reviewed by another path).
+    """
+    from journal.models import ExecutionRow
+    from journal.repo import insert_execution
+
+    f = _filing(accession_number=f"acc-{decision_id}", content_hash=f"h-{decision_id}")
+    fid = insert_filing(db, f)
+    p = ProposalRow(
+        filing_id=fid,
+        decision_id=decision_id,
+        model_id="claude-sonnet-4-6",
+        prompt_version=prompt_version,
+        raw_response='{"conviction": ' + str(conviction) + "}",
+        kind=kind,
+        symbol=symbol if kind == "trade_proposal" else None,
+        direction="long" if kind == "trade_proposal" else None,
+        size_pct_requested=0.05 if kind == "trade_proposal" else None,
+        conviction=conviction if kind == "trade_proposal" else None,
+        thesis="x" if kind == "trade_proposal" else None,
+        input_tokens=10,
+        output_tokens=10,
+        latency_ms=100,
+        cost_usd=0.001,
+    )
+    pid = insert_proposal(db, p)
+    if created_at is not None:
+        with connect(db) as conn:
+            conn.execute(
+                "UPDATE proposals SET created_at = ? WHERE id = ?",
+                (created_at, pid),
+            )
+            conn.commit()
+    if seed_pending_capacity and kind == "trade_proposal":
+        insert_execution(
+            db,
+            ExecutionRow(
+                proposal_id=pid,
+                decision="rejected",
+                reject_reason="pending_capacity",
+                submitted_orders_json="[]",
+            ),
+        )
+    return pid
+
+
+def _seed_prompt(db: str) -> str:
+    pv = "sonnet_filing_analysis@deadbeef0001"
+    insert_prompt(
+        db,
+        PromptRow(
+            prompt_version=pv,
+            name="sonnet_filing_analysis",
+            file_path="src/prompts/sonnet_filing_analysis_v1.txt",
+            content_hash="deadbeef",
+        ),
+    )
+    return pv
+
+
+def test_find_retro_candidate_picks_cv9_in_window(db: str) -> None:
+    from journal.repo import find_retro_candidate
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    pid = _proposal(
+        db, prompt_version=pv, decision_id="d1", conviction=9,
+        created_at=now - dt.timedelta(hours=2),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is not None
+    assert got.id == pid
+    assert got.conviction == 9
+
+
+def test_find_retro_candidate_excludes_cv8(db: str) -> None:
+    from journal.repo import find_retro_candidate
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    _proposal(
+        db, prompt_version=pv, decision_id="d2", conviction=8,
+        created_at=now - dt.timedelta(hours=1),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is None
+
+
+def test_find_retro_candidate_excludes_stale(db: str) -> None:
+    from journal.repo import find_retro_candidate
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    _proposal(
+        db, prompt_version=pv, decision_id="d3", conviction=10,
+        created_at=now - dt.timedelta(hours=7),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is None
+
+
+def test_find_retro_candidate_excludes_already_reviewed(db: str) -> None:
+    from journal.repo import find_retro_candidate, insert_proposal_review
+    from journal.models import ProposalReviewRow
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    pid = _proposal(
+        db, prompt_version=pv, decision_id="d4", conviction=9,
+        created_at=now - dt.timedelta(hours=1),
+    )
+    # Add a review (e.g., from production review path) → no longer a candidate.
+    insert_proposal_review(
+        db,
+        ProposalReviewRow(
+            proposal_id=pid,
+            model_id="claude-opus-4-7",
+            prompt_version=pv,
+            decision="ratify",
+            raw_response="{}",
+            rationale="x" * 60,
+            input_tokens=10,
+            output_tokens=10,
+            latency_ms=100,
+            cost_usd=0.001,
+        ),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is None
+
+
+def test_find_retro_candidate_excludes_already_executed(db: str) -> None:
+    from journal.repo import find_retro_candidate, insert_execution
+    from journal.models import ExecutionRow
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    pid = _proposal(
+        db, prompt_version=pv, decision_id="d5", conviction=9,
+        created_at=now - dt.timedelta(hours=1),
+    )
+    insert_execution(
+        db,
+        ExecutionRow(
+            proposal_id=pid,
+            decision="rejected",
+            reject_reason="kill_switch",
+            submitted_orders_json="[]",
+        ),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is None
+
+
+def test_find_retro_candidate_two_cv9_picks_most_recent(db: str) -> None:
+    from journal.repo import find_retro_candidate
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    older = _proposal(
+        db, prompt_version=pv, decision_id="d6a", conviction=9,
+        created_at=now - dt.timedelta(hours=4),
+    )
+    newer = _proposal(
+        db, prompt_version=pv, decision_id="d6b", conviction=9,
+        created_at=now - dt.timedelta(hours=1),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is not None
+    assert got.id == newer
+    assert got.id != older
+
+
+def test_find_retro_candidate_higher_conviction_wins(db: str) -> None:
+    from journal.repo import find_retro_candidate
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    _proposal(
+        db, prompt_version=pv, decision_id="d7a", conviction=9,
+        created_at=now - dt.timedelta(hours=1),
+    )
+    cv10_pid = _proposal(
+        db, prompt_version=pv, decision_id="d7b", conviction=10,
+        created_at=now - dt.timedelta(hours=2),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is not None
+    assert got.id == cv10_pid
+
+
+def test_has_open_position_true_when_qty_nonzero(db: str) -> None:
+    from journal.repo import has_open_position, insert_position
+    from journal.models import PositionRow
+
+    insert_position(
+        db,
+        PositionRow(
+            snapshot_at=dt.datetime(2026, 5, 6, 14, 0, 0),
+            source="reconciler",
+            symbol="ACME",
+            qty=100,
+            avg_entry_price=10.0,
+            market_value=1010.0,
+            unrealized_pnl=10.0,
+        ),
+    )
+    assert has_open_position(db, "ACME") is True
+    assert has_open_position(db, "OTHER") is False
+
+
+def test_has_open_position_false_when_latest_snapshot_zero_qty(db: str) -> None:
+    """A symbol that was held but is now closed (qty=0 latest snapshot)
+    must not block a retro candidate."""
+    from journal.repo import has_open_position, insert_position
+    from journal.models import PositionRow
+
+    insert_position(
+        db,
+        PositionRow(
+            snapshot_at=dt.datetime(2026, 5, 6, 14, 0, 0),
+            source="reconciler",
+            symbol="ACME",
+            qty=100,
+            avg_entry_price=10.0,
+            market_value=1010.0,
+            unrealized_pnl=10.0,
+        ),
+    )
+    insert_position(
+        db,
+        PositionRow(
+            snapshot_at=dt.datetime(2026, 5, 6, 15, 0, 0),
+            source="reconciler",
+            symbol="ACME",
+            qty=0,
+            avg_entry_price=10.0,
+            market_value=0.0,
+            unrealized_pnl=0.0,
+        ),
+    )
+    assert has_open_position(db, "ACME") is False

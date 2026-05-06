@@ -129,6 +129,28 @@ class BrokerAdapter(Protocol):
         """
         ...
 
+    def replace_stop_order(
+        self,
+        broker_order_id: str,
+        *,
+        new_stop_price: float,
+        client_order_id: str,
+    ) -> SubmittedOrder:
+        """Atomically replace a live stop order's `stop_price` (Feature A).
+
+        Used by the thesis-review `adjust_stop` path so the position is
+        never momentarily uncovered. Alpaca's PATCH /v2/orders/{id} is
+        atomic: the broker either accepts the replacement (returning a
+        new order id) and leaves NO gap, or rejects it and the original
+        stop remains live.
+
+        On any failure (network, invalid price, order already filled),
+        implementations MUST raise — the caller's safety contract is
+        "don't proceed unless the replacement succeeded; the original
+        stop is still live."
+        """
+        ...
+
 
 __all__ = [
     "AccountSnapshot",

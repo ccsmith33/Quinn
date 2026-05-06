@@ -103,6 +103,12 @@ _PROMPT_DEFS: dict[str, list[tuple[str, str]]] = {
         ("fragment", "rules_invariant"),
         ("schema", "opus_proposal_review"),
     ],
+    # Feature A — time-horizon thesis review on open positions.
+    "opus_thesis_review_v1": [
+        ("fragment", "role"),
+        ("fragment", "rules_invariant"),
+        ("schema", "thesis_review"),
+    ],
 }
 
 
@@ -152,6 +158,64 @@ class PromptBuilder:
             name="opus_proposal_review_v1",
             block2_text=ctx_summary,
             block3_text=self._proposal_payload(proposal, source_text_summary),
+        )
+
+    def build_opus_thesis_review(
+        self,
+        *,
+        proposal: ProposalRow,
+        execution_id: int,
+        days_held: int,
+        current_price: float,
+        pct_change_since_entry: float,
+        realized_fill_price: float | None,
+        realized_dollar_size: float | None,
+        time_horizon_days: int,
+        stop_loss_price: float,
+        take_profit_price: float | None,
+        filings_since_entry_summary: str,
+    ) -> ApiRequest:
+        """Feature A — compose the Opus thesis-review request for an open
+        position whose horizon has elapsed.
+
+        The block-2 context is per-execution (not daily-stable) — Opus's
+        cache-hit on these calls is limited to block 1 (role + rules +
+        schema). Same trade-off as `opus_proposal_review_v1`.
+        """
+        ctx_summary = (
+            f"# Thesis-review context\n"
+            f"execution_id: {execution_id}\n"
+            f"original_decision_id: {proposal.decision_id}\n"
+            f"original_prompt_version: {proposal.prompt_version}\n"
+        )
+        block3 = (
+            f"# Position under review\n"
+            f"symbol: {proposal.symbol}\n"
+            f"direction: {proposal.direction}\n"
+            f"size_pct_requested: {proposal.size_pct_requested}\n"
+            f"conviction_at_entry: {proposal.conviction}\n"
+            f"original_thesis: {proposal.thesis}\n"
+            f"declared_time_horizon_days: {time_horizon_days}\n"
+            f"original_stop_loss_price: {stop_loss_price:.2f}\n"
+            f"original_take_profit_price: "
+            f"{('%.2f' % take_profit_price) if take_profit_price else 'none'}\n"
+            f"realized_fill_price: "
+            f"{('%.2f' % realized_fill_price) if realized_fill_price else 'unknown'}\n"
+            f"realized_dollar_size: "
+            f"{('$%.2f' % realized_dollar_size) if realized_dollar_size else 'unknown'}\n"
+            f"---\n"
+            f"# Current state\n"
+            f"days_held_since_entry: {days_held}\n"
+            f"current_price: {current_price:.2f}\n"
+            f"pct_change_since_entry: {pct_change_since_entry:+.2%}\n"
+            f"---\n"
+            f"# Filings since entry (for {proposal.symbol})\n"
+            f"{filings_since_entry_summary}\n"
+        )
+        return self._build(
+            name="opus_thesis_review_v1",
+            block2_text=ctx_summary,
+            block3_text=block3,
         )
 
     # -- internals ----------------------------------------------------------

@@ -198,6 +198,41 @@ class LlmCallRow(_Row):
     called_at: dt.datetime | None = None
 
 
+class ThesisReviewScheduleRow(_Row):
+    """Feature A — when an open position is due for an Opus thesis-review.
+    Append-only; the latest row per `execution_id` is the canonical
+    schedule. `scheduled_reason` ∈ {"entry", "hold", "adjust_stop"}."""
+
+    id: int | None = None
+    execution_id: int
+    due_at: dt.datetime
+    scheduled_at: dt.datetime | None = None
+    scheduled_reason: str
+
+
+class ThesisReviewRow(_Row):
+    """Feature A — Opus thesis-review outcome row. `decision` ∈
+    {"hold", "close", "adjust_stop"}. `modifications_json` carries the
+    `new_stop_price` for adjust_stop and is NULL otherwise."""
+
+    id: int | None = None
+    execution_id: int
+    schedule_id: int
+    model_id: str
+    prompt_version: str
+    decision: str
+    raw_response: str
+    rationale: str
+    modifications_json: str | None = None
+    input_tokens: int
+    output_tokens: int
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    latency_ms: int
+    cost_usd: float
+    created_at: dt.datetime | None = None
+
+
 class BackupRow(_Row):
     id: int | None = None
     started_at: dt.datetime

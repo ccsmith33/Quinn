@@ -36,6 +36,7 @@ Carry-forward notes:
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
 from journal.models import FilingRow, ProposalRow
@@ -121,6 +122,8 @@ class SonnetAnalyzer:
         opus_review_conviction_threshold: int,
         db_path: str,
         max_output_tokens: int | None = None,
+        ks5_max_concurrent: int | None = None,
+        open_positions_counter: Callable[[], int] | None = None,
     ) -> None:
         self._client = client
         self._store = store
@@ -132,6 +135,15 @@ class SonnetAnalyzer:
         # S5.6 carry-fwd S5.2 C-1: per-call cost ceiling (D-052). When
         # None (legacy test path), the SDK kwargs default applies.
         self._max_output_tokens = max_output_tokens
+        # Feature B: skip Opus when KS5 is at capacity. None disables the
+        # gate (legacy test path); production composition wires the value
+        # from `config.execution.ks5_max_concurrent`. The counter must
+        # share a source-of-truth with `SizingEngine.size()` (broker
+        # truth) — otherwise Feature B can refuse to spend on a trade
+        # that would have actually fit. Composition wires this to
+        # `lambda: len(broker.get_positions())`.
+        self._ks5_max_concurrent = ks5_max_concurrent
+        self._open_positions_counter = open_positions_counter
 
     async def analyze(
         self,
@@ -200,10 +212,60 @@ class SonnetAnalyzer:
         if isinstance(result, ProposalEmitted):
             conviction = int(result.payload.get("conviction", 0))
             if conviction >= self._threshold:
+                # Feature B: capacity gate. If KS5 is at cap, skip Opus —
+                # the proposal can't be actioned and would only be rejected
+                # by the sizer anyway. Absence of a `proposal_reviews` row
+                # is the "pending_capacity" signal Feature C keys on.
+                #
+                # Source-of-truth: the count MUST come from the same place
+                # the sizer's KS-5 gate consults (broker truth, see
+                # `SizingEngine.size()`). If we read journal-truth here
+                # the two gates can disagree and Feature B will refuse to
+                # spend on a trade that would actually have fit. The
+                # counter is callable so the call is lazy — invoked only
+                # when conviction has already cleared the threshold.
+                #
+                # Fallback: if no counter is wired (legacy test path),
+                # fall back to the AnalyzerContext's journal-derived
+                # count. Production composition always wires the broker-
+                # backed counter.
+                if self._ks5_max_concurrent is not None:
+                    if self._open_positions_counter is not None:
+                        try:
+                            current_open = int(self._open_positions_counter())
+                        except Exception as e:  # noqa: BLE001 — broker outage
+                            # If we can't ask the broker (transient outage),
+                            # fall back to the journal-derived count to
+                            # stay consistent with the rest of the pipeline.
+                            log.warning(
+                                "agent.opus_capacity_counter_failed",
+                                extra={
+                                    "event": "agent.opus_capacity_counter_failed",
+                                    "error": str(e),
+                                },
+                            )
+                            current_open = ctx.open_positions_count
+                    else:
+                        current_open = ctx.open_positions_count
+                    if current_open >= self._ks5_max_concurrent:
+                        log.info(
+                            "agent.opus_skipped_at_capacity",
+                            extra={
+                                "event": "agent.opus_skipped_at_capacity",
+                                "filing_id": filing.id,
+                                "proposal_id": proposal_id,
+                                "conviction": conviction,
+                                "current_open_positions": current_open,
+                                "ks5_max": self._ks5_max_concurrent,
+                            },
+                        )
+                        return result
+
                 proposal_row = get_proposal_by_id(self._db_path, proposal_id)
                 if proposal_row is None:
                     raise RuntimeError(
-                        f"proposal {proposal_id} disappeared between store and read"
+                        f"proposal {proposal_id} disappeared between "
+                        "store and read"
                     )
                 await self._opus.review(proposal_row, filing, raw_text)
 

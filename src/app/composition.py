@@ -28,6 +28,12 @@ from typing import Any
 from analyzer.anthropic_client import AnthropicClient
 from analyzer.opus import OpusReviewer
 from analyzer.sonnet import SonnetAnalyzer
+from analyzer.thesis_review import ThesisReviewer
+from app.retro_fill import RetroFillCoordinator
+from app.thesis_coordinator import (
+    ThesisReviewCoordinator,
+    make_journal_filings_lookup,
+)
 from broker.alpaca import AlpacaBroker
 from broker.protocol import BrokerAdapter
 from config.loader import AppConfig
@@ -59,6 +65,7 @@ log = get_logger(__name__)
 _COMPOSED_PROMPT_NAMES: tuple[str, ...] = (
     "sonnet_filing_analysis_v1",
     "opus_proposal_review_v1",
+    "opus_thesis_review_v1",
 )
 
 
@@ -167,8 +174,28 @@ def compose_agent(
         max_output_tokens=config.analyzer.opus_max_output_tokens,
     )
 
+    # Broker — the SOLE credential seam. AlpacaBroker validates
+    # endpoint↔mode at construction time, so a misconfigured pair
+    # raises here, before any trading happens. Constructed BEFORE the
+    # analyzer (Feature B) because the analyzer's KS-5 capacity counter
+    # must consult broker truth (same source-of-truth as
+    # `SizingEngine.size()` so the two gates can't disagree).
+    broker = AlpacaBroker(
+        mode=config.execution.broker_mode,
+        api_key_id=secrets.alpaca_api_key_id,
+        api_secret=secrets.alpaca_api_secret_key,
+        endpoint=secrets.alpaca_endpoint.get_secret_value(),
+    )
+
     # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
-    # lives in this constructor (D-047).
+    # lives in this constructor (D-047). Feature B: also wires the KS5
+    # capacity gate so we skip Opus spend when no slot is free.
+    #
+    # Feature B source-of-truth: the capacity counter calls the BROKER
+    # (not the journal) so it agrees with `SizingEngine.size()` which
+    # also consults `broker.get_positions()`. Mismatch would cause
+    # Feature B to refuse Opus spend on a trade that would actually
+    # have fit at the sizer's gate.
     analyzer = SonnetAnalyzer(
         client=anthropic,
         store=proposal_store,
@@ -180,6 +207,8 @@ def compose_agent(
         ),
         db_path=journal.db_path,
         max_output_tokens=config.analyzer.sonnet_max_output_tokens,
+        ks5_max_concurrent=config.execution.ks5_max_concurrent,
+        open_positions_counter=lambda: len(broker.get_positions()),
     )
 
     # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.
@@ -191,16 +220,6 @@ def compose_agent(
     killswitch = KillSwitch(journal)
     auto_halt = AutoHaltEvaluator()
 
-    # Broker — the SOLE credential seam. AlpacaBroker validates
-    # endpoint↔mode at construction time, so a misconfigured pair
-    # raises here, before any trading happens.
-    broker = AlpacaBroker(
-        mode=config.execution.broker_mode,
-        api_key_id=secrets.alpaca_api_key_id,
-        api_secret=secrets.alpaca_api_secret_key,
-        endpoint=secrets.alpaca_endpoint.get_secret_value(),
-    )
-
     # Telegram outbound notifier. Single instance shared by reconciler
     # (`notify(message)` via _TelegramAlerterAdapter) and AlertWatcher
     # (`send(text)` directly). NFR-9: send is best-effort, never blocks.
@@ -209,16 +228,48 @@ def compose_agent(
         chat_id=secrets.telegram_operator_chat_id.get_secret_value(),
     )
 
+    # Feature C — opportunistic retro-fill coordinator. Runs after each
+    # successful reconciler tick to find high-conviction proposals that
+    # were skipped at capacity by Feature B. The executor closure is
+    # wired below, AFTER the AgentLoop is constructed (two-phase init).
+    retro_coordinator = RetroFillCoordinator(
+        journal=journal,
+        opus_reviewer=reviewer,
+        ks5_max_concurrent=config.execution.ks5_max_concurrent,
+    )
+
+    # Feature A — thesis-review coordinator. Reviews open positions
+    # whose declared horizon has elapsed, then applies hold / close /
+    # adjust_stop. Also driven by the reconciler tick.
+    thesis_reviewer = ThesisReviewer(
+        client=anthropic,
+        prompt_builder=prompt_builder,
+        opus_model_id=config.analyzer.opus_model_id,
+        db_path=journal.db_path,
+        max_output_tokens=config.analyzer.opus_max_output_tokens,
+    )
+    thesis_coordinator = ThesisReviewCoordinator(
+        journal=journal,
+        broker=broker,
+        reviewer=thesis_reviewer,
+        filings_lookup=make_journal_filings_lookup(journal.db_path),
+    )
+
     # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.
     # S5.6 carry-fwd S6.5 reviewer M-3 (HIGH): wire the Telegram alerter
     # at construction so position-discrepancy notifications reach the
     # operator (not just structured logs).
+    # Feature C: pass the retro coordinator so it fires at end-of-tick.
+    # Feature A: pass the thesis coordinator so open-position reviews
+    # fire at end-of-tick once their horizon has elapsed.
     reconciler = Reconciler(
         broker=broker,
         journal=journal,
         ks=killswitch,
         cfg=config.reconciler,
         alerter=_TelegramAlerterAdapter(telegram),
+        retro_coordinator=retro_coordinator,
+        thesis_coordinator=thesis_coordinator,
     )
 
     # AlertWatcher (S8.2) — must be constructed AFTER migrations have
@@ -287,11 +338,19 @@ def compose_agent(
     # `app/loop.py` (which has heavier asyncio surface).
     from .loop import AgentLoop
 
-    return AgentLoop(
+    agent_loop = AgentLoop(
         components=components,
         config=config,
         shutdown_grace_seconds=60.0,
     )
+
+    # Feature C two-phase wiring: the retro coordinator was created
+    # BEFORE the loop (since the reconciler holds it), so set the
+    # executor now that the loop exists. Without this, `run_tick` is a
+    # no-op — fail safe.
+    retro_coordinator.set_executor(agent_loop.execute_proposal)
+
+    return agent_loop
 
 
 def register_composed_prompt_versions(
