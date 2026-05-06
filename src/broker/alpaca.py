@@ -20,6 +20,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.trading.requests import (
     LimitOrderRequest,
     MarketOrderRequest,
+    ReplaceOrderRequest,
     StopLimitOrderRequest,
     StopOrderRequest,
 )
@@ -259,6 +260,27 @@ class AlpacaBroker:
             raise
         if raw is None:
             return None
+        return _normalize_submitted(raw)
+
+    def replace_stop_order(
+        self,
+        broker_order_id: str,
+        *,
+        new_stop_price: float,
+        client_order_id: str,
+    ) -> SubmittedOrder:
+        """Feature A — atomic stop-price replacement via Alpaca's
+        PATCH /v2/orders/{id}. The broker either accepts the new
+        stop_price (returning a new order with the same protective leg
+        intact) or rejects, leaving the original stop live. There is
+        no uncovered window."""
+        replace_req = ReplaceOrderRequest(
+            stop_price=new_stop_price,
+            client_order_id=client_order_id,
+        )
+        raw = _retry(
+            self._trading.replace_order_by_id, broker_order_id, replace_req
+        )
         return _normalize_submitted(raw)
 
 

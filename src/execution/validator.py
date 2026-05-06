@@ -37,6 +37,13 @@ log = get_logger(__name__)
 # by S5.6's agent loop (carry-fwd S6.4 reviewer M-1; S6.4's OrderSubmitter
 # only writes the ACCEPTED branch). Strings are stable; do not rename
 # without coordinating the write path and any downstream report queries.
+#
+# `pending_capacity` (Feature B) is the placeholder reason written by
+# `AgentLoop._execute` when the analyzer's KS-5 capacity gate skipped
+# Opus and the loop must short-circuit before broker submission. It is
+# NOT emitted by the validator — but it shares the `executions.reject_reason`
+# column, so the canonical vocabulary lives here next to the validator
+# reasons for ops to read in one place.
 RejectReason = Literal[
     "schema",
     "kill_switch",
@@ -44,6 +51,7 @@ RejectReason = Literal[
     "price_floor",
     "insufficient_capital",
     "direction_unsupported",
+    "pending_capacity",
 ]
 
 # Trade-time price floor (FR-8 / ADR-006 §3): the daily snapshot enforces

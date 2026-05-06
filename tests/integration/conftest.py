@@ -74,6 +74,10 @@ class _FakeBroker:
     # Pre-seeded orders simulating the broker's memory of a previous
     # process run whose journal write was lost mid-pipeline (M-4 test).
     preseeded_by_client_id: dict[str, SubmittedOrder] = field(default_factory=dict)
+    # Open positions visible to consumers via `get_positions()`. Defaults
+    # empty (no holdings); tests that exercise Feature B's capacity gate
+    # can override this list to simulate a full KS-5 slate.
+    positions: list[Position] = field(default_factory=list)
     equity: float = 100_000.0
     cash: float = 100_000.0
     quote_last: float = 100.0
@@ -107,6 +111,31 @@ class _FakeBroker:
             return self.submitted_by_client_id[client_order_id]
         return self.preseeded_by_client_id.get(client_order_id)
 
+    def replace_stop_order(
+        self,
+        broker_order_id: str,
+        *,
+        new_stop_price: float,
+        client_order_id: str,
+    ) -> SubmittedOrder:
+        # Atomic replace stub mirroring Alpaca's PATCH semantics: the
+        # broker emits a new SubmittedOrder with the same protective
+        # role but updated stop_price.
+        self.next_order_id += 1
+        resp = SubmittedOrder(
+            broker_order_id=f"fake-replace-{self.next_order_id:06d}",
+            client_order_id=client_order_id,
+            symbol="REPLACED",
+            side="sell",
+            qty=1,
+            order_type="stop",
+            status="accepted",
+            submitted_at=dt.datetime.now(dt.UTC),
+            stop_price=new_stop_price,
+        )
+        self.submitted_by_client_id[client_order_id] = resp
+        return resp
+
     def get_account(self) -> AccountSnapshot:
         return AccountSnapshot(
             equity=self.equity,
@@ -118,7 +147,7 @@ class _FakeBroker:
         )
 
     def get_positions(self) -> list[Position]:
-        return []
+        return list(self.positions)
 
     def get_quote(self, symbol: str) -> Quote:
         return Quote(
@@ -372,6 +401,7 @@ def _build_components(
     killswitch: KillSwitch,
     queue: asyncio.Queue,
     similarity_artifact_dir: str,
+    ks5_max_concurrent: int | None = None,
 ) -> Any:
     """Build the AgentComponents bundle used by all integration tests.
 
@@ -407,6 +437,12 @@ def _build_components(
         sonnet_model_id=sonnet_model_id,
         opus_review_conviction_threshold=7,
         db_path=db_path,
+        ks5_max_concurrent=ks5_max_concurrent,
+        open_positions_counter=(
+            (lambda: len(fake_broker.get_positions()))
+            if ks5_max_concurrent is not None
+            else None
+        ),
     )
     validator = ProposalValidator()
     sizer = SizingEngine()
@@ -466,7 +502,11 @@ def build_components(
     killswitch: KillSwitch,
     tmp_path: Path,
 ):
-    def _factory(*, queue: asyncio.Queue) -> Any:
+    def _factory(
+        *,
+        queue: asyncio.Queue,
+        ks5_max_concurrent: int | None = None,
+    ) -> Any:
         return _build_components(
             db_path=db_path,
             journal=journal,
@@ -478,6 +518,7 @@ def build_components(
             killswitch=killswitch,
             queue=queue,
             similarity_artifact_dir=str(tmp_path / "sim"),
+            ks5_max_concurrent=ks5_max_concurrent,
         )
     return _factory
 

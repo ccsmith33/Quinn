@@ -455,6 +455,246 @@ async def test_high_conviction_triggers_opus_review(
 
 
 @pytest.mark.asyncio
+async def test_opus_skipped_when_ks5_at_capacity(
+    db: str, filing: FilingRow, sonnet_prompt_version: str, caplog: Any
+) -> None:
+    """Feature B: when KS5 is at capacity (open_positions_count >=
+    ks5_max_concurrent), do NOT call Opus even on a high-conviction
+    proposal. The proposal still persists; absence of a proposal_reviews
+    row is the "pending_capacity" signal Feature C will key on."""
+    import logging
+
+    from analyzer.sonnet import SonnetAnalyzer
+    from proposal.store import ProposalStore
+
+    raw = json.dumps(_valid_proposal_payload(conviction=9))
+    client = _FakeAnthropicClient(db_path=db, responses=[raw])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    store = ProposalStore(db_path=db)
+    opus = _FakeOpusReviewer()
+
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=store,
+        prompt_builder=builder,
+        opus_reviewer=opus,
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=5,
+        ks5_max_concurrent=5,
+        db_path=db,
+    )
+
+    ctx_full = AnalyzerContext(
+        universe_summary="ACME ($150M cap, NYSE)",
+        kill_switch_state="ok",
+        open_positions_count=5,
+        decision_id="placeholder-rebuilt-by-analyzer",
+    )
+
+    with caplog.at_level(logging.INFO):
+        await analyzer.analyze(filing, raw_text="filing body", ctx=ctx_full)
+
+    # AC: Opus NOT called.
+    assert opus.calls == []
+    # AC: proposal stored, no proposal_reviews row.
+    decision_id = client.calls[0]["decision_id"]
+    row = get_proposal_by_decision_id(db, decision_id)
+    assert row is not None
+    assert row.kind == "trade_proposal"
+    review = get_proposal_review_by_proposal_id(db, row.id)  # type: ignore[arg-type]
+    assert review is None
+    # AC: structured log event emitted.
+    skip_records = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "agent.opus_skipped_at_capacity"
+    ]
+    assert len(skip_records) == 1
+    rec = skip_records[0]
+    assert rec.filing_id == filing.id
+    assert rec.proposal_id == row.id
+    assert rec.conviction == 9
+    assert rec.current_open_positions == 5
+    assert rec.ks5_max == 5
+
+
+@pytest.mark.asyncio
+async def test_opus_capacity_gate_uses_broker_counter_not_journal_ctx(
+    db: str, filing: FilingRow, sonnet_prompt_version: str, caplog: Any
+) -> None:
+    """Feature B source-of-truth alignment: the capacity gate must
+    consult the broker-backed counter (the same source `SizingEngine`
+    uses at sizing.py:103), NOT `ctx.open_positions_count` (which is
+    journal-derived). Mismatch would cause Feature B to refuse Opus
+    spend on a trade that would actually fit at the sizer's gate.
+
+    This test sets ctx.open_positions_count=4 (slack per journal) but
+    wires the broker counter to return 5 (full per broker). Expected:
+    Opus is SKIPPED — broker truth wins.
+    """
+    import logging
+
+    from analyzer.sonnet import SonnetAnalyzer
+    from proposal.store import ProposalStore
+
+    raw = json.dumps(_valid_proposal_payload(conviction=9))
+    client = _FakeAnthropicClient(db_path=db, responses=[raw])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    store = ProposalStore(db_path=db)
+    opus = _FakeOpusReviewer()
+
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=store,
+        prompt_builder=builder,
+        opus_reviewer=opus,
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=5,
+        ks5_max_concurrent=5,
+        open_positions_counter=lambda: 5,  # broker truth — at cap
+        db_path=db,
+    )
+    ctx_journal_says_slack = AnalyzerContext(
+        universe_summary="ACME",
+        kill_switch_state="ok",
+        open_positions_count=4,  # journal disagrees — would say "fit"
+        decision_id="placeholder",
+    )
+    with caplog.at_level(logging.INFO):
+        await analyzer.analyze(filing, raw_text="x", ctx=ctx_journal_says_slack)
+
+    assert opus.calls == [], "broker-truth (5/5) must override journal (4/5)"
+    skip_records = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "agent.opus_skipped_at_capacity"
+    ]
+    assert len(skip_records) == 1
+    # Logged count is the broker count, not the ctx count.
+    assert skip_records[0].current_open_positions == 5
+
+
+@pytest.mark.asyncio
+async def test_opus_capacity_gate_broker_counter_overrides_ctx_at_slack(
+    db: str, filing: FilingRow, sonnet_prompt_version: str
+) -> None:
+    """Inverse mismatch: journal says full (ctx=5), broker says slack
+    (counter=4). Broker wins → Opus IS called. Pins the contract that
+    Feature B does NOT block on stale journal state."""
+    from analyzer.opus import OpusRatified
+    from analyzer.sonnet import SonnetAnalyzer
+    from proposal.store import ProposalStore
+
+    raw = json.dumps(_valid_proposal_payload(conviction=9))
+    client = _FakeAnthropicClient(db_path=db, responses=[raw])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    store = ProposalStore(db_path=db)
+    opus = _FakeOpusReviewer()
+    opus.return_value = OpusRatified(proposal=None, rationale="x")  # type: ignore[arg-type]
+
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=store,
+        prompt_builder=builder,
+        opus_reviewer=opus,
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=5,
+        ks5_max_concurrent=5,
+        open_positions_counter=lambda: 4,  # broker truth — slack
+        db_path=db,
+    )
+    ctx_journal_says_full = AnalyzerContext(
+        universe_summary="ACME",
+        kill_switch_state="ok",
+        open_positions_count=5,  # journal disagrees — would say "skip"
+        decision_id="placeholder",
+    )
+    await analyzer.analyze(filing, raw_text="x", ctx=ctx_journal_says_full)
+    assert len(opus.calls) == 1, (
+        "broker-truth (4/5 slack) must override stale journal (5/5)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_opus_capacity_gate_falls_back_to_ctx_when_counter_raises(
+    db: str, filing: FilingRow, sonnet_prompt_version: str
+) -> None:
+    """If the broker counter raises (transient outage), the gate falls
+    back to the journal-derived ctx count to stay consistent with the
+    rest of the pipeline. cv9, ctx says 5/5 → still skip."""
+    from analyzer.sonnet import SonnetAnalyzer
+    from proposal.store import ProposalStore
+
+    raw = json.dumps(_valid_proposal_payload(conviction=9))
+    client = _FakeAnthropicClient(db_path=db, responses=[raw])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    store = ProposalStore(db_path=db)
+    opus = _FakeOpusReviewer()
+
+    def _raising_counter() -> int:
+        raise RuntimeError("simulated broker outage")
+
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=store,
+        prompt_builder=builder,
+        opus_reviewer=opus,
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=5,
+        ks5_max_concurrent=5,
+        open_positions_counter=_raising_counter,
+        db_path=db,
+    )
+    ctx_at_cap = AnalyzerContext(
+        universe_summary="ACME",
+        kill_switch_state="ok",
+        open_positions_count=5,
+        decision_id="placeholder",
+    )
+    await analyzer.analyze(filing, raw_text="x", ctx=ctx_at_cap)
+    # ctx fallback says 5/5 → skip.
+    assert opus.calls == []
+
+
+@pytest.mark.asyncio
+async def test_opus_called_when_ks5_has_slack(
+    db: str, filing: FilingRow, sonnet_prompt_version: str
+) -> None:
+    """Feature B: when KS5 has slack (open_positions_count <
+    ks5_max_concurrent), Opus is called normally — existing behavior
+    preserved."""
+    from analyzer.opus import OpusRatified
+    from analyzer.sonnet import SonnetAnalyzer
+    from proposal.store import ProposalStore
+
+    raw = json.dumps(_valid_proposal_payload(conviction=9))
+    client = _FakeAnthropicClient(db_path=db, responses=[raw])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    store = ProposalStore(db_path=db)
+    opus = _FakeOpusReviewer()
+    opus.return_value = OpusRatified(proposal=None, rationale="x")  # type: ignore[arg-type]
+
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=store,
+        prompt_builder=builder,
+        opus_reviewer=opus,
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=5,
+        ks5_max_concurrent=5,
+        db_path=db,
+    )
+
+    ctx_slack = AnalyzerContext(
+        universe_summary="ACME ($150M cap, NYSE)",
+        kill_switch_state="ok",
+        open_positions_count=4,
+        decision_id="placeholder-rebuilt-by-analyzer",
+    )
+    await analyzer.analyze(filing, raw_text="filing body", ctx=ctx_slack)
+
+    assert len(opus.calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_system_fields_injected(
     db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
 ) -> None:

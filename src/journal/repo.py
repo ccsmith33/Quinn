@@ -30,6 +30,8 @@ from .models import (
     ProposalReviewRow,
     ProposalRow,
     SimilarityCacheRow,
+    ThesisReviewRow,
+    ThesisReviewScheduleRow,
     UniverseMemberRow,
     UniverseSnapshotRow,
 )
@@ -349,6 +351,85 @@ def get_proposal_by_decision_id(db_path: str, decision_id: str) -> ProposalRow |
     return ProposalRow(**d) if d is not None else None
 
 
+def find_retro_candidate(
+    db_path: str,
+    *,
+    min_conviction: int,
+    not_older_than: _dt.datetime,
+) -> ProposalRow | None:
+    """Feature C — find a high-conviction `trade_proposal` that was
+    skipped at capacity and is still fresh enough to retro-fill.
+
+    A row is a candidate when:
+      - kind == 'trade_proposal'
+      - conviction >= min_conviction
+      - created_at >= not_older_than
+      - has an `executions` row with `reject_reason='pending_capacity'`
+        (the deterministic signal written by `AgentLoop._execute` when
+        Feature B's gate skipped Opus and broker submission was
+        blocked)
+      - NO `proposal_reviews` row exists (defense-in-depth: Opus must
+        not have already reviewed it via some other path)
+
+    Tie-break: highest conviction first, then most recent. Returns at
+    most one candidate per call (the caller serializes retro work).
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT p.* FROM proposals p
+            JOIN executions e ON e.proposal_id = p.id
+            WHERE p.kind = 'trade_proposal'
+              AND p.conviction >= ?
+              AND p.created_at >= ?
+              AND e.reject_reason = 'pending_capacity'
+              AND NOT EXISTS (
+                  SELECT 1 FROM proposal_reviews pr WHERE pr.proposal_id = p.id
+              )
+              -- Exclude proposals whose retro path already ran: any
+              -- execution row that is NOT pending_capacity means the
+              -- proposal has a terminal outcome (accepted, rejected,
+              -- broker_unavailable, opus_reject, etc.) and must not be
+              -- retro-filled again. Migration 003 allows multiple rows
+              -- per proposal so this filter is necessary.
+              AND NOT EXISTS (
+                  SELECT 1 FROM executions e2
+                  WHERE e2.proposal_id = p.id
+                    AND (
+                        e2.reject_reason IS NULL
+                        OR e2.reject_reason != 'pending_capacity'
+                    )
+              )
+            ORDER BY p.conviction DESC, p.created_at DESC
+            LIMIT 1
+            """,
+            (min_conviction, not_older_than),
+        ).fetchone()
+    d = _row_to_dict(row)
+    return ProposalRow(**d) if d is not None else None
+
+
+def has_open_position(db_path: str, symbol: str) -> bool:
+    """Feature C pyramiding guard — return True if `symbol` has a non-zero
+    qty on its latest `positions` snapshot. Mirrors the open-position
+    semantics used by `JournalRepo.get_open_positions` (latest snapshot
+    per symbol with qty != 0).
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT p.qty FROM positions p
+            WHERE p.symbol = ?
+            ORDER BY p.snapshot_at DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+    if row is None:
+        return False
+    return int(row["qty"]) != 0
+
+
 # ---------------------------------------------------------------------------
 # proposal_reviews (append-only)
 # ---------------------------------------------------------------------------
@@ -393,6 +474,101 @@ def get_proposal_review_by_proposal_id(
 
 
 # ---------------------------------------------------------------------------
+# thesis_review_schedule + thesis_reviews (Feature A; both append-only)
+# ---------------------------------------------------------------------------
+
+def insert_thesis_review_schedule(
+    db_path: str, row: ThesisReviewScheduleRow
+) -> int:
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "INSERT INTO thesis_review_schedule "
+            "(execution_id, due_at, scheduled_reason) VALUES (?, ?, ?)",
+            (row.execution_id, row.due_at, row.scheduled_reason),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def get_latest_thesis_schedule_for_execution(
+    db_path: str, execution_id: int
+) -> ThesisReviewScheduleRow | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM thesis_review_schedule "
+            "WHERE execution_id = ? ORDER BY id DESC LIMIT 1",
+            (execution_id,),
+        ).fetchone()
+    d = _row_to_dict(row)
+    return ThesisReviewScheduleRow(**d) if d is not None else None
+
+
+def find_due_thesis_reviews(
+    db_path: str, *, now: _dt.datetime
+) -> list[ThesisReviewScheduleRow]:
+    """Feature A — return schedule rows that:
+      - are the LATEST per execution_id (most-recent scheduling wins);
+      - have `due_at <= now`;
+      - have NOT yet produced a `thesis_reviews` row (UNIQUE(schedule_id)
+        ensures we never fire a schedule twice);
+      - belong to an execution whose `decision = 'accepted'` (rejected
+        executions never opened a position).
+
+    Position-still-open is enforced by the caller via
+    `has_open_position(symbol)` because the `proposals.symbol → execution`
+    join requires extra context the caller already has.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT s.* FROM thesis_review_schedule s
+            JOIN executions e ON e.id = s.execution_id
+            WHERE s.due_at <= ?
+              AND e.decision = 'accepted'
+              AND s.id IN (
+                  SELECT MAX(id) FROM thesis_review_schedule GROUP BY execution_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM thesis_reviews tr WHERE tr.schedule_id = s.id
+              )
+            ORDER BY s.due_at ASC
+            """,
+            (now,),
+        ).fetchall()
+    return [ThesisReviewScheduleRow(**dict(r)) for r in rows]
+
+
+def insert_thesis_review(db_path: str, row: ThesisReviewRow) -> int:
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "INSERT INTO thesis_reviews "
+            "(execution_id, schedule_id, model_id, prompt_version, decision, "
+            "raw_response, rationale, modifications_json, input_tokens, "
+            "output_tokens, cache_read_tokens, cache_creation_tokens, "
+            "latency_ms, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row.execution_id,
+                row.schedule_id,
+                row.model_id,
+                row.prompt_version,
+                row.decision,
+                row.raw_response,
+                row.rationale,
+                row.modifications_json,
+                row.input_tokens,
+                row.output_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_tokens,
+                row.latency_ms,
+                row.cost_usd,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+# ---------------------------------------------------------------------------
 # executions (append-only)
 # ---------------------------------------------------------------------------
 
@@ -417,9 +593,20 @@ def insert_execution(db_path: str, row: ExecutionRow) -> int:
 
 
 def get_execution_by_proposal_id(db_path: str, proposal_id: int) -> ExecutionRow | None:
+    """Return the LATEST execution row for `proposal_id`.
+
+    Migration 003 dropped UNIQUE(proposal_id), so a single proposal can
+    now have multiple `executions` rows: a `pending_capacity` placeholder
+    written by `AgentLoop._execute` when Feature B's gate skipped Opus,
+    followed (later) by an `accepted`/`rejected` row written by Feature
+    C's retro-fill. Callers want "the current outcome" — the latest row
+    by id wins.
+    """
     with connect(db_path) as conn:
         row = conn.execute(
-            "SELECT * FROM executions WHERE proposal_id = ?", (proposal_id,)
+            "SELECT * FROM executions WHERE proposal_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (proposal_id,),
         ).fetchone()
     d = _row_to_dict(row)
     return ExecutionRow(**d) if d is not None else None
@@ -925,7 +1112,17 @@ class JournalRepo:
         params: list[object] = []
         wheres: list[str] = []
         if decision_status is not None:
-            sql += " JOIN executions e ON e.proposal_id = p.id"
+            # Migration 003 allows multiple `executions` rows per
+            # proposal (pending_capacity placeholder + later outcome).
+            # Filter on the LATEST row per proposal so a single
+            # `accepted` outcome doesn't return both rows.
+            sql += (
+                " JOIN executions e ON e.proposal_id = p.id "
+                " AND e.id = ("
+                "   SELECT MAX(id) FROM executions e2 "
+                "   WHERE e2.proposal_id = p.id"
+                " )"
+            )
             wheres.append("e.decision = ?")
             params.append(decision_status)
         if symbol is not None:

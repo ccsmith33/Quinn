@@ -506,10 +506,18 @@ class AgentLoop:
         )
         if proposal is None or proposal.kind != "trade_proposal":
             return
-        # Skip if executions row already exists (idempotency).
+        # Skip if executions row already exists (idempotency). A
+        # `pending_capacity` row is the placeholder Feature B writes
+        # when it skipped Opus; it represents "queued for retro," not
+        # an executed outcome — so re-execution must NOT short-circuit
+        # on it. Migration 003 allows multiple rows per proposal.
         with connect(self._components.journal.db_path) as conn:
             row = conn.execute(
-                "SELECT 1 FROM executions WHERE proposal_id = ?", (proposal_id,)
+                "SELECT reject_reason FROM executions "
+                "WHERE proposal_id = ? "
+                "AND (reject_reason IS NULL OR reject_reason != 'pending_capacity') "
+                "LIMIT 1",
+                (proposal_id,),
             ).fetchone()
         if row is not None:
             return
@@ -523,6 +531,12 @@ class AgentLoop:
             return
         await self._execute(proposal_id, filing)
 
+    async def execute_proposal(self, proposal_id: int, filing: FilingRow) -> None:
+        """Public alias so the retro-fill coordinator (Feature C) can drive
+        the post-Opus chain through the same code path the consumer uses.
+        """
+        await self._execute(proposal_id, filing)
+
     async def _execute(self, proposal_id: int, filing: FilingRow) -> None:
         """Run the validator → sizer → submitter chain for `proposal_id`.
 
@@ -531,10 +545,20 @@ class AgentLoop:
         write because S6.2 / S6.3 are pure logic; on accept, S6.4's
         `OrderSubmitter.submit` writes the row.
         """
-        # Idempotency: skip if already executed.
+        # Idempotency: skip if already executed. A `pending_capacity`
+        # row is the placeholder written when Feature B's gate skipped
+        # Opus; Feature C's retro path may legitimately re-enter
+        # `_execute` once Opus has reviewed, so don't treat it as a
+        # terminal outcome. Migration 003 allows multiple rows per
+        # proposal so a follow-up `accepted` / `rejected` insert won't
+        # collide on UNIQUE.
         with connect(self._components.journal.db_path) as conn:
             existing = conn.execute(
-                "SELECT 1 FROM executions WHERE proposal_id = ?", (proposal_id,)
+                "SELECT 1 FROM executions "
+                "WHERE proposal_id = ? "
+                "AND (reject_reason IS NULL OR reject_reason != 'pending_capacity') "
+                "LIMIT 1",
+                (proposal_id,),
             ).fetchone()
         if existing is not None:
             log.debug(
@@ -558,6 +582,40 @@ class AgentLoop:
         )
         if review is not None and review.decision in ("reject", "malformed"):
             self._write_rejected_execution(proposal_id, "opus_reject")
+            return
+
+        # Feature B / Feature C HIGH-1 fix — pending_capacity guard.
+        #
+        # If the proposal's conviction cleared the Opus-review threshold
+        # but no `proposal_reviews` row exists, that means the analyzer's
+        # capacity gate (Feature B in `SonnetAnalyzer.analyze`) skipped
+        # Opus because KS-5 was at cap. We MUST NOT proceed to the
+        # validator/sizer chain in that case — without Opus review the
+        # trade violates FR-17, and there is a journal-vs-broker race
+        # window where the sizer's KS-5 check (broker truth) could see
+        # slack while Feature B (broker truth at analyze time) saw
+        # capacity. Writing an `executions` row with
+        # `reject_reason='pending_capacity'` (a) blocks the broker
+        # submission path, (b) gives Feature C's retro-fill query a
+        # deterministic signal to find these proposals, and (c) keeps
+        # the audit trail complete.
+        threshold = self._opus_review_threshold()
+        if (
+            review is None
+            and threshold is not None
+            and proposal_row.conviction is not None
+            and proposal_row.conviction >= threshold
+        ):
+            log.info(
+                "agent.execution_pending_capacity",
+                extra={
+                    "event": "agent.execution_pending_capacity",
+                    "proposal_id": proposal_id,
+                    "conviction": proposal_row.conviction,
+                    "threshold": threshold,
+                },
+            )
+            self._write_rejected_execution(proposal_id, "pending_capacity")
             return
 
         # Build TradeProposal pydantic model from row payload (raw_response).
@@ -657,10 +715,15 @@ class AgentLoop:
             )
             # The submitter writes a `submission_failed` row on broker
             # outage; if the exception escaped that path entirely, still
-            # record so the auditor sees it.
+            # record so the auditor sees it. A `pending_capacity`
+            # placeholder doesn't count as "the submitter wrote a row"
+            # — we still need a broker_unavailable row in that case.
             with connect(self._components.journal.db_path) as conn:
                 row = conn.execute(
-                    "SELECT 1 FROM executions WHERE proposal_id = ?",
+                    "SELECT 1 FROM executions "
+                    "WHERE proposal_id = ? "
+                    "AND (reject_reason IS NULL OR reject_reason != 'pending_capacity') "
+                    "LIMIT 1",
                     (proposal_id,),
                 ).fetchone()
             if row is None:
@@ -691,7 +754,81 @@ class AgentLoop:
                         },
                     )
 
+            # Feature A — schedule the time-horizon thesis review. The
+            # proposal's `time_horizon_days` field drives the due date
+            # (default 14 days if missing). A schedule row written here
+            # arms the reconciler-driven coordinator; if entry fails or
+            # stop/TP fires before the date, the coordinator's open-
+            # position guard discards the schedule silently.
+            try:
+                self._schedule_thesis_review(
+                    execution_id=result.execution_id,
+                    proposal=trade,
+                )
+            except Exception as e:  # noqa: BLE001 — must not block trade flow
+                log.warning(
+                    "agent.thesis_schedule_failed",
+                    extra={
+                        "event": "agent.thesis_schedule_failed",
+                        "proposal_id": proposal_id,
+                        "execution_id": result.execution_id,
+                        "error": str(e),
+                    },
+                )
+
     # -- Helpers -----------------------------------------------------------
+
+    def _opus_review_threshold(self) -> int | None:
+        """Return the conviction threshold above which Opus review is
+        mandatory before broker submission. Sourced from
+        `config.analyzer.opus_review_conviction_threshold`. Returns None
+        when no config is wired (test convenience) — the
+        `pending_capacity` guard then degrades to a no-op so legacy
+        unit tests that exercise `_execute` in isolation still pass.
+        """
+        if self._config is None:
+            return None
+        try:
+            return int(self._config.analyzer.opus_review_conviction_threshold)
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _schedule_thesis_review(
+        self,
+        *,
+        execution_id: int,
+        proposal: Any,
+    ) -> None:
+        """Feature A — write the entry-time thesis-review schedule row.
+
+        Due date is `now + proposal.time_horizon_days` days. Calling code
+        guards on success of the order submission, so failures here are
+        non-fatal — log and proceed.
+        """
+        from journal.models import ThesisReviewScheduleRow
+        from journal.repo import insert_thesis_review_schedule
+
+        horizon = getattr(proposal, "time_horizon_days", None)
+        if not isinstance(horizon, int) or horizon <= 0:
+            horizon = 14  # Feature A default per task spec
+        due = dt.datetime.now(dt.UTC) + dt.timedelta(days=horizon)
+        insert_thesis_review_schedule(
+            self._components.journal.db_path,
+            ThesisReviewScheduleRow(
+                execution_id=execution_id,
+                due_at=due,
+                scheduled_reason="entry",
+            ),
+        )
+        log.info(
+            "agent.thesis_review_scheduled",
+            extra={
+                "event": "agent.thesis_review_scheduled",
+                "execution_id": execution_id,
+                "horizon_days": horizon,
+                "due_at": due.isoformat(),
+            },
+        )
 
     def _read_raw(self, filing: FilingRow) -> str:
         try:
@@ -717,6 +854,16 @@ class AgentLoop:
         # Literal["halted","ok"]; collapse the v1 schema's vocabulary
         # ("active" → "ok", anything halted → "halted").
         ks_literal: Any = "halted" if ks_state == "halted" else "ok"
+        # `open_positions_count` here is JOURNAL-DERIVED (latest
+        # `positions` snapshot per symbol with qty != 0). It is used for
+        # PROMPT CONTEXT only — the LLM sees a number to inform its
+        # reasoning about portfolio state. Feature B's KS-5 capacity
+        # gate consults a SEPARATE BROKER-DERIVED counter
+        # (`open_positions_counter` wired by `compose_agent` to
+        # `lambda: len(broker.get_positions())`) so it agrees with
+        # `SizingEngine.size()` at sizing.py:103. The two values can
+        # diverge briefly (reconciler hasn't ticked since a stop fired)
+        # but the gate uses broker truth, not this count.
         positions = self._components.journal.get_open_positions()
         # Universe summary is an issuer-membership snapshot string for
         # block-2 (cached, daily-stable). Keep it minimal at v1.

@@ -35,6 +35,10 @@ from config.loader import ReconcilerConfig
 from journal.models import AccountSnapshotRow, PositionRow
 from observability.log_port import get_logger
 
+# Forward-only protocol for the Feature C retro coordinator. We don't
+# import the concrete class here to avoid a circular dependency with
+# `app.retro_fill` (which already imports from `journal.repo`).
+
 log = get_logger(__name__)
 
 # Threshold above which transient broker failures are surfaced as a WARN
@@ -73,6 +77,10 @@ class _AlerterLike(Protocol):
     def notify(self, message: str) -> None: ...
 
 
+class _RetroCoordinatorLike(Protocol):
+    async def run_tick(self) -> None: ...
+
+
 def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.UTC)
 
@@ -93,6 +101,8 @@ class Reconciler:
         *,
         alerter: _AlerterLike | None = None,
         now_fn: Callable[[], dt.datetime] = _utcnow,
+        retro_coordinator: _RetroCoordinatorLike | None = None,
+        thesis_coordinator: _RetroCoordinatorLike | None = None,
     ) -> None:
         self._broker = broker
         self._journal = journal
@@ -103,6 +113,13 @@ class Reconciler:
         self._task: asyncio.Task[None] | None = None
         self._stopping = asyncio.Event()
         self._consecutive_failures = 0
+        # Feature C — invoked at the end of every successful reconcile
+        # tick. None disables retro fill (legacy test path).
+        self._retro = retro_coordinator
+        # Feature A — open-position thesis-review coordinator. Same
+        # lifecycle gating as `_retro`: skipped on suppressed/deferred
+        # ticks; errors logged and not propagated.
+        self._thesis = thesis_coordinator
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -133,7 +150,7 @@ class Reconciler:
         # configured cadence.
         while not self._stopping.is_set():
             try:
-                self.reconcile_now()
+                report = self.reconcile_now()
             except Exception as e:  # noqa: BLE001 — defensive; failures must not kill loop
                 log.error(
                     "reconciler.loop_error",
@@ -142,6 +159,53 @@ class Reconciler:
                         "error": str(e),
                     },
                 )
+                report = None
+
+            # Feature C — opportunistic retro-fill on slot-open. Runs only
+            # after a successful, non-suppressed reconcile so the journal's
+            # view of open positions is fresh. Off-hours suppression is
+            # inherited via `report.suppressed`. Errors are caught here so
+            # a retro hiccup never stops the reconciler tick cadence.
+            if (
+                self._retro is not None
+                and report is not None
+                and not report.suppressed
+                and not report.deferred
+            ):
+                try:
+                    await self._retro.run_tick()
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "reconciler.retro_tick_error",
+                        extra={
+                            "event": "reconciler.retro_tick_error",
+                            "error": str(e),
+                            "error_class": type(e).__name__,
+                        },
+                    )
+
+            # Feature A — open-position thesis-review tick. Same gating
+            # as the retro tick. Runs AFTER retro because a retro fill
+            # opening a new position should still get its first thesis
+            # review scheduled at entry — that scheduling happens in the
+            # agent loop's submission path, not here.
+            if (
+                self._thesis is not None
+                and report is not None
+                and not report.suppressed
+                and not report.deferred
+            ):
+                try:
+                    await self._thesis.run_tick()
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "reconciler.thesis_tick_error",
+                        extra={
+                            "event": "reconciler.thesis_tick_error",
+                            "error": str(e),
+                            "error_class": type(e).__name__,
+                        },
+                    )
             try:
                 await asyncio.wait_for(
                     self._stopping.wait(),
