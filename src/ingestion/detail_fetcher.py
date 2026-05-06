@@ -139,15 +139,19 @@ _EX_99_FILENAME_RE = re.compile(
 # Earnings 8-Ks frequently attach multiple exhibits (99.1 = press release,
 # 99.2 = financial supplement, 99.3 = slide deck); each carries
 # independent signal worth ingesting. Cap is on COMBINED response bytes,
-# not per-file, so a 4.5 MB 99.1 leaves only 0.5 MB headroom for
-# 99.2/99.3 — they're skipped with a warning rather than truncated. This
-# is the response-size guard the agent loop needs against pathologically
-# large filings (`edgar_client.py` itself has no body cap; httpx buffers
-# whatever EDGAR sends). On the first exhibit whose bytes would push us
-# past the cap, we stop and keep what we already have. 5 MB matches a
-# realistic earnings-release combined size with 1–2x headroom for the
-# median case while protecting against OOM on adversarial filings.
-_EXHIBIT_CUMULATIVE_BYTE_CAP = 5 * 1024 * 1024
+# not per-file, so a 384 KB 99.1 leaves only 128 KB headroom for
+# 99.2/99.3 — they're skipped (or stream-aborted) rather than truncated.
+#
+# Cap rationale (2026-05-06 cost-cuts task #3):
+#   The cap's role shifted from "OOM prevention" to "token-budget control"
+#   once `EdgarClient.get_bounded` shipped streaming-bound reads. Most
+#   earnings press releases are 30-100 KB; a 1 MB exhibit at ~4 chars/token
+#   becomes ~250 K input tokens which on Haiku 4.5 is ~$0.25 per call alone.
+#   The 5 MB legacy cap was set when OOM was the primary concern.
+#   Tightened to 512 KB to bound per-call input cost and keep variance low.
+#   256 KB was considered but would risk truncating bigger earnings PDFs;
+#   512 KB still covers the vast majority of real filings.
+_EXHIBIT_CUMULATIVE_BYTE_CAP = 512 * 1024
 # Separator marking the boundary between primary body / each exhibit.
 # Soft hint to the analyst (visible in raw_text) and essential for
 # raw_text inspection during ops debugging.
@@ -562,6 +566,16 @@ class DetailFetcher:
                         "byte_cap": _EXHIBIT_CUMULATIVE_BYTE_CAP,
                     },
                 )
+                _log.info(
+                    "exhibit_truncated_at_cap",
+                    extra={
+                        "event": "exhibit_truncated_at_cap",
+                        "accession": filing.accession_number,
+                        "exhibit_skipped": exhibit_name,
+                        "cumulative_byte_size": cumulative_bytes,
+                        "byte_cap": _EXHIBIT_CUMULATIVE_BYTE_CAP,
+                    },
+                )
                 break
             url = _doc_url(filing.cik, filing.accession_number, exhibit_name)
             try:
@@ -589,6 +603,16 @@ class DetailFetcher:
                         "accession": filing.accession_number,
                         "exhibit_name": exhibit_name,
                         "remaining_budget": remaining_budget,
+                        "cumulative_byte_size": cumulative_bytes,
+                        "byte_cap": _EXHIBIT_CUMULATIVE_BYTE_CAP,
+                    },
+                )
+                _log.info(
+                    "exhibit_truncated_at_cap",
+                    extra={
+                        "event": "exhibit_truncated_at_cap",
+                        "accession": filing.accession_number,
+                        "exhibit_skipped": exhibit_name,
                         "cumulative_byte_size": cumulative_bytes,
                         "byte_cap": _EXHIBIT_CUMULATIVE_BYTE_CAP,
                     },

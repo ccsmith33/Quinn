@@ -1840,6 +1840,71 @@ async def test_8k_first_exhibit_alone_over_cap_yields_body_only(
 
 
 @pytest.mark.asyncio
+async def test_exhibit_truncated_at_cap_logs_event(
+    db: str,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When the cumulative cap binds (a subsequent exhibit cannot fit),
+    an INFO-level `exhibit_truncated_at_cap` log event is emitted so the
+    operator can monitor whether the cap is binding too often.
+
+    Operator query target: `SELECT COUNT(*) ... WHERE event =
+    'exhibit_truncated_at_cap' AND date(...) = today` to size cap impact.
+    """
+    import logging
+
+    from ingestion.detail_fetcher import _EXHIBIT_CUMULATIVE_BYTE_CAP
+
+    primary_body = b"<html><body><p>Item 2.02 Results.</p></body></html>"
+    half_cap = (_EXHIBIT_CUMULATIVE_BYTE_CAP // 2) + 8_192
+    body_991 = (
+        b"<html><body><p>EX991_FITS_MARKER</p><p>"
+        + b"x" * half_cap
+        + b"</p></body></html>"
+    )
+    body_992 = (
+        b"<html><body><p>EX992_OVERFLOW_MARKER</p><p>"
+        + b"y" * half_cap
+        + b"</p></body></html>"
+    )
+    transport = _route_with_exhibit(
+        cik=1234567,
+        accession="0001234567-26-000913",
+        primary_name="acme-8k.htm",
+        primary_body=primary_body,
+        exhibits=[
+            {"name": "ex-99-1.htm", "type": "text.gif", "size": str(len(body_991))},
+            {"name": "ex-99-2.htm", "type": "text.gif", "size": str(len(body_992))},
+        ],
+        exhibit_bodies={"ex-99-1.htm": body_991, "ex-99-2.htm": body_992},
+    )
+    edgar = _client(transport)
+    fetcher = DetailFetcher(edgar=edgar, db_path=db, raw_root=tmp_path / "raw")
+    try:
+        with caplog.at_level(logging.INFO, logger="ingestion.detail_fetcher"):
+            await fetcher.fetch_and_persist(
+                _discovered(accession="0001234567-26-000913", form_type="8-K")
+            )
+    finally:
+        await edgar.aclose()
+
+    matching = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "exhibit_truncated_at_cap"
+    ]
+    assert matching, (
+        "expected at least one exhibit_truncated_at_cap log event; "
+        f"got events: {[getattr(r, 'event', None) for r in caplog.records]}"
+    )
+    rec = matching[0]
+    assert rec.levelno == logging.INFO
+    # Operator-useful context — accession + cap value.
+    assert rec.accession == "0001234567-26-000913"
+    assert rec.byte_cap == _EXHIBIT_CUMULATIVE_BYTE_CAP
+
+
+@pytest.mark.asyncio
 async def test_8k_one_exhibit_5xx_does_not_block_others(
     db: str, tmp_path: Path
 ) -> None:

@@ -31,6 +31,7 @@ from journal.repo import (
 from observability.log_port import get_logger
 from prefilter.item_codes import ALLOW as ITEM_ALLOW
 from prefilter.item_codes import ItemCodePrefilter
+from prefilter.routine_8k import RoutineEightKFilter
 from prefilter.similarity import SimilarityChecker
 from universe.api import Universe
 
@@ -84,6 +85,7 @@ class Prefilter:
         self.similarity = similarity
         self.form_4_enabled = form_4_enabled
         self._item_code = ItemCodePrefilter()
+        self._routine_8k = RoutineEightKFilter()
 
     # ------------------------------------------------------------------
     # Public API
@@ -123,7 +125,8 @@ class Prefilter:
                 reason_detail=f"cik {filing.cik} not in universe",
             )
 
-        # Stage 2 — 8-K item-code prefilter + material-8-K bypass.
+        # Stage 2 — 8-K item-code prefilter + routine-8-K filter +
+        # material-8-K bypass.
         if filing.form_type == "8-K":
             codes = _parse_item_codes(filing.item_codes)
             ic_decision = self._item_code.evaluate(codes)
@@ -131,6 +134,16 @@ class Prefilter:
                 return PrefilterDecision(
                     decision="reject",
                     rule_fired=ic_decision.reason,
+                    reason_detail=f"item_codes={codes}",
+                )
+            # Routine-8-K filter (task #1): codes are in ALLOW but the
+            # combination is provably non-tradeable (e.g., {5.07} voting,
+            # {8.01} routine dividend). Drops before LLM cost is incurred.
+            routine = self._routine_8k.evaluate(codes, raw_text=raw_text)
+            if routine is not None:
+                return PrefilterDecision(
+                    decision="reject",
+                    rule_fired=routine.rule_fired,
                     reason_detail=f"item_codes={codes}",
                 )
             # Item-code prefilter accepted → at least one allow-list code is

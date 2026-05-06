@@ -18,8 +18,20 @@ def test_known_models_present() -> None:
         "claude-opus-4-6",
         "claude-sonnet-4-6",
         "claude-haiku-4-5",
+        "claude-haiku-4-5-20251001",
     ):
         assert model_id in PRICING
+
+
+def test_haiku_dated_alias_matches_undated_pricing() -> None:
+    """The dated Haiku 4.5 id (`claude-haiku-4-5-20251001`) must be priced
+    identically to the undated `claude-haiku-4-5` entry — they reference
+    the same underlying model. This guards against drift if the table
+    is hand-edited.
+    """
+    undated = PRICING["claude-haiku-4-5"]
+    dated = PRICING["claude-haiku-4-5-20251001"]
+    assert dated == undated
 
 
 def test_compute_cost_basic_math() -> None:
