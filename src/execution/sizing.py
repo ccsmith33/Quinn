@@ -29,11 +29,19 @@ from proposal.schemas import TradeProposal
 
 log = get_logger(__name__)
 
-# Conviction-tier thresholds (PRD §6.1). Below 7 should never reach sizing
-# — the analyzer (S5.3) routes low-conviction outputs to NoTrade. The
-# engine asserts this branch is unreachable as a wiring guardrail.
+# Conviction-tier sizing rates (PRD §6.1). cv >= 9 → high-tier rate; cv in
+# [7, 8] → mid-tier rate; cv in [_CONVICTION_FLOOR, 6] also uses mid-tier
+# rate (small fraction of equity, consistent with the prompt's "~5% for
+# conviction 5–6" calibration).
 _TIER_HIGH_THRESHOLD = 9  # cv >= 9 → high tier (10% default)
 _TIER_MID_THRESHOLD = 7  # cv in [7, 8] → mid tier (5% default)
+
+# Floor below which we will not size a trade. Tracks the configured Opus-
+# review threshold (lowered from 7 → 5 on 2026-05-06): proposals that
+# somehow reach sizing below this floor are journaled-and-skipped via
+# `SizingRejected("conviction_too_low")` rather than crashing the agent
+# loop, so a stray low-cv proposal is recoverable in production.
+_CONVICTION_FLOOR = 5
 
 # Sizing rejection vocabulary, written to `executions.reject_reason` by
 # S5.6's agent loop (carry-fwd S6.4 reviewer M-1; S6.4's OrderSubmitter
@@ -43,6 +51,7 @@ SizingRejectReason = Literal[
     "ks6_already_held",
     "ks7_cash_reserve",
     "size_too_small_for_one_share",
+    "conviction_too_low",
 ]
 
 
@@ -82,13 +91,13 @@ class SizingEngine:
         quote: Quote,
         cfg: ExecutionConfig,
     ) -> SizingResult:
-        # Defensive (AC-2): cv < 7 should be filtered by the analyzer
-        # routing path. Reaching this branch is a wiring bug, not a runtime
-        # condition we want to silently size around.
-        assert proposal.conviction >= _TIER_MID_THRESHOLD, (
-            f"sizing reached for conviction={proposal.conviction} (<7); "
-            "analyzer must route low-conviction outputs to NoTrade"
-        )
+        # Defense-in-depth: a proposal below the conviction floor should
+        # have been routed to NoTrade by the analyzer or rejected by Opus.
+        # If one slips through, journal-and-skip rather than crash the
+        # agent loop — recoverable in production over an unhandled
+        # AssertionError that would tear down the ingest path.
+        if proposal.conviction < _CONVICTION_FLOOR:
+            return self._reject("conviction_too_low", proposal)
 
         # KS-5: concurrent-position cap (PRD §5.2).
         if len(open_positions) >= cfg.ks5_max_concurrent:

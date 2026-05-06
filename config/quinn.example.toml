@@ -27,7 +27,10 @@ form_4_enabled = true
 # the quality safety net.
 sonnet_model_id = "claude-haiku-4-5-20251001"
 opus_model_id = "claude-opus-4-7"
-opus_review_conviction_threshold = 7
+# Lowered from 7 (2026-05-06) to surface more borderline proposals for Opus
+# review while paper-trading. Revisit after observing trade rate vs. Opus
+# rejection rate.
+opus_review_conviction_threshold = 5
 sonnet_max_output_tokens = 4096
 opus_max_output_tokens = 4096
 

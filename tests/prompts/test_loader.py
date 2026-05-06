@@ -10,12 +10,19 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 import pytest
 
 from journal.models import FilingRow, ProposalRow
-from prompts.loader import AnalyzerContext, ApiRequest, PromptBuilder
+from prompts.loader import (
+    _FILING_BODY_BYTE_CAP,
+    _FILING_BODY_TRUNCATION_MARKER,
+    AnalyzerContext,
+    ApiRequest,
+    PromptBuilder,
+)
 from prompts.lock import verify_lock, write_lock
 
 # ---------------------------------------------------------------------------
@@ -308,3 +315,77 @@ def test_committed_lock_matches_committed_files() -> None:
     lock = pdir / "prompts.lock"
     assert lock.is_file(), "prompts.lock missing — run write_lock to regenerate"
     verify_lock(pdir, lock)
+
+
+# ---------------------------------------------------------------------------
+# Body-cap: prevent 200K-token context overruns on large 10-Qs.
+# ---------------------------------------------------------------------------
+
+def test_filing_body_under_cap_passes_through_unchanged(tmp_path: Path) -> None:
+    """raw_text smaller than the cap is embedded verbatim, no truncation marker."""
+    pdir = _make_prompt_dir(tmp_path / "prompts")
+    builder = PromptBuilder(pdir)
+    body = "small filing body" * 100  # well under cap
+    req = builder.build_sonnet_filing_analysis(_filing(), body, _ctx())
+
+    user_text = "".join(c.text for m in req.messages for c in m.content)
+    assert body in user_text
+    assert _FILING_BODY_TRUNCATION_MARKER not in user_text
+
+
+def test_filing_body_at_cap_is_truncated_with_marker(tmp_path: Path) -> None:
+    """raw_text exceeding the cap is truncated and gets the explicit marker."""
+    pdir = _make_prompt_dir(tmp_path / "prompts")
+    builder = PromptBuilder(pdir)
+    body = "X" * (_FILING_BODY_BYTE_CAP + 50_000)
+    req = builder.build_sonnet_filing_analysis(_filing(), body, _ctx())
+
+    user_text = "".join(c.text for m in req.messages for c in m.content)
+    assert _FILING_BODY_TRUNCATION_MARKER in user_text
+    # The body that reaches the model must be ≤ cap + marker length (the
+    # other surrounding metadata in the payload is small and doesn't matter
+    # for the 200K-token guarantee — what matters is the body slice).
+    body_in_payload = user_text.split("---\n", 1)[1]
+    truncated_body = body_in_payload.rsplit(_FILING_BODY_TRUNCATION_MARKER, 1)[0]
+    assert len(truncated_body.encode("utf-8")) <= _FILING_BODY_BYTE_CAP
+
+
+def test_filing_body_truncation_logs_event(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When the cap binds, an info-level event is logged for operator visibility."""
+    pdir = _make_prompt_dir(tmp_path / "prompts")
+    builder = PromptBuilder(pdir)
+    body = "X" * (_FILING_BODY_BYTE_CAP + 1000)
+    with caplog.at_level(logging.INFO, logger="prompts.loader"):
+        builder.build_sonnet_filing_analysis(_filing(), body, _ctx())
+
+    matching = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "filing_body_truncated_at_cap"
+    ]
+    assert matching, (
+        "expected filing_body_truncated_at_cap event; "
+        f"got: {[getattr(r, 'event', None) for r in caplog.records]}"
+    )
+    rec = matching[0]
+    assert rec.levelno == logging.INFO
+    assert rec.cap == _FILING_BODY_BYTE_CAP
+    assert rec.original_size == len(body.encode("utf-8"))
+
+
+def test_filing_body_under_cap_emits_no_truncation_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No log event when the body is below the cap."""
+    pdir = _make_prompt_dir(tmp_path / "prompts")
+    builder = PromptBuilder(pdir)
+    body = "small body"
+    with caplog.at_level(logging.INFO, logger="prompts.loader"):
+        builder.build_sonnet_filing_analysis(_filing(), body, _ctx())
+
+    matching = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "filing_body_truncated_at_cap"
+    ]
+    assert not matching

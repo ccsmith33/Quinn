@@ -18,7 +18,7 @@ def test_load_example_config_builds_appconfig() -> None:
     # spot-check a few values from §10.2
     assert cfg.ingestion.rss_poll_seconds_market == 60
     assert cfg.prefilter.similarity_threshold == 0.97
-    assert cfg.analyzer.opus_review_conviction_threshold == 7
+    assert cfg.analyzer.opus_review_conviction_threshold == 5
     assert cfg.execution.broker_mode in ("paper", "live")
     assert cfg.killswitch.ks1_daily_loss_pct == 0.03
     assert cfg.observability.log_level == "INFO"

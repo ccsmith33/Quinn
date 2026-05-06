@@ -281,14 +281,34 @@ def test_realized_dollar_size_request_logged_for_journaling() -> None:
     assert result.realized_dollar_size == pytest.approx(1000.0)
 
 
-def test_low_conviction_branch_is_defensive_assertion() -> None:
-    """AC-2 defensive: cv < 7 should not reach sizing (analyzer routes elsewhere).
-
-    The engine asserts; this catches an upstream wiring bug.
+def test_below_floor_conviction_returns_sizing_rejected() -> None:
+    """Conviction below the floor (5) is rejected as a journaled outcome
+    rather than raising — defense-in-depth so a stray low-cv proposal
+    can't crash the agent loop.
     """
-    p = _proposal(conviction=5)
+    p = _proposal(conviction=4)
     account = _account(equity=5000.0)
     engine = SizingEngine()
 
-    with pytest.raises(AssertionError):
-        engine.size(p, account, open_positions=[], quote=_quote(), cfg=_cfg())
+    result = engine.size(
+        p, account, open_positions=[], quote=_quote(), cfg=_cfg()
+    )
+    assert isinstance(result, SizingRejected)
+    assert result.reason == "conviction_too_low"
+
+
+def test_at_floor_conviction_proceeds_through_sizing() -> None:
+    """Conviction == floor (5) is accepted and routed through normal sizing
+    using the mid-tier rate (cv 5..6 share the mid-tier rate; cv >= 9 hits
+    the high-tier rate).
+    """
+    p = _proposal(conviction=5, size_pct=0.05)
+    account = _account(equity=5000.0)
+    engine = SizingEngine()
+
+    result = engine.size(
+        p, account, open_positions=[], quote=_quote(), cfg=_cfg()
+    )
+    assert isinstance(result, SizingAccepted)
+    # mid-tier rate is 5% per ExecutionConfig default → realized_pct ~ 0.05.
+    assert result.realized_pct == pytest.approx(0.05)
