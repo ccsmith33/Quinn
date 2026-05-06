@@ -20,7 +20,12 @@ minhash_perms = 128
 form_4_enabled = true
 
 [analyzer]
-sonnet_model_id = "claude-sonnet-4-6"
+# First-pass analyzer model. Variable name retained for backward compat
+# with module names (`src/analyzer/sonnet.py`, `composition.sonnet_model_id`);
+# actual model is configurable. As of 2026-05 the default is Haiku 4.5
+# (~3x cheaper than Sonnet 4.6) — Opus reviewer at conviction-7+ remains
+# the quality safety net.
+sonnet_model_id = "claude-haiku-4-5-20251001"
 opus_model_id = "claude-opus-4-7"
 opus_review_conviction_threshold = 7
 sonnet_max_output_tokens = 4096

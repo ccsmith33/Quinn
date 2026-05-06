@@ -51,6 +51,8 @@ _PUBLIC_RATES_PER_MILLION: dict[str, tuple[float, float]] = {
     "claude-opus-4-6": (5.00, 25.00),
     "claude-sonnet-4-6": (3.00, 15.00),
     "claude-haiku-4-5": (1.00, 5.00),
+    # Dated Haiku 4.5 alias — same model, snapshot id used by config.
+    "claude-haiku-4-5-20251001": (1.00, 5.00),
 }
 
 

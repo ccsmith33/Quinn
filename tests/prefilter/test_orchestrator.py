@@ -503,6 +503,140 @@ def test_8k_with_no_item_codes_rejected_at_item_code_stage(
     assert decision.rule_fired == "item_code_empty"
 
 
+# ---------------------------------------------------------------------------
+# Task #1 — routine 8-K rules (cost-cuts day 4)
+# ---------------------------------------------------------------------------
+
+
+def test_routine_5_07_voting_rejected_before_similarity(
+    db_path: str, universe: Universe
+) -> None:
+    """Pure 5.07 — annual meeting voting — drops without LLM call."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000010",
+        cik=320193,
+        form_type="8-K",
+        item_codes=["5.07", "9.01"],
+    )
+    decision = pref.evaluate(f, "Annual meeting results: directors elected.")
+
+    assert decision.decision == "reject"
+    assert decision.rule_fired == "routine_5_07_voting"
+    sim_spy.check.assert_not_called()
+    persisted = get_prefilter_decision_by_filing(db_path, f.id or 0)
+    assert persisted is not None
+    assert persisted.rule_fired == "routine_5_07_voting"
+
+
+def test_routine_5_02_retirement_rejected(
+    db_path: str, universe: Universe
+) -> None:
+    """{5.02, 9.01} with retirement-only body drops."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000011",
+        cik=320193,
+        form_type="8-K",
+        item_codes=["5.02", "9.01"],
+    )
+    body = "John Smith is retiring as Chief Financial Officer effective June 1."
+    decision = pref.evaluate(f, body)
+
+    assert decision.decision == "reject"
+    assert decision.rule_fired == "routine_5_02_retirement"
+    sim_spy.check.assert_not_called()
+
+
+def test_substantive_1_01_with_5_07_still_accepted(
+    db_path: str, universe: Universe
+) -> None:
+    """1.01 alongside 5.07 — material agreement is the catalyst; do not drop.
+    Falls through to material_8k_bypass."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000012",
+        cik=320193,
+        form_type="8-K",
+        item_codes=["1.01", "5.07"],
+    )
+    decision = pref.evaluate(f, "Annual meeting; also entered into a credit agreement.")
+
+    assert decision.decision == "accept"
+    assert decision.rule_fired == "material_8k_bypass"
+    sim_spy.check.assert_not_called()
+
+
+def test_2_02_with_5_07_still_accepted(
+    db_path: str, universe: Universe
+) -> None:
+    """{2.02, 5.07, 9.01} — earnings is the catalyst; do not drop."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000013",
+        cik=320193,
+        form_type="8-K",
+        item_codes=["2.02", "5.07", "9.01"],
+    )
+    decision = pref.evaluate(f, "Annual meeting and Q1 earnings: EPS $1.50.")
+
+    assert decision.decision == "accept"
+    assert decision.rule_fired == "material_8k_bypass"
+
+
+def test_routine_8_01_dividend_rejected(
+    db_path: str, universe: Universe
+) -> None:
+    """Pure {8.01} dividend declaration drops."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000014",
+        cik=320193,
+        form_type="8-K",
+        item_codes=["8.01"],
+    )
+    body = (
+        "The Board of Directors declared a quarterly cash dividend of "
+        "$0.42 per share, payable June 15, 2026."
+    )
+    decision = pref.evaluate(f, body)
+
+    assert decision.decision == "reject"
+    assert decision.rule_fired == "routine_8_01_dividend"
+    sim_spy.check.assert_not_called()
+
+
+def test_routine_7_01_ir_conference_rejected(
+    db_path: str, universe: Universe
+) -> None:
+    """Pure {7.01} IR/conference posting drops."""
+    sim_spy = MagicMock(spec=SimilarityChecker)
+    pref = Prefilter(db_path=db_path, universe=universe, similarity=sim_spy)
+    f = _filing(
+        db_path=db_path,
+        accession="0000001-26-000015",
+        cik=320193,
+        form_type="8-K",
+        item_codes=["7.01"],
+    )
+    body = "The Company is furnishing its investor presentation for upcoming meetings."
+    decision = pref.evaluate(f, body)
+
+    assert decision.decision == "reject"
+    assert decision.rule_fired == "routine_7_01_ir_conference"
+    sim_spy.check.assert_not_called()
+
+
 def test_decision_returned_matches_decision_persisted(
     prefilter: Prefilter, db_path: str
 ) -> None:
