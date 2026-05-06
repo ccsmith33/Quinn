@@ -51,7 +51,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 
-from journal.models import FilingRow  # noqa: E402
+from journal.models import FilingRow, ProposalRow  # noqa: E402
 from prompts.loader import AnalyzerContext, PromptBuilder  # noqa: E402
 from analyzer.parse import ResponseParseError, extract_json_object  # noqa: E402
 
@@ -60,6 +60,7 @@ DEFAULT_DB = "/var/lib/quinn/journal.db"
 DEFAULT_PROMPT_DIR = _REPO_ROOT / "src" / "prompts"
 EX99_RE = re.compile(r"ex-?99[-_]?\d*", re.IGNORECASE)
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_OPUS_MODEL = "claude-opus-4-7"
 DEFAULT_USER_AGENT = "Quinn-Research/v1 ccsmith33@crimson.ua.edu"
 DEFAULT_EXHIBIT_CAP_BYTES = 256_000  # 256KB per exhibit; reduced from 1MB after droplet OOM
 MIN_FREE_MEMORY_MB = 250  # refuse to run below this on Linux unless --force
@@ -253,6 +254,74 @@ def estimate_cost(model: str, usage: dict) -> float:
     )
 
 
+def run_opus_review(
+    *,
+    filing: FilingRow,
+    proposal_payload: dict,
+    raw_text: str,
+    prompt_dir: Path,
+    api_key: str,
+    opus_model: str,
+    haiku_model: str,
+    haiku_prompt_version: str,
+    haiku_raw_response: str,
+    max_tokens: int,
+) -> dict:
+    """Build an Opus review request from Haiku's trade_proposal output and
+    call Opus. Returns a dict with the parsed Opus decision + cost/usage.
+    Mirrors `OpusReviewer.review()` in production but doesn't write to DB.
+    """
+    # Synthesize a ProposalRow from Haiku's output. The PromptBuilder only
+    # reads the fields it embeds in _proposal_payload; the rest can be
+    # placeholders.
+    fake_proposal = ProposalRow(
+        filing_id=filing.id or -1,
+        decision_id=f"dryrun-opus-{filing.id}",
+        model_id=haiku_model,
+        prompt_version=haiku_prompt_version,
+        raw_response=haiku_raw_response,
+        kind="trade_proposal",
+        symbol=proposal_payload.get("symbol"),
+        direction=proposal_payload.get("direction"),
+        size_pct_requested=proposal_payload.get("size_pct_of_capital"),
+        conviction=proposal_payload.get("conviction"),
+        thesis=proposal_payload.get("thesis") or proposal_payload.get("thesis_or_reason"),
+        input_tokens=0,
+        output_tokens=0,
+        latency_ms=0,
+        cost_usd=0.0,
+    )
+
+    builder = PromptBuilder(prompt_dir)
+    request = builder.build_opus_proposal_review(fake_proposal, raw_text)
+
+    text, usage = call_anthropic(
+        request, api_key, model=opus_model, max_tokens=max_tokens
+    )
+    cost = estimate_cost(opus_model, usage)
+
+    parsed: dict | None = None
+    decision = "?"
+    rationale = ""
+    try:
+        parsed = extract_json_object(text)
+        decision = parsed.get("decision") or "?"
+        rationale = parsed.get("rationale") or ""
+    except ResponseParseError:
+        pass
+
+    return {
+        "decision": decision,
+        "rationale": rationale,
+        "parsed": parsed,
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "cache_read": usage["cache_read_input_tokens"],
+        "cost_usd": cost,
+        "raw": text,
+    }
+
+
 def fetch_today_filing_ids(db_path: str, *, since: str | None = None) -> list[int]:
     """Return all filing.id values from the journal where filed_at falls in
     `since` (default: today). Used by --batch-today.
@@ -283,6 +352,9 @@ def analyze_one(
     user_agent: str,
     max_tokens: int,
     verbose: bool,
+    with_opus: bool = False,
+    opus_model: str = DEFAULT_OPUS_MODEL,
+    opus_threshold: int = 5,
 ) -> dict:
     """Run a single dryrun analysis and return a result dict.
 
@@ -401,7 +473,7 @@ def analyze_one(
             print("  [raw, not JSON-parseable]")
             print(text)
 
-    return {
+    result = {
         "filing_id": filing.id,
         "ticker": filing.issuer_ticker,
         "form_type": filing.form_type,
@@ -415,7 +487,50 @@ def analyze_one(
         "cache_read": usage["cache_read_input_tokens"],
         "cost_usd": cost,
         "parse_ok": parsed is not None,
+        "opus_decision": None,
+        "opus_rationale": None,
+        "opus_cost_usd": 0.0,
     }
+
+    # Optional Opus review on trade_proposal at conviction >= threshold.
+    if (
+        with_opus
+        and decision == "trade_proposal"
+        and conviction is not None
+        and conviction >= opus_threshold
+        and parsed is not None
+    ):
+        if verbose:
+            print()
+            print(f"=== Opus review ({opus_model}) ===")
+        opus = run_opus_review(
+            filing=filing,
+            proposal_payload=parsed,
+            raw_text=raw_text,
+            prompt_dir=prompt_dir,
+            api_key=api_key,
+            opus_model=opus_model,
+            haiku_model=model,
+            haiku_prompt_version=request.prompt_version,
+            haiku_raw_response=text,
+            max_tokens=max_tokens,
+        )
+        result["opus_decision"] = opus["decision"]
+        result["opus_rationale"] = (opus["rationale"] or "")[:500]
+        result["opus_cost_usd"] = opus["cost_usd"]
+        result["cost_usd"] += opus["cost_usd"]
+        if verbose:
+            print(
+                f"  opus_decision = {opus['decision']}  "
+                f"(in={opus['input_tokens']} out={opus['output_tokens']} "
+                f"cost=${opus['cost_usd']:.4f})"
+            )
+            if opus["rationale"]:
+                print()
+                print("--- Opus rationale ---")
+                print(opus["rationale"])
+
+    return result
 
 
 def main() -> None:
@@ -469,6 +584,22 @@ def main() -> None:
         action="store_true",
         help="Bypass the low-memory refusal AND the >$3 cost confirmation",
     )
+    p.add_argument(
+        "--with-opus",
+        action="store_true",
+        help="Also run Opus review on any trade_proposal with conviction >= --opus-threshold (adds ~$0.25 per proposal)",
+    )
+    p.add_argument(
+        "--opus-model",
+        default=DEFAULT_OPUS_MODEL,
+        help=f"Opus model id for --with-opus (default {DEFAULT_OPUS_MODEL})",
+    )
+    p.add_argument(
+        "--opus-threshold",
+        type=int,
+        default=5,
+        help="Conviction floor for Opus review (default 5; matches production)",
+    )
     args = p.parse_args()
 
     check_memory_or_exit(force=args.force)
@@ -504,6 +635,9 @@ def main() -> None:
             user_agent=args.user_agent,
             max_tokens=args.max_tokens,
             verbose=True,
+            with_opus=args.with_opus,
+            opus_model=args.opus_model,
+            opus_threshold=args.opus_threshold,
         )
 
 
@@ -562,6 +696,9 @@ def run_batch(args, api_key: str) -> None:
                 user_agent=args.user_agent,
                 max_tokens=args.max_tokens,
                 verbose=False,
+                with_opus=args.with_opus,
+                opus_model=args.opus_model,
+                opus_threshold=args.opus_threshold,
             )
         except Exception as e:  # noqa: BLE001 — diagnostic script; want to keep going
             print(
@@ -618,10 +755,27 @@ def run_batch(args, api_key: str) -> None:
         print()
         print(f"  TRADE PROPOSALS ({len(trade_proposals)}):")
         for r in trade_proposals:
+            opus_tag = ""
+            if r.get("opus_decision"):
+                opus_tag = f" → opus={r['opus_decision']}"
             print(
-                f"    {r['ticker'] or '-':<8} conviction={r['conviction']} "
-                f"thesis={r['thesis_head']}"
+                f"    {r['ticker'] or '-':<8} conviction={r['conviction']}"
+                f"{opus_tag}  thesis={r['thesis_head']}"
             )
+
+        if args.with_opus:
+            opus_decisions: dict[str, int] = {}
+            opus_total_cost = 0.0
+            for r in trade_proposals:
+                d = r.get("opus_decision")
+                if d:
+                    opus_decisions[d] = opus_decisions.get(d, 0) + 1
+                opus_total_cost += r.get("opus_cost_usd", 0.0)
+            print()
+            print("  Opus review distribution:")
+            for k, v in sorted(opus_decisions.items(), key=lambda kv: -kv[1]):
+                print(f"    {k:<20} {v}")
+            print(f"  Opus total cost: ${opus_total_cost:.2f}")
 
 
 if __name__ == "__main__":
