@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
-from broker.protocol import AccountSnapshot, Position, Quote
+from broker.protocol import AccountSnapshot, OpenOrder, Position, Quote
 from config.loader import ExecutionConfig
 from observability.log_port import get_logger
 from proposal.schemas import TradeProposal
@@ -90,6 +90,7 @@ class SizingEngine:
         open_positions: list[Position],
         quote: Quote,
         cfg: ExecutionConfig,
+        pending_buys: list[OpenOrder] | None = None,
     ) -> SizingResult:
         # Defense-in-depth: a proposal below the conviction floor should
         # have been routed to NoTrade by the analyzer or rejected by Opus.
@@ -99,14 +100,29 @@ class SizingEngine:
         if proposal.conviction < _CONVICTION_FLOOR:
             return self._reject("conviction_too_low", proposal)
 
+        # KS-5 / KS-6 effective count = unique symbols across (filled
+        # positions ∪ pending entry buys). Hotfix 2026-05-07: pre-market
+        # market BUYs queue at Alpaca and only fill at the bell, so the
+        # filled-only view saw 0 positions while the bot was happily
+        # opening its 28th of the morning. Pending SELLs (stops / TPs
+        # from prior days) are NOT counted — the underlying long is
+        # already in `open_positions`.
+        pending_buys = pending_buys or []
+        pending_symbols = {o.symbol for o in pending_buys if o.is_entry}
+        held_symbols = {p.symbol for p in open_positions}
+        effective_symbols = held_symbols | pending_symbols
+
         # KS-5: concurrent-position cap (PRD §5.2).
-        if len(open_positions) >= cfg.ks5_max_concurrent:
+        if len(effective_symbols) >= cfg.ks5_max_concurrent:
             return self._reject("ks5_concurrent_limit", proposal)
 
         # KS-6: single-name re-entry block (PRD §5.2 + tactical clarification
         # in S6.3 dev notes — KS-6 is "covered by KS-4" in v1, with the
-        # additional rule that we don't re-enter a held name).
-        if any(p.symbol == proposal.symbol for p in open_positions):
+        # additional rule that we don't re-enter a held name OR submit a
+        # second entry while a prior entry on the same symbol is still
+        # pending fill (avoids the wash-trade rejection cascade observed
+        # in the 2026-05-07 incident).
+        if proposal.symbol in effective_symbols:
             return self._reject("ks6_already_held", proposal)
 
         # PRD §6.1: conviction-tier rate.

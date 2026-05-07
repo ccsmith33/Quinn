@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from broker.protocol import AccountSnapshot, Position, Quote
+from broker.protocol import AccountSnapshot, OpenOrder, Position, Quote
 from config.loader import ExecutionConfig
 from execution.sizing import (
     SizingAccepted,
@@ -79,6 +79,36 @@ def _position(symbol: str, qty: int = 10) -> Position:
         avg_entry_price=10.0,
         market_value=10.0 * qty,
         unrealized_pnl=0.0,
+    )
+
+
+def _open_buy(symbol: str, qty: int = 10) -> OpenOrder:
+    """Pending entry-leg BUY order, simulating the pre-market queue."""
+    return OpenOrder(
+        symbol=symbol,
+        side="buy",
+        qty=qty,
+        order_type="market",
+        status="accepted",
+        broker_order_id=f"ord-{symbol}",
+        client_order_id=f"prop-{symbol}-entry",
+    )
+
+
+def _open_sell(symbol: str, qty: int = 10) -> OpenOrder:
+    """Pending protective SELL leg (stop or TP from a prior day).
+
+    These should NOT count toward KS-5 capacity — the underlying long is
+    already in `open_positions`.
+    """
+    return OpenOrder(
+        symbol=symbol,
+        side="sell",
+        qty=qty,
+        order_type="stop",
+        status="new",
+        broker_order_id=f"ord-{symbol}-stop",
+        client_order_id=f"prop-{symbol}-stop",
     )
 
 
@@ -295,6 +325,119 @@ def test_below_floor_conviction_returns_sizing_rejected() -> None:
     )
     assert isinstance(result, SizingRejected)
     assert result.reason == "conviction_too_low"
+
+
+def test_ks5_trips_with_only_pending_buys_and_zero_filled() -> None:
+    """Hotfix 2026-05-07 (the production bug): pre-market market BUYs
+    queue at Alpaca and only fill at 9:30 ET. With ks5_max_concurrent=10
+    and 10 pending buys but 0 filled, KS-5 must still trip — pre-fix it
+    saw `len(open_positions)=0` and let through what eventually became
+    27 unprotected positions.
+    """
+    p = _proposal(symbol="ACME", conviction=8)
+    account = _account(equity=5000.0)
+    pending = [_open_buy(f"SYM{i}") for i in range(10)]
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=[],
+        quote=_quote(),
+        cfg=_cfg(ks5_max_concurrent=10),
+        pending_buys=pending,
+    )
+    assert isinstance(result, SizingRejected)
+    assert result.reason == "ks5_concurrent_limit"
+
+
+def test_ks5_trips_with_mixed_filled_and_pending() -> None:
+    """KS-5 counts UNIQUE symbols across (filled ∪ pending entry buys).
+
+    5 filled positions + 5 distinct pending buys = 10 effective slots
+    consumed; the next proposal must be rejected at ks5_max_concurrent=10.
+    """
+    p = _proposal(symbol="NEWCO", conviction=8)
+    account = _account(equity=5000.0)
+    filled = [_position(f"FILLED{i}") for i in range(5)]
+    pending = [_open_buy(f"PEND{i}") for i in range(5)]
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=filled,
+        quote=_quote(),
+        cfg=_cfg(ks5_max_concurrent=10),
+        pending_buys=pending,
+    )
+    assert isinstance(result, SizingRejected)
+    assert result.reason == "ks5_concurrent_limit"
+
+
+def test_ks6_trips_when_pending_buy_exists_for_symbol() -> None:
+    """A second entry on the same symbol while the first is still
+    pending fill must be rejected as `ks6_already_held`. This both
+    matches the long-only mandate and avoids the wash-trade rejection
+    cascade observed pre-fix (Alpaca rejects the second back-to-back
+    submission with broker code 40310000).
+    """
+    p = _proposal(symbol="ACME", conviction=8)
+    account = _account(equity=5000.0)
+    pending = [_open_buy("ACME")]
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=[],
+        quote=_quote(),
+        cfg=_cfg(),
+        pending_buys=pending,
+    )
+    assert isinstance(result, SizingRejected)
+    assert result.reason == "ks6_already_held"
+
+
+def test_ks5_does_not_count_pending_sells() -> None:
+    """Protective SELL legs (stops / TPs from prior days) surface in
+    `get_open_orders()` too but must NOT consume KS-5 capacity — the
+    underlying long position is already in `open_positions`. Without
+    this, a portfolio with N positions + N stops would falsely
+    appear to be at 2N capacity.
+    """
+    p = _proposal(symbol="NEWCO", conviction=8)
+    account = _account(equity=5000.0)
+    # 4 filled positions plus their 4 stops = 8 open orders, but only
+    # 4 effective KS-5 slots consumed. cfg max=5 → accepted.
+    filled = [_position(f"SYM{i}") for i in range(4)]
+    pending_sells = [_open_sell(f"SYM{i}") for i in range(4)]
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=filled,
+        quote=_quote(),
+        cfg=_cfg(ks5_max_concurrent=5),
+        pending_buys=pending_sells,
+    )
+    assert isinstance(result, SizingAccepted)
+
+
+def test_pending_buys_defaults_to_empty_when_omitted() -> None:
+    """Backward-compat: legacy callers that don't pass `pending_buys`
+    behave as if there are no pending entries — preserves the prior
+    semantics for tests / paths not yet wired to the new broker
+    surface.
+    """
+    p = _proposal(symbol="NEWCO", conviction=8)
+    account = _account(equity=5000.0)
+    engine = SizingEngine()
+
+    # No `pending_buys=` kwarg → defaults to None → treated as empty.
+    result = engine.size(p, account, open_positions=[], quote=_quote(), cfg=_cfg())
+    assert isinstance(result, SizingAccepted)
 
 
 def test_at_floor_conviction_proceeds_through_sizing() -> None:

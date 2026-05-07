@@ -35,6 +35,7 @@ import uuid
 from typing import Any
 
 from broker.alpaca import BrokerUnavailable
+from broker.protocol import BrokerRejected
 from execution.orders import AcceptedProposal, SubmissionAccepted, SubmissionFailed
 from execution.sizing import SizingAccepted, SizingRejected
 from execution.validator import Accepted, Rejected
@@ -664,9 +665,26 @@ class AgentLoop:
             self._write_rejected_execution(proposal_id, validation.reason)
             return
 
-        # Sizer.
+        # Sizer. Hotfix 2026-05-07: also fetch pending broker orders so
+        # KS-5 / KS-6 see queued pre-market entries (which haven't filled
+        # yet and therefore don't appear in `get_positions()`). Without
+        # this, the bot opened 28 entries in one pre-market session
+        # because each new sizing check saw 0 open positions.
         account = self._components.broker.get_account()
         positions = self._components.broker.get_positions()
+        try:
+            open_orders = self._components.broker.get_open_orders()
+        except Exception as e:  # noqa: BLE001 — never block trade flow on telemetry
+            log.warning(
+                "agent.get_open_orders_failed",
+                extra={
+                    "event": "agent.get_open_orders_failed",
+                    "proposal_id": proposal_id,
+                    "error": str(e),
+                },
+            )
+            open_orders = []
+        pending_buys = [o for o in open_orders if o.is_entry]
         quote = self._components.broker.get_quote(trade.symbol)
         sizing = self._components.sizer.size(
             trade,
@@ -674,6 +692,7 @@ class AgentLoop:
             positions,
             quote,
             self._config.execution if self._config else _stub_execution_config(),
+            pending_buys=pending_buys,
         )
         if isinstance(sizing, SizingRejected):
             self._write_rejected_execution(proposal_id, sizing.reason)
@@ -704,13 +723,18 @@ class AgentLoop:
                 self._components.journal,
                 self._components.killswitch,
             )
-        except BrokerUnavailable as e:
+        except (BrokerRejected, BrokerUnavailable) as e:
+            # The submitter writes journal rows for both branches and
+            # halts the killswitch on stop-leg failures. We log here as
+            # defense-in-depth so the audit trail still records anything
+            # that escaped the submitter's handler.
             log.error(
                 "agent.broker_unavailable",
                 extra={
                     "event": "agent.broker_unavailable",
                     "proposal_id": proposal_id,
                     "error": str(e),
+                    "error_type": type(e).__name__,
                 },
             )
             # The submitter writes a `submission_failed` row on broker

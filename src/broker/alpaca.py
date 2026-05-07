@@ -16,8 +16,9 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
+    GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     ReplaceOrderRequest,
@@ -30,6 +31,8 @@ from observability.log_port import get_logger
 
 from .protocol import (
     AccountSnapshot,
+    BrokerRejected,
+    OpenOrder,
     OrderRequest,
     Position,
     Quote,
@@ -67,11 +70,43 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+def _wrap_api_error(exc: APIError) -> BrokerRejected:
+    """Translate a non-retryable alpaca-py `APIError` into our domain
+    exception so callers depend only on `broker.protocol`.
+
+    Hotfix 2026-05-07 (incident: 27 unprotected positions): a wash-trade
+    rejection (status 422, broker code 40310000) on a back-to-back stop
+    submission was propagating raw out of the broker abstraction and
+    escaping the `OrderSubmitter`'s `BrokerUnavailable` handler entirely
+    — the position stayed live without protection AND without a journal
+    row. Wrapping at the broker boundary lets execution catch a single
+    union (`BrokerRejected | BrokerUnavailable`) and route both to the
+    `submission_partial_no_stop` killswitch halt + journal write.
+    """
+    status = getattr(exc, "status_code", None)
+    # alpaca-py packs the broker-specific code in the `_error` dict
+    # (e.g. {"code": 40310000, "message": "..."}); fall back to None.
+    err_payload = getattr(exc, "_error", None)
+    broker_code: int | str | None = None
+    if isinstance(err_payload, dict):
+        broker_code = err_payload.get("code")
+    return BrokerRejected(
+        str(exc),
+        status_code=status,
+        broker_code=broker_code,
+    )
+
+
 def _retry(callable_: Any, *args: Any, **kwargs: Any) -> Any:
     """Run `callable_` with exponential backoff + full jitter on transient errors.
 
     Spec: base 1s, cap 60s, max 5 attempts. On exhaustion, raise BrokerUnavailable
     chained from the last error (NFR-5).
+
+    Non-retryable `APIError`s (anything that isn't 429/503) are wrapped as
+    `BrokerRejected` so they cross the broker boundary in a domain type
+    rather than the raw alpaca-py SDK exception (incident 2026-05-07).
+    Non-`APIError` exceptions still propagate raw.
     """
     last_exc: BaseException | None = None
     for attempt in range(_RETRY_MAX_ATTEMPTS):
@@ -79,6 +114,8 @@ def _retry(callable_: Any, *args: Any, **kwargs: Any) -> Any:
             return callable_(*args, **kwargs)
         except BaseException as exc:
             if not _is_retryable(exc):
+                if isinstance(exc, APIError):
+                    raise _wrap_api_error(exc) from exc
                 raise
             last_exc = exc
             if attempt == _RETRY_MAX_ATTEMPTS - 1:
@@ -168,6 +205,19 @@ def _normalize_position(pos: Any) -> Position:
     )
 
 
+def _normalize_open_order(o: Any) -> OpenOrder:
+    raw_type = _enum_value(getattr(o, "order_type", None) or getattr(o, "type", None))
+    return OpenOrder(
+        symbol=str(o.symbol),
+        side=_enum_value(o.side),
+        qty=int(float(o.qty)),
+        order_type=raw_type,
+        status=_enum_value(o.status),
+        broker_order_id=str(o.id),
+        client_order_id=str(o.client_order_id),
+    )
+
+
 class AlpacaBroker:
     """BrokerAdapter implementation backed by alpaca-py.
 
@@ -227,6 +277,26 @@ class AlpacaBroker:
         raw = _retry(self._trading.get_all_positions)
         return [_normalize_position(p) for p in raw]
 
+    def get_open_orders(self) -> list[OpenOrder]:
+        """Return broker orders that are currently open / pending fill.
+
+        Alpaca's `QueryOrderStatus.OPEN` covers the lifecycle states that
+        haven't reached a terminal disposition (filled / canceled /
+        expired / rejected): accepted, new, partially_filled, pending_new,
+        accepted_for_bidding. We rely on the broker's own classification
+        rather than filtering client-side, both because the SDK does the
+        filtering for free and because the set of "open" statuses is the
+        broker's contract, not ours.
+
+        Hotfix 2026-05-07: production saw 28 entries opened in one
+        pre-market session because each new sizing check saw 0 open
+        positions (broker hadn't filled them yet). KS-5 now consults
+        `len(positions ∪ open_buy_orders by symbol)`.
+        """
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        raw = _retry(self._trading.get_orders, filter=req)
+        return [_normalize_open_order(o) for o in raw]
+
     def get_quote(self, symbol: str) -> Quote:
         quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
         trade_req = StockLatestTradeRequest(symbol_or_symbols=symbol)
@@ -254,8 +324,11 @@ class AlpacaBroker:
         """
         try:
             raw = _retry(self._trading.get_order_by_client_id, client_order_id)
-        except APIError as e:
-            if getattr(e, "status_code", None) == 404:
+        except BrokerRejected as e:
+            # 404 is "no order with that client_id" — the v1 orphan-order
+            # contract treats this as None, not an error. Other rejections
+            # (auth failure, malformed id) still propagate.
+            if e.status_code == 404:
                 return None
             raise
         if raw is None:
@@ -286,6 +359,7 @@ class AlpacaBroker:
 
 __all__ = [
     "AlpacaBroker",
+    "BrokerRejected",
     "BrokerUnavailable",
     "LIVE_ENDPOINT",
     "PAPER_ENDPOINT",

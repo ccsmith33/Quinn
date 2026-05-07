@@ -39,7 +39,7 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from broker.alpaca import BrokerUnavailable
-from broker.protocol import BrokerAdapter, OrderRequest, Quote, SubmittedOrder
+from broker.protocol import BrokerAdapter, BrokerRejected, OrderRequest, Quote, SubmittedOrder
 from journal.models import ExecutionRow, OrderRow
 from observability.log_port import get_logger
 from proposal.schemas import TradeProposal
@@ -115,16 +115,24 @@ class OrderSubmitter:
         nbbo = broker.get_quote(proposal.symbol)
 
         # --- 2. Build + submit entry order -----------------------------
+        # `BrokerRejected` covers non-retryable broker rejections (e.g.
+        # 422 insufficient buying power); `BrokerUnavailable` covers the
+        # transient-then-exhausted path. Both share a single failure
+        # branch — there is no exposure on entry-leg failure (no fill, no
+        # position), so we journal `submission_failed` and stop. (Hotfix
+        # 2026-05-07: prior to this, raw APIErrors propagated past the
+        # submitter unjournaled.)
         entry_req = self._build_entry(accepted_proposal)
         try:
             entry_resp = broker.submit_order(entry_req)
-        except BrokerUnavailable as e:
+        except (BrokerRejected, BrokerUnavailable) as e:
             log.error(
                 "execution.submit.entry_failed",
                 extra={
                     "event": "execution.submit.entry_failed",
                     "symbol": proposal.symbol,
                     "error": str(e),
+                    "error_type": type(e).__name__,
                 },
             )
             execution_id = journal.insert_execution(
@@ -139,10 +147,18 @@ class OrderSubmitter:
             return SubmissionFailed(reason="submission_failed", execution_id=execution_id)
 
         # --- 3. Build + submit stop-loss (entry now exposed) ----------
+        # Critical handler: the entry order is alive at the broker. ANY
+        # failure (transient `BrokerUnavailable` OR non-retryable
+        # `BrokerRejected` — e.g. Alpaca's 40310000 wash-trade detection
+        # when the entry is still pending pre-market) leaves the position
+        # unprotected. Both must trip the killswitch and journal the
+        # partial state. Hotfix 2026-05-07: incident_2026_05_07_unprotected_positions
+        # describes the wash-trade variant escaping the prior
+        # `BrokerUnavailable`-only handler.
         stop_req = self._build_stop(accepted_proposal)
         try:
             stop_resp = broker.submit_order(stop_req)
-        except BrokerUnavailable as e:
+        except (BrokerRejected, BrokerUnavailable) as e:
             log.critical(
                 "execution.submit.stop_failed_position_unprotected",
                 extra={
@@ -150,6 +166,7 @@ class OrderSubmitter:
                     "symbol": proposal.symbol,
                     "entry_broker_order_id": entry_resp.broker_order_id,
                     "error": str(e),
+                    "error_type": type(e).__name__,
                 },
             )
             # KS halt FIRST so subsequent entries are blocked, then journal
@@ -190,7 +207,7 @@ class OrderSubmitter:
         if tp_req is not None:
             try:
                 tp_resp = broker.submit_order(tp_req)
-            except BrokerUnavailable as e:
+            except (BrokerRejected, BrokerUnavailable) as e:
                 # Position is protected by stop; TP failure is recoverable.
                 tp_note = f"tp_submission_failed: {e}"
                 log.warning(
@@ -199,6 +216,7 @@ class OrderSubmitter:
                         "event": "execution.submit.tp_failed",
                         "symbol": proposal.symbol,
                         "error": str(e),
+                        "error_type": type(e).__name__,
                     },
                 )
 

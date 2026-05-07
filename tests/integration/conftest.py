@@ -32,6 +32,7 @@ from analyzer.opus import OpusReviewer
 from analyzer.sonnet import SonnetAnalyzer
 from broker.protocol import (
     AccountSnapshot,
+    OpenOrder,
     OrderRequest,
     Position,
     Quote,
@@ -78,6 +79,10 @@ class _FakeBroker:
     # empty (no holdings); tests that exercise Feature B's capacity gate
     # can override this list to simulate a full KS-5 slate.
     positions: list[Position] = field(default_factory=list)
+    # Open broker orders visible via `get_open_orders()`. Tests that
+    # exercise the KS-5 / KS-6 pre-market queue path can populate this
+    # to simulate pending entries that haven't filled yet.
+    open_orders: list[OpenOrder] = field(default_factory=list)
     equity: float = 100_000.0
     cash: float = 100_000.0
     quote_last: float = 100.0
@@ -148,6 +153,9 @@ class _FakeBroker:
 
     def get_positions(self) -> list[Position]:
         return list(self.positions)
+
+    def get_open_orders(self) -> list[OpenOrder]:
+        return list(self.open_orders)
 
     def get_quote(self, symbol: str) -> Quote:
         return Quote(

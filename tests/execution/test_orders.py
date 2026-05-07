@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from broker.alpaca import BrokerUnavailable
-from broker.protocol import OrderRequest, Position, Quote, SubmittedOrder
+from broker.protocol import BrokerRejected, OpenOrder, OrderRequest, Position, Quote, SubmittedOrder
 from execution.orders import (
     AcceptedProposal,
     OrderSubmitter,
@@ -88,6 +88,9 @@ class _FakeBroker:
         raise AssertionError("submitter does not call get_account")
 
     def get_positions(self) -> list[Position]:  # pragma: no cover
+        return []
+
+    def get_open_orders(self) -> list[OpenOrder]:  # pragma: no cover
         return []
 
     def get_quote(self, symbol: str) -> Quote:
@@ -321,6 +324,78 @@ def test_entry_succeeds_stop_fails_kill_switch_halted() -> None:
     assert journal.executions[0]["decision"] == "submission_partial_no_stop"
     entry_rows = [o for o in journal.orders if o["role"] == "entry"]
     assert len(entry_rows) == 1
+
+
+def test_entry_succeeds_stop_fails_with_broker_rejected_kill_switch_halted() -> None:
+    """Hotfix 2026-05-07 (incident: 27 unprotected positions): the exact
+    production failure mode. Entry buy submits; back-to-back stop is
+    rejected with `BrokerRejected` (the wrapped wash-trade APIError 40310000).
+    Must follow the SAME path as the existing `BrokerUnavailable` branch:
+    KS halts on `submission_partial_no_stop`, execution row + entry order
+    row are journaled, TP is not attempted.
+    """
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker(
+        stop_raises=BrokerRejected(
+            "potential wash trade detected",
+            status_code=422,
+            broker_code=40310000,
+        )
+    )
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, ks)
+
+    assert isinstance(result, SubmissionFailed)
+    assert result.reason == "submission_partial_no_stop"
+    # Entry submitted, stop attempted; TP not reached.
+    assert len(broker.submitted) == 2
+    # KS halted with the partial-no-stop reason — same as the
+    # BrokerUnavailable branch.
+    assert len(ks.halts) == 1
+    reason, set_by, _notes = ks.halts[0]
+    assert reason == "submission_partial_no_stop"
+    assert set_by == "system"
+    # Execution row + entry order row written so the live position is
+    # auditable at the journal.
+    assert len(journal.executions) == 1
+    assert journal.executions[0]["decision"] == "submission_partial_no_stop"
+    entry_rows = [o for o in journal.orders if o["role"] == "entry"]
+    assert len(entry_rows) == 1
+
+
+def test_entry_failure_with_broker_rejected_journals_submission_failed() -> None:
+    """Hotfix 2026-05-07: a non-retryable rejection on the ENTRY leg
+    (e.g. 422 insufficient buying power) used to escape the
+    `BrokerUnavailable`-only handler unjournaled. Now must write a
+    `submission_failed` execution row and not flip the killswitch (no
+    exposure, since no fill).
+    """
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker(
+        entry_raises=BrokerRejected(
+            "insufficient buying power", status_code=422
+        )
+    )
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, ks)
+
+    assert isinstance(result, SubmissionFailed)
+    assert result.reason == "submission_failed"
+    # Only the entry attempt; no stop/TP because there's no fill to protect.
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].side == "buy"
+    # Execution row recorded; no order rows.
+    assert len(journal.executions) == 1
+    assert journal.executions[0]["decision"] == "submission_failed"
+    assert journal.orders == []
+    # No KS halt — entry failure is pre-position, not unprotected exposure.
+    assert ks.halts == []
 
 
 def test_p95_under_10s_with_fake_broker() -> None:

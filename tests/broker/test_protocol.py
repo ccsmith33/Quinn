@@ -19,8 +19,19 @@ from broker.protocol import (
 
 
 def test_protocol_methods_present() -> None:
-    """AC-1: BrokerAdapter protocol exposes the five required methods."""
-    expected = {"submit_order", "cancel_order", "get_account", "get_positions", "get_quote"}
+    """AC-1: BrokerAdapter protocol exposes the required methods.
+
+    Hotfix 2026-05-07: `get_open_orders` added so the KS-5 gate sees
+    pre-market queued entries.
+    """
+    expected = {
+        "submit_order",
+        "cancel_order",
+        "get_account",
+        "get_positions",
+        "get_open_orders",
+        "get_quote",
+    }
     actual = {name for name in dir(BrokerAdapter) if not name.startswith("_")}
     assert expected.issubset(actual), f"missing: {expected - actual}"
 

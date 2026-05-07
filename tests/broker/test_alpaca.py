@@ -27,6 +27,8 @@ from broker.alpaca import AlpacaBroker, BrokerUnavailable
 from broker.protocol import (
     AccountSnapshot,
     BrokerAdapter,
+    BrokerRejected,
+    OpenOrder,
     OrderRequest,
     Position,
     Quote,
@@ -75,6 +77,8 @@ class _FakeTradingClient:
         # Configurable behaviour; tests mutate via the instance attached to broker.
         self._submit_responses: list[Any] = []
         self._submit_exceptions: list[Exception | None] = []
+        # Hotfix 2026-05-07: open-orders surface (KS-5 pending-buy gate).
+        self._open_orders_response: list[Any] = []
 
     # ---- helpers used by tests ----
     def queue_submit_response(self, resp: Any) -> None:
@@ -119,6 +123,11 @@ class _FakeTradingClient:
                 side="long",
             )
         ]
+
+    def get_orders(self, filter: Any = None) -> list[Any]:  # noqa: A002
+        # Tests can mutate `self._open_orders_response` to simulate
+        # pre-market queued orders. Hotfix 2026-05-07.
+        return list(self._open_orders_response)
 
 
 class _FakeDataClient:
@@ -216,7 +225,14 @@ def live_broker(fake_sdk: None) -> AlpacaBroker:
 def test_protocol_methods_present_on_alpaca(paper_broker: AlpacaBroker) -> None:
     """First failing test: AlpacaBroker satisfies the BrokerAdapter protocol."""
     assert isinstance(paper_broker, BrokerAdapter)
-    for method in ("submit_order", "cancel_order", "get_account", "get_positions", "get_quote"):
+    for method in (
+        "submit_order",
+        "cancel_order",
+        "get_account",
+        "get_positions",
+        "get_open_orders",
+        "get_quote",
+    ):
         assert callable(getattr(paper_broker, method))
 
 
@@ -307,6 +323,51 @@ def test_get_positions_normalizes(paper_broker: AlpacaBroker) -> None:
     assert p.symbol == "AAPL"
     assert p.qty == 10
     assert p.avg_entry_price == 180.5
+
+
+def test_get_open_orders_normalizes_to_open_order_list(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Hotfix 2026-05-07: the new `get_open_orders()` adapter method
+    must surface broker-queued orders so the KS-5 capacity gate counts
+    pre-market entries that haven't filled yet.
+    """
+    paper_broker._trading._open_orders_response = [
+        SimpleNamespace(
+            id="ord-1",
+            client_order_id="prop-1-entry",
+            symbol="ACME",
+            side=SimpleNamespace(value="buy"),
+            qty="10",
+            order_type=SimpleNamespace(value="market"),
+            type=SimpleNamespace(value="market"),
+            status=SimpleNamespace(value="accepted"),
+        ),
+        SimpleNamespace(
+            id="ord-2",
+            client_order_id="prop-2-stop",
+            symbol="OLDCO",
+            side=SimpleNamespace(value="sell"),
+            qty="5",
+            order_type=SimpleNamespace(value="stop"),
+            type=SimpleNamespace(value="stop"),
+            status=SimpleNamespace(value="new"),
+        ),
+    ]
+
+    orders = paper_broker.get_open_orders()
+    assert len(orders) == 2
+    assert all(isinstance(o, OpenOrder) for o in orders)
+
+    entry, stop = orders
+    assert entry.symbol == "ACME"
+    assert entry.side == "buy"
+    assert entry.is_entry is True
+    assert entry.qty == 10
+    assert stop.side == "sell"
+    # SELL legs (stops / TPs) are NOT entries — the underlying long is
+    # already counted in `get_positions()`.
+    assert stop.is_entry is False
 
 
 def test_quote_returns_bid_ask_last_ts(paper_broker: AlpacaBroker) -> None:
@@ -404,8 +465,19 @@ def test_retry_exhausts_to_broker_unavailable(paper_broker: AlpacaBroker) -> Non
     assert len(fake_trading.submit_calls) == 5
 
 
-def test_non_retryable_error_propagates_unwrapped(paper_broker: AlpacaBroker) -> None:
-    """A 4xx that isn't 429 (e.g. 422 insufficient buying power) must NOT be retried."""
+def test_non_retryable_api_error_wrapped_as_broker_rejected(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Hotfix 2026-05-07: a non-retryable APIError (e.g. 422 insufficient
+    buying power, or the wash-trade 40310000 that escaped the production
+    handler) must be wrapped as `BrokerRejected` at the broker boundary.
+
+    Raw `APIError` propagation was the proximate cause of the 27
+    unprotected positions on first live trading day — the execution
+    layer's `BrokerUnavailable`-only `except` let raw rejections fall
+    through unjournaled. Wrapping here forces a single domain-typed
+    failure mode that callers can handle.
+    """
     fake_trading = paper_broker._trading
     fake_trading.queue_submit_exception(_FakeAPIError(422, "insufficient buying power"))
 
@@ -417,9 +489,65 @@ def test_non_retryable_error_propagates_unwrapped(paper_broker: AlpacaBroker) ->
         tif="day",
         client_order_id="cid-AAPL",
     )
-    with pytest.raises(_FakeAPIError):
+    with pytest.raises(BrokerRejected) as ei:
         paper_broker.submit_order(req)
+    assert ei.value.status_code == 422
+    # Single call — non-retryable should not loop.
     assert len(fake_trading.submit_calls) == 1
+
+
+def test_wash_trade_apierror_wrapped_as_broker_rejected(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """The exact production failure mode: Alpaca rejects a back-to-back
+    stop submission with broker_code=40310000 ("potential wash trade
+    detected"). This must surface as `BrokerRejected` so the execution
+    layer can route it to the `submission_partial_no_stop` killswitch
+    halt (incident 2026-05-07).
+    """
+    fake_trading = paper_broker._trading
+    err = _FakeAPIError(
+        422, "potential wash trade detected — opposite side market/stop order exists"
+    )
+    err._error = {"code": 40310000, "message": str(err)}
+    fake_trading.queue_submit_exception(err)
+
+    req = OrderRequest(
+        symbol="ACME",
+        side="sell",
+        qty=10,
+        order_type="stop",
+        tif="gtc",
+        client_order_id="prop-1-stop",
+        stop_price=8.50,
+    )
+    with pytest.raises(BrokerRejected) as ei:
+        paper_broker.submit_order(req)
+    assert ei.value.status_code == 422
+    assert ei.value.broker_code == 40310000
+    assert "wash trade" in str(ei.value)
+
+
+def test_retryable_api_error_still_retries(paper_broker: AlpacaBroker) -> None:
+    """Wrapping non-retryable APIErrors must NOT alter the retry path:
+    429s still get backoff + retry, eventually succeeding.
+    """
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_exception(_FakeAPIError(429))
+    fake_trading.queue_submit_exception(_FakeAPIError(429))
+    fake_trading.queue_submit_response(_make_fake_alpaca_order("AAPL", 1))
+
+    req = OrderRequest(
+        symbol="AAPL",
+        side="buy",
+        qty=1,
+        order_type="market",
+        tif="day",
+        client_order_id="cid-AAPL",
+    )
+    out = paper_broker.submit_order(req)
+    assert out.symbol == "AAPL"
+    assert len(fake_trading.submit_calls) == 3
 
 
 def test_backoff_uses_full_jitter(
@@ -484,7 +612,14 @@ def test_p95_under_10s_with_fake_sdk(paper_broker: AlpacaBroker) -> None:
 def test_paper_and_live_have_identical_method_signatures(
     paper_broker: AlpacaBroker, live_broker: AlpacaBroker
 ) -> None:
-    for name in ("submit_order", "cancel_order", "get_account", "get_positions", "get_quote"):
+    for name in (
+        "submit_order",
+        "cancel_order",
+        "get_account",
+        "get_positions",
+        "get_open_orders",
+        "get_quote",
+    ):
         assert inspect.signature(getattr(paper_broker, name)) == inspect.signature(
             getattr(live_broker, name)
         ), f"signature divergence on {name}"

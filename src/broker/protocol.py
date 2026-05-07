@@ -96,6 +96,38 @@ class Position(_Domain):
     unrealized_pnl: float
 
 
+class OpenOrder(_Domain):
+    """Snapshot of a broker order that is currently open / pending fill.
+
+    Used by the Feature B / KS-5 capacity gate to count pre-market queued
+    entries that have not yet filled (incident 2026-05-07: positions only
+    show up in `get_positions()` after fill, so back-to-back pre-market
+    entries can each see "0 open positions" and bypass KS-5).
+
+    `is_entry` distinguishes BUY entries from protective SELL legs (stops
+    / TPs from prior days) so KS-5 only counts capacity that's actually
+    being consumed by new entries.
+    """
+
+    symbol: str
+    side: Side
+    qty: int
+    order_type: OrderType
+    status: OrderStatus
+    broker_order_id: str
+    client_order_id: str
+
+    @property
+    def is_entry(self) -> bool:
+        """A BUY-side open order is an entry leg (Quinn is long-only).
+
+        SELL stops / TPs from prior days surface as open orders too, but
+        they don't consume KS-5 capacity — the underlying long position
+        already counts there.
+        """
+        return self.side == "buy"
+
+
 class Quote(_Domain):
     """NBBO snapshot used by execution at submission time (pre_submission_nbbo)."""
 
@@ -106,12 +138,46 @@ class Quote(_Domain):
     ts: dt.datetime
 
 
+class BrokerRejected(Exception):
+    """Non-retryable broker rejection — distinct from `BrokerUnavailable`.
+
+    Raised when the broker returns a definitive 4xx that is NOT 429 (e.g.
+    Alpaca's 40310000 wash-trade detection on a back-to-back stop after a
+    pending entry, or a 422 insufficient buying power). Retrying these is
+    pointless — the broker has made a deterministic decision — but the
+    failure must still flow through the same execution-layer handlers as
+    a transient outage so the kill-switch halts on `submission_partial_no_stop`
+    and the journal records the partial state. See incident 2026-05-07.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        broker_code: int | str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.broker_code = broker_code
+
+
 @runtime_checkable
 class BrokerAdapter(Protocol):
     def submit_order(self, req: OrderRequest) -> SubmittedOrder: ...
     def cancel_order(self, broker_order_id: str) -> None: ...
     def get_account(self) -> AccountSnapshot: ...
     def get_positions(self) -> list[Position]: ...
+    def get_open_orders(self) -> list[OpenOrder]:
+        """Return broker orders that are currently open / pending fill.
+
+        Filters to lifecycle statuses that are not yet terminal:
+        accepted, new, partially_filled, pending_new, accepted_for_bidding.
+        Used by the KS-5 capacity gate to count pre-market queued entries
+        that haven't filled yet (incident 2026-05-07).
+        """
+        ...
+
     def get_quote(self, symbol: str) -> Quote: ...
 
     def get_order_by_client_id(
@@ -155,6 +221,8 @@ class BrokerAdapter(Protocol):
 __all__ = [
     "AccountSnapshot",
     "BrokerAdapter",
+    "BrokerRejected",
+    "OpenOrder",
     "OrderRequest",
     "OrderStatus",
     "OrderType",
