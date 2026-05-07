@@ -677,6 +677,23 @@ def get_orders_for_execution(db_path: str, execution_id: int) -> list[OrderRow]:
     return [OrderRow(**dict(r)) for r in rows]
 
 
+def get_orders_since(
+    db_path: str, *, symbol: str, since: _dt.datetime
+) -> list[OrderRow]:
+    """Reconciler hotfix 2026-05-07 — orders for `symbol` submitted on or
+    after `since`, oldest first. Used by the reconciler to classify a
+    broker/journal position diff as "expected" (recently-submitted bracket
+    legs explain the divergence) vs. "unexpected" (genuine concern; halt).
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE symbol = ? AND submitted_at >= ? "
+            "ORDER BY submitted_at ASC, id ASC",
+            (symbol, since),
+        ).fetchall()
+    return [OrderRow(**dict(r)) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # positions (append-only)
 # ---------------------------------------------------------------------------
@@ -938,6 +955,12 @@ class JournalRepo:
 
     def insert_order(self, row: OrderRow) -> int:
         return insert_order(self.db_path, row)
+
+    def get_orders_since(
+        self, symbol: str, since: _dt.datetime
+    ) -> list[OrderRow]:
+        """Reconciler hotfix — recent orders for `symbol` since `since`."""
+        return get_orders_since(self.db_path, symbol=symbol, since=since)
 
     # positions, account_snapshots (S6.5 reconciler)
     def insert_position(self, row: PositionRow) -> int:

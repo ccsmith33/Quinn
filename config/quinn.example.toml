@@ -55,6 +55,14 @@ sizing_high_pct = 0.10
 
 [reconciler]
 interval_seconds_market = 300
+# Hotfix 2026-05-07 — false-positive halt window. When broker/journal
+# positions diverge, look back this many minutes in the `orders` table for
+# recent bracket-order rows (entry buy, stop sell, take_profit sell) that
+# explain the divergence. If recent orders fully account for the diff, the
+# reconciler does not halt (it just snapshots broker truth). Genuine
+# unexplained divergence still halts. Raise to loosen the safety net,
+# lower to tighten it.
+expected_fill_window_minutes = 30
 
 [killswitch]
 ks1_daily_loss_pct = 0.03
