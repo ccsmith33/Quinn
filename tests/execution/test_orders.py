@@ -15,7 +15,15 @@ from typing import Any
 import pytest
 
 from broker.alpaca import BrokerUnavailable
-from broker.protocol import BrokerRejected, OpenOrder, OrderRequest, Position, Quote, SubmittedOrder
+from broker.protocol import (
+    BracketOrderRequest,
+    BrokerRejected,
+    OpenOrder,
+    OrderRequest,
+    Position,
+    Quote,
+    SubmittedOrder,
+)
 from execution.orders import (
     AcceptedProposal,
     OrderSubmitter,
@@ -32,15 +40,19 @@ from proposal.schemas import TradeProposal
 # ---------------------------------------------------------------------------
 
 class _FakeBroker:
-    """Records every submit/get_quote call. By default returns success."""
+    """Records every submit/get_quote call. By default returns success.
+
+    Hotfix 2026-05-07: now exposes `submit_bracket_order` since the
+    submitter's normal flow is a single atomic bracket / OTO call. The
+    legacy `submit_order` surface is kept for the wash-trade defense-in-
+    depth test and for any future non-bracket call site.
+    """
 
     def __init__(
         self,
         *,
         quote: Quote | None = None,
-        entry_raises: Exception | None = None,
-        stop_raises: Exception | None = None,
-        tp_raises: Exception | None = None,
+        bracket_raises: Exception | None = None,
     ) -> None:
         self._quote = quote or Quote(
             symbol="ACME",
@@ -49,27 +61,19 @@ class _FakeBroker:
             last=10.02,
             ts=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
         )
-        self._entry_raises = entry_raises
-        self._stop_raises = stop_raises
-        self._tp_raises = tp_raises
+        self._bracket_raises = bracket_raises
         self.submitted: list[OrderRequest] = []
+        self.submitted_brackets: list[BracketOrderRequest] = []
         self.quote_calls: int = 0
+        self._next_id = 0
 
     def submit_order(self, req: OrderRequest) -> SubmittedOrder:
+        # Retained for orphan-adoption / defense-in-depth tests; the
+        # production submitter no longer routes here for the normal flow.
         self.submitted.append(req)
-        # Order role is encoded in the request via order_type + side combo:
-        # entry = buy/market or buy/limit; stop = sell/stop; tp = sell/limit.
-        is_entry = req.side == "buy"
-        is_stop = req.side == "sell" and req.order_type == "stop"
-        is_tp = req.side == "sell" and req.order_type == "limit"
-        if is_entry and self._entry_raises is not None:
-            raise self._entry_raises
-        if is_stop and self._stop_raises is not None:
-            raise self._stop_raises
-        if is_tp and self._tp_raises is not None:
-            raise self._tp_raises
+        self._next_id += 1
         return SubmittedOrder(
-            broker_order_id=f"ord-{len(self.submitted)}",
+            broker_order_id=f"ord-{self._next_id}",
             client_order_id=req.client_order_id,
             symbol=req.symbol,
             side=req.side,
@@ -80,6 +84,53 @@ class _FakeBroker:
             limit_price=req.limit_price,
             stop_price=req.stop_price,
         )
+
+    def submit_bracket_order(
+        self, req: BracketOrderRequest
+    ) -> tuple[SubmittedOrder, SubmittedOrder, SubmittedOrder | None]:
+        self.submitted_brackets.append(req)
+        if self._bracket_raises is not None:
+            raise self._bracket_raises
+        self._next_id += 1
+        entry = SubmittedOrder(
+            broker_order_id=f"ord-{self._next_id}",
+            client_order_id=req.entry_client_order_id,
+            symbol=req.entry_symbol,
+            side=req.entry_side,
+            qty=req.entry_qty,
+            order_type=req.entry_order_type,
+            status="accepted",
+            submitted_at=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+            limit_price=req.entry_limit_price,
+            stop_price=None,
+        )
+        self._next_id += 1
+        stop = SubmittedOrder(
+            broker_order_id=f"ord-{self._next_id}",
+            client_order_id=f"{req.entry_client_order_id}:bracket-stop",
+            symbol=req.entry_symbol,
+            side="sell",
+            qty=req.entry_qty,
+            order_type="stop",
+            status="accepted",
+            submitted_at=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+            stop_price=req.stop_loss_price,
+        )
+        tp: SubmittedOrder | None = None
+        if req.take_profit_price is not None:
+            self._next_id += 1
+            tp = SubmittedOrder(
+                broker_order_id=f"ord-{self._next_id}",
+                client_order_id=f"{req.entry_client_order_id}:bracket-tp",
+                symbol=req.entry_symbol,
+                side="sell",
+                qty=req.entry_qty,
+                order_type="limit",
+                status="accepted",
+                submitted_at=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+                limit_price=req.take_profit_price,
+            )
+        return entry, stop, tp
 
     def cancel_order(self, broker_order_id: str) -> None:  # pragma: no cover
         pass
@@ -187,8 +238,10 @@ def _accepted(
 # Tests (story §test plan)
 # ---------------------------------------------------------------------------
 
-def test_market_entry_with_stop_and_tp_submitted() -> None:
-    """Test #1 (first failing): market entry + stop + TP all submitted; rows persisted."""
+def test_bracket_submission_writes_three_journal_rows() -> None:
+    """Hotfix 2026-05-07: market entry + stop + TP submitted as a single
+    atomic BRACKET; three order rows + one execution row persisted.
+    """
     p = _proposal(take_profit_price=12.00)
     accepted = _accepted(proposal=p)
     broker = _FakeBroker()
@@ -199,13 +252,15 @@ def test_market_entry_with_stop_and_tp_submitted() -> None:
     result = submitter.submit(accepted, broker, journal, ks)
 
     assert isinstance(result, SubmissionAccepted)
-    # Three orders submitted: entry, stop, tp.
-    assert len(broker.submitted) == 3
-    sides = [(r.side, r.order_type) for r in broker.submitted]
-    assert sides[0] == ("buy", "market")
-    assert sides[1] == ("sell", "stop")
-    assert sides[2] == ("sell", "limit")
-    # One execution row, three order rows.
+    # ONE bracket call (atomic) — not three separate submit_order calls.
+    assert len(broker.submitted_brackets) == 1
+    assert broker.submitted == []  # no calls to legacy submit_order
+    bracket = broker.submitted_brackets[0]
+    assert bracket.entry_side == "buy"
+    assert bracket.entry_order_type == "market"
+    assert bracket.stop_loss_price == 8.50
+    assert bracket.take_profit_price == 12.00
+    # One execution row, three order rows (entry + stop + tp).
     assert len(journal.executions) == 1
     assert len(journal.orders) == 3
     exec_row = journal.executions[0]
@@ -214,10 +269,14 @@ def test_market_entry_with_stop_and_tp_submitted() -> None:
     assert exec_row["realized_size_pct"] == 0.05
     submitted_orders = json.loads(exec_row["submitted_orders_json"])
     assert {o["role"] for o in submitted_orders} == {"entry", "stop", "take_profit"}
+    roles = {o["role"] for o in journal.orders}
+    assert roles == {"entry", "stop", "take_profit"}
 
 
 def test_limit_entry_uses_entry_limit_price() -> None:
-    """Test #2: entry_style=limit → limit BUY at entry_limit_price, TIF=day."""
+    """Test #2: entry_style=limit → limit BUY at entry_limit_price, TIF=day,
+    routed through the bracket flow.
+    """
     p = _proposal(entry_style="limit", entry_limit_price=9.95)
     accepted = _accepted(proposal=p)
     broker = _FakeBroker()
@@ -228,14 +287,16 @@ def test_limit_entry_uses_entry_limit_price() -> None:
     result = submitter.submit(accepted, broker, journal, ks)
 
     assert isinstance(result, SubmissionAccepted)
-    entry = broker.submitted[0]
-    assert entry.order_type == "limit"
-    assert entry.limit_price == 9.95
-    assert entry.tif == "day"
+    bracket = broker.submitted_brackets[0]
+    assert bracket.entry_order_type == "limit"
+    assert bracket.entry_limit_price == 9.95
+    assert bracket.entry_tif == "day"
 
 
 def test_no_tp_when_take_profit_price_omitted() -> None:
-    """Test #3: TP omitted in proposal → only entry + stop submitted."""
+    """Hotfix 2026-05-07: TP omitted in proposal → OTO submission (no
+    take-profit in the bracket request); only entry + stop journal rows.
+    """
     p = _proposal(take_profit_price=None)
     accepted = _accepted(proposal=p)
     broker = _FakeBroker()
@@ -246,8 +307,14 @@ def test_no_tp_when_take_profit_price_omitted() -> None:
     result = submitter.submit(accepted, broker, journal, ks)
 
     assert isinstance(result, SubmissionAccepted)
-    assert len(broker.submitted) == 2
+    assert len(broker.submitted_brackets) == 1
+    bracket = broker.submitted_brackets[0]
+    # OTO branch: no take-profit price on the request.
+    assert bracket.take_profit_price is None
+    # Two journal rows (entry + stop) — TP not present.
     assert len(journal.orders) == 2
+    roles = {o["role"] for o in journal.orders}
+    assert roles == {"entry", "stop"}
 
 
 def test_pre_submission_nbbo_snapshot_recorded() -> None:
@@ -276,106 +343,16 @@ def test_pre_submission_nbbo_snapshot_recorded() -> None:
     assert entry_row["pre_submission_quote_at"] == quote.ts
 
 
-def test_entry_failure_no_stop_submitted() -> None:
-    """Test #5 / AC-8: entry fails → no stop/TP; execution decision='submission_failed'."""
-    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
-    broker = _FakeBroker(entry_raises=BrokerUnavailable("retries exhausted"))
-    journal = _FakeJournal()
-    ks = _FakeKillSwitch()
-    submitter = OrderSubmitter()
-
-    result = submitter.submit(accepted, broker, journal, ks)
-
-    assert isinstance(result, SubmissionFailed)
-    # Only the entry attempt — no stop / no TP.
-    assert len(broker.submitted) == 1
-    assert broker.submitted[0].side == "buy"
-    # Execution row recorded; zero order rows.
-    assert len(journal.executions) == 1
-    assert journal.executions[0]["decision"] == "submission_failed"
-    assert journal.orders == []
-    # KS not flipped — entry failure pre-position is not the partial-no-stop case.
-    assert ks.halts == []
-
-
-def test_entry_succeeds_stop_fails_kill_switch_halted() -> None:
-    """Test #6 / AC-8: entry OK, stop fails → KS flipped 'submission_partial_no_stop'."""
-    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
-    broker = _FakeBroker(stop_raises=BrokerUnavailable("retries exhausted"))
-    journal = _FakeJournal()
-    ks = _FakeKillSwitch()
-    submitter = OrderSubmitter()
-
-    result = submitter.submit(accepted, broker, journal, ks)
-
-    # Result reports the partial state.
-    assert isinstance(result, SubmissionFailed)
-    assert result.reason == "submission_partial_no_stop"
-    # Entry submitted, stop attempted (and failed). TP not attempted because
-    # stop is the first protective leg and its failure short-circuits.
-    assert len(broker.submitted) == 2
-    # KS was flipped to halted.
-    assert len(ks.halts) == 1
-    reason, set_by, _notes = ks.halts[0]
-    assert reason == "submission_partial_no_stop"
-    assert set_by == "system"
-    # Execution + entry-order rows present so the open position is auditable.
-    assert len(journal.executions) == 1
-    assert journal.executions[0]["decision"] == "submission_partial_no_stop"
-    entry_rows = [o for o in journal.orders if o["role"] == "entry"]
-    assert len(entry_rows) == 1
-
-
-def test_entry_succeeds_stop_fails_with_broker_rejected_kill_switch_halted() -> None:
-    """Hotfix 2026-05-07 (incident: 27 unprotected positions): the exact
-    production failure mode. Entry buy submits; back-to-back stop is
-    rejected with `BrokerRejected` (the wrapped wash-trade APIError 40310000).
-    Must follow the SAME path as the existing `BrokerUnavailable` branch:
-    KS halts on `submission_partial_no_stop`, execution row + entry order
-    row are journaled, TP is not attempted.
+def test_bracket_submission_rejected_writes_submission_failed_no_order_rows() -> None:
+    """Hotfix 2026-05-07: bracket submission is atomic — when Alpaca
+    rejects the whole complex order (e.g. 422 insufficient buying power,
+    or any other non-retryable rejection), no legs reach the broker. The
+    execution row records `submission_failed`; zero order rows are
+    written; the killswitch is NOT flipped (no exposure).
     """
     accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
     broker = _FakeBroker(
-        stop_raises=BrokerRejected(
-            "potential wash trade detected",
-            status_code=422,
-            broker_code=40310000,
-        )
-    )
-    journal = _FakeJournal()
-    ks = _FakeKillSwitch()
-    submitter = OrderSubmitter()
-
-    result = submitter.submit(accepted, broker, journal, ks)
-
-    assert isinstance(result, SubmissionFailed)
-    assert result.reason == "submission_partial_no_stop"
-    # Entry submitted, stop attempted; TP not reached.
-    assert len(broker.submitted) == 2
-    # KS halted with the partial-no-stop reason — same as the
-    # BrokerUnavailable branch.
-    assert len(ks.halts) == 1
-    reason, set_by, _notes = ks.halts[0]
-    assert reason == "submission_partial_no_stop"
-    assert set_by == "system"
-    # Execution row + entry order row written so the live position is
-    # auditable at the journal.
-    assert len(journal.executions) == 1
-    assert journal.executions[0]["decision"] == "submission_partial_no_stop"
-    entry_rows = [o for o in journal.orders if o["role"] == "entry"]
-    assert len(entry_rows) == 1
-
-
-def test_entry_failure_with_broker_rejected_journals_submission_failed() -> None:
-    """Hotfix 2026-05-07: a non-retryable rejection on the ENTRY leg
-    (e.g. 422 insufficient buying power) used to escape the
-    `BrokerUnavailable`-only handler unjournaled. Now must write a
-    `submission_failed` execution row and not flip the killswitch (no
-    exposure, since no fill).
-    """
-    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
-    broker = _FakeBroker(
-        entry_raises=BrokerRejected(
+        bracket_raises=BrokerRejected(
             "insufficient buying power", status_code=422
         )
     )
@@ -387,14 +364,71 @@ def test_entry_failure_with_broker_rejected_journals_submission_failed() -> None
 
     assert isinstance(result, SubmissionFailed)
     assert result.reason == "submission_failed"
-    # Only the entry attempt; no stop/TP because there's no fill to protect.
-    assert len(broker.submitted) == 1
-    assert broker.submitted[0].side == "buy"
+    # The single bracket call was attempted; nothing else.
+    assert len(broker.submitted_brackets) == 1
+    assert broker.submitted == []
     # Execution row recorded; no order rows.
     assert len(journal.executions) == 1
     assert journal.executions[0]["decision"] == "submission_failed"
     assert journal.orders == []
-    # No KS halt — entry failure is pre-position, not unprotected exposure.
+    # No KS halt — bracket atomicity guarantees no exposure on rejection.
+    assert ks.halts == []
+
+
+def test_bracket_submission_unavailable_writes_submission_failed() -> None:
+    """Hotfix 2026-05-07: bracket submission exhausts retries
+    (`BrokerUnavailable`) → same clean failure path as `BrokerRejected`:
+    `submission_failed` execution row, zero order rows, killswitch
+    untouched. With bracket atomicity there is no `submission_partial_no_stop`
+    case on normal flow.
+    """
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker(bracket_raises=BrokerUnavailable("retries exhausted"))
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, ks)
+
+    assert isinstance(result, SubmissionFailed)
+    assert result.reason == "submission_failed"
+    assert len(broker.submitted_brackets) == 1
+    assert len(journal.executions) == 1
+    assert journal.executions[0]["decision"] == "submission_failed"
+    assert journal.orders == []
+    assert ks.halts == []
+
+
+def test_bracket_submission_does_not_emit_submission_partial_no_stop() -> None:
+    """Regression guard for incident 2026-05-07. The historic
+    `submission_partial_no_stop` failure mode was caused by the entry
+    succeeding while the back-to-back stop was rejected as a wash trade.
+    With bracket / OTO orders that state cannot occur on the normal flow:
+    every rejection fails atomically. This test asserts the submitter
+    never emits that decision string given a bracket rejection.
+    """
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker(
+        bracket_raises=BrokerRejected(
+            "potential wash trade detected — opposite side market/stop order exists",
+            status_code=422,
+            broker_code=40310000,
+        )
+    )
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, ks)
+
+    assert isinstance(result, SubmissionFailed)
+    # Critical: the decision must NOT be the historic partial-no-stop value.
+    assert result.reason == "submission_failed"
+    assert journal.executions[0]["decision"] != "submission_partial_no_stop"
+    assert journal.executions[0]["decision"] == "submission_failed"
+    # Zero order rows — bracket atomicity precludes a live entry.
+    assert journal.orders == []
+    # Killswitch stays clean — no unprotected exposure.
     assert ks.halts == []
 
 

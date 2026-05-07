@@ -16,14 +16,16 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     ReplaceOrderRequest,
     StopLimitOrderRequest,
+    StopLossRequest,
     StopOrderRequest,
+    TakeProfitRequest,
 )
 from pydantic import SecretStr
 
@@ -31,6 +33,7 @@ from observability.log_port import get_logger
 
 from .protocol import (
     AccountSnapshot,
+    BracketOrderRequest,
     BrokerRejected,
     OpenOrder,
     OrderRequest,
@@ -162,6 +165,53 @@ def _to_alpaca_request(req: OrderRequest) -> Any:
     raise ValueError(f"unknown order_type: {req.order_type}")
 
 
+def _to_alpaca_bracket_request(req: BracketOrderRequest) -> Any:
+    """Translate a `BracketOrderRequest` into an alpaca-py order request
+    with the appropriate `order_class` (BRACKET or OTO).
+
+    Hotfix 2026-05-07 (incident: 27 unprotected positions): bracket /
+    OTO orders eliminate the wash-trade race that occurred when entry
+    + stop were submitted as separate calls pre-market. Alpaca treats
+    the bundle as a single transaction, so the back-to-back wash-trade
+    detector (40310000) does not fire on the protective leg.
+
+    Class selection:
+      - take_profit_price set    → BRACKET (entry parent + stop child + tp child)
+      - take_profit_price absent → OTO     (entry parent + stop child)
+    """
+    side = _ORDER_SIDE_MAP[req.entry_side]
+    tif = _TIF_MAP[req.entry_tif]
+    if req.take_profit_price is not None:
+        order_class = OrderClass.BRACKET
+        take_profit = TakeProfitRequest(limit_price=req.take_profit_price)
+        stop_loss = StopLossRequest(stop_price=req.stop_loss_price)
+    else:
+        order_class = OrderClass.OTO
+        take_profit = None
+        stop_loss = StopLossRequest(stop_price=req.stop_loss_price)
+
+    common: dict[str, Any] = {
+        "symbol": req.entry_symbol,
+        "qty": req.entry_qty,
+        "side": side,
+        "time_in_force": tif,
+        "client_order_id": req.entry_client_order_id,
+        "extended_hours": req.entry_extended_hours,
+        "order_class": order_class,
+        "stop_loss": stop_loss,
+    }
+    if take_profit is not None:
+        common["take_profit"] = take_profit
+
+    if req.entry_order_type == "market":
+        return MarketOrderRequest(**common)
+    if req.entry_order_type == "limit":
+        return LimitOrderRequest(limit_price=req.entry_limit_price, **common)
+    raise ValueError(
+        f"bracket entry order_type must be market or limit, got {req.entry_order_type!r}"
+    )
+
+
 def _enum_value(v: Any) -> Any:
     return v.value if hasattr(v, "value") else v
 
@@ -265,6 +315,76 @@ class AlpacaBroker:
         alpaca_req = _to_alpaca_request(req)
         raw = _retry(self._trading.submit_order, alpaca_req)
         return _normalize_submitted(raw)
+
+    def submit_bracket_order(
+        self, req: BracketOrderRequest
+    ) -> tuple[SubmittedOrder, SubmittedOrder, SubmittedOrder | None]:
+        """Submit entry + stop (+ optional TP) as a single atomic complex
+        order (BRACKET / OTO).
+
+        Alpaca returns the parent (entry) with its `legs` field populated
+        with the child orders. We split them by side / order_type:
+          - the SELL stop child  → stop leg
+          - the SELL limit child → take-profit leg
+
+        Hotfix 2026-05-07: a partial state ("entry placed, stop rejected")
+        is impossible by the broker's contract — either all legs are
+        accepted or the whole submission is rejected. Failure surfaces as
+        `BrokerRejected` / `BrokerUnavailable` and the caller treats it as
+        a clean `submission_failed` (no exposure, no journal order rows).
+        """
+        alpaca_req = _to_alpaca_bracket_request(req)
+        raw = _retry(self._trading.submit_order, alpaca_req)
+        entry = _normalize_submitted(raw)
+
+        legs = list(getattr(raw, "legs", None) or [])
+        stop_raw = next(
+            (
+                leg
+                for leg in legs
+                if _enum_value(leg.side) == "sell"
+                and _enum_value(
+                    getattr(leg, "order_type", None) or getattr(leg, "type", None)
+                )
+                == "stop"
+            ),
+            None,
+        )
+        if stop_raw is None:
+            # Defense in depth: alpaca-py contract says BRACKET/OTO always
+            # populates the stop leg. If it's missing the parent is in an
+            # unknown state — better to surface as BrokerRejected than to
+            # claim success with no stop.
+            raise BrokerRejected(
+                "bracket submission accepted but stop leg missing from response",
+                status_code=None,
+                broker_code=None,
+            )
+        stop = _normalize_submitted(stop_raw)
+
+        tp: SubmittedOrder | None = None
+        if req.take_profit_price is not None:
+            tp_raw = next(
+                (
+                    leg
+                    for leg in legs
+                    if _enum_value(leg.side) == "sell"
+                    and _enum_value(
+                        getattr(leg, "order_type", None) or getattr(leg, "type", None)
+                    )
+                    == "limit"
+                ),
+                None,
+            )
+            if tp_raw is None:
+                raise BrokerRejected(
+                    "bracket submission accepted but take-profit leg missing from response",
+                    status_code=None,
+                    broker_code=None,
+                )
+            tp = _normalize_submitted(tp_raw)
+
+        return entry, stop, tp
 
     def cancel_order(self, broker_order_id: str) -> None:
         _retry(self._trading.cancel_order_by_id, broker_order_id)
