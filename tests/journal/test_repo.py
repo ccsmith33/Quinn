@@ -534,3 +534,87 @@ def test_has_open_position_false_when_latest_snapshot_zero_qty(db: str) -> None:
         ),
     )
     assert has_open_position(db, "ACME") is False
+
+
+# ---------------------------------------------------------------------------
+# Reconciler hotfix 2026-05-07 — get_orders_since
+# ---------------------------------------------------------------------------
+
+
+def test_get_orders_since_filters_by_symbol_and_window(db: str) -> None:
+    """Verify the new reconciler helper filters on symbol AND
+    submitted_at >= since, and returns rows in (submitted_at ASC, id ASC)
+    order so the classifier sees them deterministically.
+    """
+    from journal.models import ExecutionRow, OrderRow, ProposalRow
+    from journal.repo import (
+        get_orders_since,
+        insert_execution,
+        insert_order,
+        insert_prompt,
+    )
+
+    pv = "test-prompt@aabb"
+    insert_prompt(
+        db,
+        PromptRow(
+            prompt_version=pv,
+            name="test-prompt",
+            file_path="/tmp/x",
+            content_hash="aabb",
+        ),
+    )
+    fid = insert_filing(db, _filing())
+    pid = insert_proposal(
+        db,
+        ProposalRow(
+            filing_id=fid,
+            decision_id="d-orders",
+            model_id="claude-haiku-4-5",
+            prompt_version=pv,
+            raw_response="{}",
+            kind="trade_proposal",
+            symbol="CXW",
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_usd=0.0,
+        ),
+    )
+    eid = insert_execution(
+        db,
+        ExecutionRow(
+            proposal_id=pid,
+            decision="accepted",
+            submitted_orders_json="[]",
+        ),
+    )
+    now = dt.datetime(2026, 5, 7, 16, 41, 0)
+
+    def _ord(symbol: str, role: str, side: str, ts: dt.datetime, oid_label: str) -> int:
+        return insert_order(
+            db,
+            OrderRow(
+                execution_id=eid,
+                role=role,
+                symbol=symbol,
+                side=side,
+                order_type="market",
+                qty=46,
+                tif="day",
+                broker_order_id=f"ord-{oid_label}",
+                submitted_at=ts,
+            ),
+        )
+
+    # CXW: one in-window entry, one stale entry (90 min ago).
+    in_window_id = _ord("CXW", "entry", "buy", now - dt.timedelta(seconds=30), "cxw-fresh")
+    _ord("CXW", "entry", "buy", now - dt.timedelta(minutes=90), "cxw-stale")
+    # Other symbol — must not appear in CXW results.
+    _ord("XYZ", "entry", "buy", now, "xyz-now")
+
+    since = now - dt.timedelta(minutes=30)
+    rows = get_orders_since(db, symbol="CXW", since=since)
+    assert len(rows) == 1
+    assert rows[0].id == in_window_id
+    assert rows[0].symbol == "CXW"

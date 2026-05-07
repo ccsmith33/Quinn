@@ -25,14 +25,14 @@ import asyncio
 import datetime as dt
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from broker.alpaca import BrokerUnavailable
 from broker.protocol import AccountSnapshot, BrokerAdapter, Position
 from config.calendar import is_market_hours
 from config.loader import ReconcilerConfig
-from journal.models import AccountSnapshotRow, PositionRow
+from journal.models import AccountSnapshotRow, OrderRow, PositionRow
 from observability.log_port import get_logger
 
 # Forward-only protocol for the Feature C retro coordinator. We don't
@@ -56,17 +56,37 @@ class PositionDiff:
 
 
 @dataclass(frozen=True)
+class ExplainedDiff:
+    """A `PositionDiff` whose qty mismatch is fully accounted for by recent
+    rows in the journal's `orders` table (post-bracket-submission window).
+    Carried in `ReconcileReport.explained_diffs` for caller introspection
+    and structured-log payloads.
+    """
+
+    diff: PositionDiff
+    explained_by_order_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class ReconcileReport:
     matched: bool
     diffs: list[PositionDiff]
     deferred: bool = False
     suppressed: bool = False
+    # Hotfix 2026-05-07 — diffs that the recent-orders classifier explained
+    # away as expected (bracket entry just filled, stop/TP just filled).
+    # `matched` is True and `diffs` is empty whenever every diff is
+    # explained; the explained list is preserved here for the operator.
+    explained_diffs: list[ExplainedDiff] = field(default_factory=list)
 
 
 class _JournalLike(Protocol):
     def get_open_positions(self) -> list: ...
     def insert_position(self, row: PositionRow) -> int: ...
     def insert_account_snapshot(self, row: AccountSnapshotRow) -> int: ...
+    def get_orders_since(
+        self, symbol: str, since: dt.datetime
+    ) -> list[OrderRow]: ...
 
 
 class _KillSwitchLike(Protocol):
@@ -305,7 +325,58 @@ class Reconciler:
             )
             return ReconcileReport(matched=True, diffs=[])
 
-        # Divergence: soft halt + alert.
+        # Hotfix 2026-05-07 — classify each diff against the journal's
+        # recent `orders` rows. Diffs whose qty delta is fully accounted
+        # for by a recent bracket-leg submission (entry-buy fill increases
+        # broker qty; stop/TP-sell fill decreases it) are "expected" and
+        # do not halt. Avg_entry mismatches are always unexpected.
+        window_minutes = self._cfg.expected_fill_window_minutes
+        since = now - dt.timedelta(minutes=window_minutes)
+        expected: list[ExplainedDiff] = []
+        unexpected: list[PositionDiff] = []
+        # Per-diff explanation (always populated for unexpected diffs too,
+        # so the structured-log payload can show "no orders explained
+        # this divergence" alongside the raw qty numbers).
+        per_diff_orders: dict[str, list[int]] = {}
+        for d in diffs:
+            recent = self._journal.get_orders_since(d.symbol, since)
+            classification, order_ids = self._classify_diff(d, recent)
+            per_diff_orders[d.symbol] = list(order_ids)
+            if classification == "expected":
+                expected.append(
+                    ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
+                )
+            else:
+                unexpected.append(d)
+
+        # All diffs explained → no halt. Log the pending-fill match event.
+        if not unexpected:
+            log.info(
+                "reconciler.match_with_pending_fills",
+                extra={
+                    "event": "reconciler.match_with_pending_fills",
+                    "broker_position_count": len(broker_positions),
+                    "explained_diffs": json.dumps([
+                        {
+                            "symbol": ed.diff.symbol,
+                            "broker_qty": ed.diff.broker_qty,
+                            "journal_qty": ed.diff.journal_qty,
+                            "explained_by_order_ids": list(
+                                ed.explained_by_order_ids
+                            ),
+                        }
+                        for ed in expected
+                    ]),
+                },
+            )
+            return ReconcileReport(
+                matched=True, diffs=[], explained_diffs=expected
+            )
+
+        # At least one unexpected diff → halt. Enrich the diff_summary
+        # payload so each row carries its classification (and which order
+        # ids explained it, when any).
+        expected_symbols = {ed.diff.symbol for ed in expected}
         notes = json.dumps([
             {
                 "symbol": d.symbol,
@@ -313,6 +384,10 @@ class Reconciler:
                 "journal_qty": d.journal_qty,
                 "broker_avg_entry": d.broker_avg_entry,
                 "journal_avg_entry": d.journal_avg_entry,
+                "classification": (
+                    "expected" if d.symbol in expected_symbols else "unexpected"
+                ),
+                "explained_by_order_ids": per_diff_orders.get(d.symbol, []),
             }
             for d in diffs
         ])
@@ -321,6 +396,8 @@ class Reconciler:
             extra={
                 "event": "reconciler.discrepancy",
                 "diff_count": len(diffs),
+                "unexpected_count": len(unexpected),
+                "expected_count": len(expected),
                 "diff_summary": notes,
             },
         )
@@ -331,9 +408,77 @@ class Reconciler:
         )
         if self._alerter is not None:
             self._alerter.notify(
-                f"Reconciler: {len(diffs)} position discrepancy(ies); kill-switch halted. {notes}"
+                f"Reconciler: {len(unexpected)} unexpected position "
+                f"discrepancy(ies) (of {len(diffs)} total); kill-switch "
+                f"halted. {notes}"
             )
-        return ReconcileReport(matched=False, diffs=diffs)
+        # `diffs` carries only the unexpected (halt-triggering) rows;
+        # explained ones move to `explained_diffs`.
+        return ReconcileReport(
+            matched=False, diffs=unexpected, explained_diffs=expected
+        )
+
+    @staticmethod
+    def _classify_diff(
+        diff: PositionDiff, recent_orders: list[OrderRow]
+    ) -> tuple[str, tuple[int, ...]]:
+        """Classify a `PositionDiff` against recent `orders` rows for the
+        same symbol. Returns ('expected'|'unexpected', explaining_order_ids).
+
+        Rules (hotfix 2026-05-07):
+          - broker_qty > journal_qty: an "expected" increase requires
+            recent role='entry', side='buy' orders whose summed qty covers
+            the delta.
+          - broker_qty < journal_qty: an "expected" decrease requires
+            recent role IN ('stop','take_profit'), side='sell' orders
+            whose summed qty covers the delta.
+          - qtys equal but avg_entry differs: ALWAYS unexpected — recent
+            orders cannot explain a price drift on the same share count.
+          - mixed qty diff AND avg_entry diff: ALWAYS unexpected — the
+            avg_entry mismatch is the giveaway, even if the qty delta
+            would otherwise be expected.
+
+        `recent_orders` should already be filtered to the time window
+        (caller-side) and to this diff's symbol; we only filter by
+        role/side here.
+        """
+        # Avg_entry mismatch alone (or in combination) → always unexpected.
+        # The reconciler computes `avg_mismatch` only when both sides have
+        # a position; if either side is None, b_avg/j_avg might be None.
+        if (
+            diff.broker_avg_entry is not None
+            and diff.journal_avg_entry is not None
+            and abs(diff.broker_avg_entry - diff.journal_avg_entry) > 1e-6
+        ):
+            return ("unexpected", ())
+
+        delta = diff.broker_qty - diff.journal_qty
+        if delta == 0:
+            # No qty diff and we already cleared the avg_entry path above
+            # (either both sides agree or one side is missing avg). This
+            # branch should be unreachable — _compute_diffs only emits a
+            # PositionDiff when qty OR avg differs — but be defensive.
+            return ("unexpected", ())
+
+        if delta > 0:
+            wanted_roles = {"entry"}
+            wanted_side = "buy"
+        else:
+            wanted_roles = {"stop", "take_profit"}
+            wanted_side = "sell"
+
+        explaining_qty = 0
+        explaining_ids: list[int] = []
+        for o in recent_orders:
+            if o.role not in wanted_roles or o.side != wanted_side:
+                continue
+            explaining_qty += o.qty
+            if o.id is not None:
+                explaining_ids.append(o.id)
+
+        if explaining_qty >= abs(delta):
+            return ("expected", tuple(explaining_ids))
+        return ("unexpected", tuple(explaining_ids))
 
     @staticmethod
     def _compute_diffs(
@@ -384,6 +529,7 @@ _AccountSnapshot = AccountSnapshot  # silence unused-import; referenced in helpe
 
 
 __all__ = [
+    "ExplainedDiff",
     "PositionDiff",
     "ReconcileReport",
     "Reconciler",

@@ -65,6 +65,16 @@ class ExecutionConfig(_Section):
 
 class ReconcilerConfig(_Section):
     interval_seconds_market: int = Field(gt=0)
+    # Hotfix 2026-05-07 — when broker/journal positions diverge, look back
+    # this many minutes in the `orders` table for recent bracket-order rows
+    # that explain the divergence (entry buy that just filled, stop/TP sell
+    # that just filled). If the recent orders fully account for the diff,
+    # the reconciler treats it as expected — no halt — and snapshots the
+    # broker's truth. Genuine unexplained divergence (manual broker
+    # action, corruption) still halts. Default 30 minutes covers the
+    # window between submission and the next reconciler tick plus a
+    # cushion for slow fills; raising it loosens the safety net.
+    expected_fill_window_minutes: int = Field(default=30, gt=0)
 
 
 class KillSwitchConfig(_Section):
