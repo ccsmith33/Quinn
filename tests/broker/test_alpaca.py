@@ -26,7 +26,10 @@ import broker.alpaca as alpaca_mod
 from broker.alpaca import AlpacaBroker, BrokerUnavailable
 from broker.protocol import (
     AccountSnapshot,
+    BracketOrderRequest,
     BrokerAdapter,
+    BrokerRejected,
+    OpenOrder,
     OrderRequest,
     Position,
     Quote,
@@ -75,6 +78,8 @@ class _FakeTradingClient:
         # Configurable behaviour; tests mutate via the instance attached to broker.
         self._submit_responses: list[Any] = []
         self._submit_exceptions: list[Exception | None] = []
+        # Hotfix 2026-05-07: open-orders surface (KS-5 pending-buy gate).
+        self._open_orders_response: list[Any] = []
 
     # ---- helpers used by tests ----
     def queue_submit_response(self, resp: Any) -> None:
@@ -119,6 +124,11 @@ class _FakeTradingClient:
                 side="long",
             )
         ]
+
+    def get_orders(self, filter: Any = None) -> list[Any]:  # noqa: A002
+        # Tests can mutate `self._open_orders_response` to simulate
+        # pre-market queued orders. Hotfix 2026-05-07.
+        return list(self._open_orders_response)
 
 
 class _FakeDataClient:
@@ -178,6 +188,70 @@ def _make_fake_alpaca_order(symbol: str, qty: int) -> Any:
     )
 
 
+def _make_fake_bracket_response(
+    *,
+    symbol: str,
+    qty: int,
+    entry_order_type: str = "market",
+    entry_limit_price: float | None = None,
+    stop_price: float = 8.5,
+    take_profit_price: float | None = None,
+) -> Any:
+    """Build a fake alpaca-py parent order with `legs` populated.
+
+    Mirrors what the real SDK returns from a BRACKET / OTO submission:
+    the parent (entry) carries the child orders in `.legs`. Tests use
+    this to drive the broker's response normalizer without calling out
+    over the wire.
+    """
+    legs: list[Any] = []
+    legs.append(
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            client_order_id=f"cid-{symbol}-stop",
+            symbol=symbol,
+            side=SimpleNamespace(value="sell"),
+            qty=str(qty),
+            order_type=SimpleNamespace(value="stop"),
+            type=SimpleNamespace(value="stop"),
+            status=SimpleNamespace(value="held"),
+            submitted_at=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+            limit_price=None,
+            stop_price=str(stop_price),
+        )
+    )
+    if take_profit_price is not None:
+        legs.append(
+            SimpleNamespace(
+                id=uuid.uuid4(),
+                client_order_id=f"cid-{symbol}-tp",
+                symbol=symbol,
+                side=SimpleNamespace(value="sell"),
+                qty=str(qty),
+                order_type=SimpleNamespace(value="limit"),
+                type=SimpleNamespace(value="limit"),
+                status=SimpleNamespace(value="held"),
+                submitted_at=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+                limit_price=str(take_profit_price),
+                stop_price=None,
+            )
+        )
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        client_order_id=f"cid-{symbol}",
+        symbol=symbol,
+        side=SimpleNamespace(value="buy"),
+        qty=str(qty),
+        order_type=SimpleNamespace(value=entry_order_type),
+        type=SimpleNamespace(value=entry_order_type),
+        status=SimpleNamespace(value="accepted"),
+        submitted_at=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+        limit_price=str(entry_limit_price) if entry_limit_price is not None else None,
+        stop_price=None,
+        legs=legs,
+    )
+
+
 @pytest.fixture
 def fake_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
     """Replace the alpaca-py clients + APIError inside broker.alpaca."""
@@ -216,7 +290,15 @@ def live_broker(fake_sdk: None) -> AlpacaBroker:
 def test_protocol_methods_present_on_alpaca(paper_broker: AlpacaBroker) -> None:
     """First failing test: AlpacaBroker satisfies the BrokerAdapter protocol."""
     assert isinstance(paper_broker, BrokerAdapter)
-    for method in ("submit_order", "cancel_order", "get_account", "get_positions", "get_quote"):
+    for method in (
+        "submit_order",
+        "submit_bracket_order",
+        "cancel_order",
+        "get_account",
+        "get_positions",
+        "get_open_orders",
+        "get_quote",
+    ):
         assert callable(getattr(paper_broker, method))
 
 
@@ -307,6 +389,51 @@ def test_get_positions_normalizes(paper_broker: AlpacaBroker) -> None:
     assert p.symbol == "AAPL"
     assert p.qty == 10
     assert p.avg_entry_price == 180.5
+
+
+def test_get_open_orders_normalizes_to_open_order_list(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Hotfix 2026-05-07: the new `get_open_orders()` adapter method
+    must surface broker-queued orders so the KS-5 capacity gate counts
+    pre-market entries that haven't filled yet.
+    """
+    paper_broker._trading._open_orders_response = [
+        SimpleNamespace(
+            id="ord-1",
+            client_order_id="prop-1-entry",
+            symbol="ACME",
+            side=SimpleNamespace(value="buy"),
+            qty="10",
+            order_type=SimpleNamespace(value="market"),
+            type=SimpleNamespace(value="market"),
+            status=SimpleNamespace(value="accepted"),
+        ),
+        SimpleNamespace(
+            id="ord-2",
+            client_order_id="prop-2-stop",
+            symbol="OLDCO",
+            side=SimpleNamespace(value="sell"),
+            qty="5",
+            order_type=SimpleNamespace(value="stop"),
+            type=SimpleNamespace(value="stop"),
+            status=SimpleNamespace(value="new"),
+        ),
+    ]
+
+    orders = paper_broker.get_open_orders()
+    assert len(orders) == 2
+    assert all(isinstance(o, OpenOrder) for o in orders)
+
+    entry, stop = orders
+    assert entry.symbol == "ACME"
+    assert entry.side == "buy"
+    assert entry.is_entry is True
+    assert entry.qty == 10
+    assert stop.side == "sell"
+    # SELL legs (stops / TPs) are NOT entries — the underlying long is
+    # already counted in `get_positions()`.
+    assert stop.is_entry is False
 
 
 def test_quote_returns_bid_ask_last_ts(paper_broker: AlpacaBroker) -> None:
@@ -404,8 +531,19 @@ def test_retry_exhausts_to_broker_unavailable(paper_broker: AlpacaBroker) -> Non
     assert len(fake_trading.submit_calls) == 5
 
 
-def test_non_retryable_error_propagates_unwrapped(paper_broker: AlpacaBroker) -> None:
-    """A 4xx that isn't 429 (e.g. 422 insufficient buying power) must NOT be retried."""
+def test_non_retryable_api_error_wrapped_as_broker_rejected(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Hotfix 2026-05-07: a non-retryable APIError (e.g. 422 insufficient
+    buying power, or the wash-trade 40310000 that escaped the production
+    handler) must be wrapped as `BrokerRejected` at the broker boundary.
+
+    Raw `APIError` propagation was the proximate cause of the 27
+    unprotected positions on first live trading day — the execution
+    layer's `BrokerUnavailable`-only `except` let raw rejections fall
+    through unjournaled. Wrapping here forces a single domain-typed
+    failure mode that callers can handle.
+    """
     fake_trading = paper_broker._trading
     fake_trading.queue_submit_exception(_FakeAPIError(422, "insufficient buying power"))
 
@@ -417,9 +555,237 @@ def test_non_retryable_error_propagates_unwrapped(paper_broker: AlpacaBroker) ->
         tif="day",
         client_order_id="cid-AAPL",
     )
-    with pytest.raises(_FakeAPIError):
+    with pytest.raises(BrokerRejected) as ei:
         paper_broker.submit_order(req)
+    assert ei.value.status_code == 422
+    # Single call — non-retryable should not loop.
     assert len(fake_trading.submit_calls) == 1
+
+
+def test_wash_trade_apierror_wrapped_as_broker_rejected(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """The exact production failure mode: Alpaca rejects a back-to-back
+    stop submission with broker_code=40310000 ("potential wash trade
+    detected"). This must surface as `BrokerRejected` so the execution
+    layer can route it to the `submission_partial_no_stop` killswitch
+    halt (incident 2026-05-07).
+    """
+    fake_trading = paper_broker._trading
+    err = _FakeAPIError(
+        422, "potential wash trade detected — opposite side market/stop order exists"
+    )
+    err._error = {"code": 40310000, "message": str(err)}
+    fake_trading.queue_submit_exception(err)
+
+    req = OrderRequest(
+        symbol="ACME",
+        side="sell",
+        qty=10,
+        order_type="stop",
+        tif="gtc",
+        client_order_id="prop-1-stop",
+        stop_price=8.50,
+    )
+    with pytest.raises(BrokerRejected) as ei:
+        paper_broker.submit_order(req)
+    assert ei.value.status_code == 422
+    assert ei.value.broker_code == 40310000
+    assert "wash trade" in str(ei.value)
+
+
+def test_submit_bracket_order_translates_correctly(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Hotfix 2026-05-07: a `BracketOrderRequest` with both stop and TP
+    must translate to a `MarketOrderRequest` with `order_class=BRACKET`,
+    `stop_loss=StopLossRequest(...)`, and `take_profit=TakeProfitRequest(...)`.
+    The adapter splits the parent's `legs` into stop + tp `SubmittedOrder`s.
+    """
+    from alpaca.trading.enums import OrderClass
+    from alpaca.trading.requests import MarketOrderRequest, StopLossRequest, TakeProfitRequest
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_response(
+        _make_fake_bracket_response(
+            symbol="ACME",
+            qty=10,
+            entry_order_type="market",
+            stop_price=8.5,
+            take_profit_price=12.0,
+        )
+    )
+
+    req = BracketOrderRequest(
+        entry_symbol="ACME",
+        entry_side="buy",
+        entry_qty=10,
+        entry_order_type="market",
+        entry_tif="day",
+        entry_client_order_id="prop-1-entry",
+        stop_loss_price=8.5,
+        take_profit_price=12.0,
+    )
+    entry, stop, tp = paper_broker.submit_bracket_order(req)
+
+    # The adapter built a single MarketOrderRequest with BRACKET class +
+    # StopLoss + TakeProfit children.
+    assert len(fake_trading.submit_calls) == 1
+    sent = fake_trading.submit_calls[0]
+    assert isinstance(sent, MarketOrderRequest)
+    assert sent.order_class == OrderClass.BRACKET
+    assert isinstance(sent.stop_loss, StopLossRequest)
+    assert sent.stop_loss.stop_price == 8.5
+    assert isinstance(sent.take_profit, TakeProfitRequest)
+    assert sent.take_profit.limit_price == 12.0
+    assert sent.client_order_id == "prop-1-entry"
+
+    # Response normalization: parent → entry; legs → stop + tp.
+    assert entry.symbol == "ACME"
+    assert entry.side == "buy"
+    assert entry.order_type == "market"
+    assert stop.side == "sell"
+    assert stop.order_type == "stop"
+    assert stop.stop_price == 8.5
+    assert tp is not None
+    assert tp.side == "sell"
+    assert tp.order_type == "limit"
+    assert tp.limit_price == 12.0
+
+
+def test_submit_oto_order_when_take_profit_absent(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Hotfix 2026-05-07: when TP is not supplied, the adapter must use
+    `OrderClass.OTO` (entry + stop only) — Alpaca's BRACKET requires
+    BOTH legs and rejects requests without a take-profit. The returned
+    tuple's third element is `None`.
+    """
+    from alpaca.trading.enums import OrderClass
+    from alpaca.trading.requests import MarketOrderRequest, StopLossRequest
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_response(
+        _make_fake_bracket_response(
+            symbol="ACME",
+            qty=10,
+            entry_order_type="market",
+            stop_price=8.5,
+            take_profit_price=None,
+        )
+    )
+
+    req = BracketOrderRequest(
+        entry_symbol="ACME",
+        entry_side="buy",
+        entry_qty=10,
+        entry_order_type="market",
+        entry_tif="day",
+        entry_client_order_id="prop-2-entry",
+        stop_loss_price=8.5,
+        take_profit_price=None,
+    )
+    entry, stop, tp = paper_broker.submit_bracket_order(req)
+
+    sent = fake_trading.submit_calls[0]
+    assert isinstance(sent, MarketOrderRequest)
+    assert sent.order_class == OrderClass.OTO
+    assert isinstance(sent.stop_loss, StopLossRequest)
+    assert sent.stop_loss.stop_price == 8.5
+    # OTO carries no take-profit on the wire.
+    assert sent.take_profit is None
+
+    assert entry.symbol == "ACME"
+    assert stop.order_type == "stop"
+    assert tp is None
+
+
+def test_submit_bracket_order_with_limit_entry(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Bracket entry can also be a limit (when proposal.entry_style='limit').
+    The adapter should emit a `LimitOrderRequest` with the same BRACKET
+    class + protective leg shape.
+    """
+    from alpaca.trading.enums import OrderClass
+    from alpaca.trading.requests import LimitOrderRequest
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_response(
+        _make_fake_bracket_response(
+            symbol="ACME",
+            qty=10,
+            entry_order_type="limit",
+            entry_limit_price=9.95,
+            stop_price=8.5,
+            take_profit_price=12.0,
+        )
+    )
+
+    req = BracketOrderRequest(
+        entry_symbol="ACME",
+        entry_side="buy",
+        entry_qty=10,
+        entry_order_type="limit",
+        entry_tif="day",
+        entry_client_order_id="prop-3-entry",
+        entry_limit_price=9.95,
+        stop_loss_price=8.5,
+        take_profit_price=12.0,
+    )
+    paper_broker.submit_bracket_order(req)
+
+    sent = fake_trading.submit_calls[0]
+    assert isinstance(sent, LimitOrderRequest)
+    assert sent.order_class == OrderClass.BRACKET
+    assert sent.limit_price == 9.95
+
+
+def test_submit_bracket_order_propagates_broker_rejected(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """If Alpaca rejects the whole bracket (e.g. 422 insufficient buying
+    power), the adapter must surface `BrokerRejected` — there is no
+    partial state to recover.
+    """
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_exception(_FakeAPIError(422, "insufficient buying power"))
+
+    req = BracketOrderRequest(
+        entry_symbol="ACME",
+        entry_side="buy",
+        entry_qty=10,
+        entry_order_type="market",
+        entry_tif="day",
+        entry_client_order_id="prop-4-entry",
+        stop_loss_price=8.5,
+        take_profit_price=12.0,
+    )
+    with pytest.raises(BrokerRejected) as ei:
+        paper_broker.submit_bracket_order(req)
+    assert ei.value.status_code == 422
+
+
+def test_retryable_api_error_still_retries(paper_broker: AlpacaBroker) -> None:
+    """Wrapping non-retryable APIErrors must NOT alter the retry path:
+    429s still get backoff + retry, eventually succeeding.
+    """
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_exception(_FakeAPIError(429))
+    fake_trading.queue_submit_exception(_FakeAPIError(429))
+    fake_trading.queue_submit_response(_make_fake_alpaca_order("AAPL", 1))
+
+    req = OrderRequest(
+        symbol="AAPL",
+        side="buy",
+        qty=1,
+        order_type="market",
+        tif="day",
+        client_order_id="cid-AAPL",
+    )
+    out = paper_broker.submit_order(req)
+    assert out.symbol == "AAPL"
+    assert len(fake_trading.submit_calls) == 3
 
 
 def test_backoff_uses_full_jitter(
@@ -484,7 +850,15 @@ def test_p95_under_10s_with_fake_sdk(paper_broker: AlpacaBroker) -> None:
 def test_paper_and_live_have_identical_method_signatures(
     paper_broker: AlpacaBroker, live_broker: AlpacaBroker
 ) -> None:
-    for name in ("submit_order", "cancel_order", "get_account", "get_positions", "get_quote"):
+    for name in (
+        "submit_order",
+        "submit_bracket_order",
+        "cancel_order",
+        "get_account",
+        "get_positions",
+        "get_open_orders",
+        "get_quote",
+    ):
         assert inspect.signature(getattr(paper_broker, name)) == inspect.signature(
             getattr(live_broker, name)
         ), f"signature divergence on {name}"

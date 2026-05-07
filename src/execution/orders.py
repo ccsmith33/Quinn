@@ -4,32 +4,42 @@ For an `AcceptedProposal` (the validator + sizing combined output) the
 submitter:
 
   1. captures the pre-submission NBBO (`broker.get_quote`) per ADR-001;
-  2. submits the entry order (market or limit BUY, TIF=day);
-  3. submits the protective stop-loss (sell stop, TIF=GTC);
-  4. submits the optional take-profit (sell limit, TIF=GTC).
+  2. submits a single atomic complex order:
+       - BRACKET when the proposal carries a take-profit price
+         (entry + stop-loss + take-profit, all created together);
+       - OTO     when the proposal has no take-profit
+         (entry + stop-loss only).
+  3. journals the execution row + one order row per leg.
 
 Single code path for paper / live (D-007 sacred): no `if mode==...`
 branching here; the broker adapter is the seam.
 
-Failure handling (AC-8):
+Hotfix 2026-05-07 (incident: 27 unprotected positions): the prior flow
+submitted entry, stop, and TP as three sequential `submit_order` calls.
+Alpaca's wash-trade detector (broker code 40310000) rejected the
+back-to-back sell-stop while the entry buy was still pending pre-market,
+and the position landed live without protection. Bracket / OTO orders
+are atomic at the broker — either every leg is created or the whole
+submission is rejected — so the `submission_partial_no_stop` failure
+mode cannot occur on the normal flow. The historical reason value is
+retained because crash-recovery / orphan adoption can still produce it
+when a process dies between submission and journal write (the broker
+has the entry; child legs from a bracket parent show up via
+`parent_id`, but the orphan-adoption code path uses deterministic
+client_order_ids that bracket children don't carry).
 
-- Entry fails (broker exhausted retries before any order placed): write
-  `executions` row with `decision="submission_failed"`. No protective
-  legs attempted; no kill-switch flip — there is no exposure.
-- Entry succeeds, stop fails: this is a critical state — the position is
-  open without protection. Flip the kill-switch to `halted` with reason
-  `submission_partial_no_stop`, set_by `system`. The execution row
-  records `decision="submission_partial_no_stop"`. The take-profit leg
-  is *not* attempted because the operator must triage; KS-halted state
-  also blocks subsequent entries (FR-20).
-- Entry + stop succeed, TP fails: protective leg is in place, so this is
-  recoverable; the execution decision is still `accepted` and the TP
-  failure is journaled in the entry/stop rows' `notes` for operator
-  review.
+Failure handling:
+
+- Bracket submission fails (entire complex order rejected, retries
+  exhausted, etc.): write `executions` row with
+  `decision="submission_failed"`. No legs at the broker; no kill-switch
+  flip — there is no exposure.
+- Bracket submission accepted: write `executions` row with
+  `decision="accepted"` plus one `OrderRow` per leg (entry + stop +
+  optional TP).
 
 The journal write order matters: execution row first (parent), then
-order rows (children). On entry failure we still write the execution
-row so the rejection is auditable.
+order rows (children).
 """
 
 from __future__ import annotations
@@ -39,7 +49,13 @@ from dataclasses import dataclass
 from typing import Literal, Protocol
 
 from broker.alpaca import BrokerUnavailable
-from broker.protocol import BrokerAdapter, OrderRequest, Quote, SubmittedOrder
+from broker.protocol import (
+    BracketOrderRequest,
+    BrokerAdapter,
+    BrokerRejected,
+    Quote,
+    SubmittedOrder,
+)
 from journal.models import ExecutionRow, OrderRow
 from observability.log_port import get_logger
 from proposal.schemas import TradeProposal
@@ -114,17 +130,24 @@ class OrderSubmitter:
         # --- 1. Pre-submission NBBO (ADR-001) ---------------------------
         nbbo = broker.get_quote(proposal.symbol)
 
-        # --- 2. Build + submit entry order -----------------------------
-        entry_req = self._build_entry(accepted_proposal)
+        # --- 2. Build + submit the bracket / OTO order ----------------
+        # Single atomic call: either every leg is created at the broker
+        # (entry + stop + optional TP) or the whole submission is
+        # rejected. The `submission_partial_no_stop` failure mode that
+        # caused the 2026-05-07 incident cannot occur here — Alpaca
+        # treats the bundle as one transaction so the wash-trade
+        # detector (40310000) does not fire on a back-to-back stop.
+        bracket_req = self._build_bracket(accepted_proposal)
         try:
-            entry_resp = broker.submit_order(entry_req)
-        except BrokerUnavailable as e:
+            entry_resp, stop_resp, tp_resp = broker.submit_bracket_order(bracket_req)
+        except (BrokerRejected, BrokerUnavailable) as e:
             log.error(
-                "execution.submit.entry_failed",
+                "execution.submit.bracket_failed",
                 extra={
-                    "event": "execution.submit.entry_failed",
+                    "event": "execution.submit.bracket_failed",
                     "symbol": proposal.symbol,
                     "error": str(e),
+                    "error_type": type(e).__name__,
                 },
             )
             execution_id = journal.insert_execution(
@@ -138,71 +161,7 @@ class OrderSubmitter:
             )
             return SubmissionFailed(reason="submission_failed", execution_id=execution_id)
 
-        # --- 3. Build + submit stop-loss (entry now exposed) ----------
-        stop_req = self._build_stop(accepted_proposal)
-        try:
-            stop_resp = broker.submit_order(stop_req)
-        except BrokerUnavailable as e:
-            log.critical(
-                "execution.submit.stop_failed_position_unprotected",
-                extra={
-                    "event": "execution.submit.stop_failed_position_unprotected",
-                    "symbol": proposal.symbol,
-                    "entry_broker_order_id": entry_resp.broker_order_id,
-                    "error": str(e),
-                },
-            )
-            # KS halt FIRST so subsequent entries are blocked, then journal
-            # the partial state. (Order matters: a crash between these two
-            # writes still leaves KS halted, the conservative state.)
-            ks.halt(
-                reason="submission_partial_no_stop",
-                set_by="system",
-                notes=(
-                    f"entry {entry_resp.broker_order_id} for {proposal.symbol} "
-                    f"submitted; stop submission failed: {e}"
-                ),
-            )
-            submitted = [{"broker_order_id": entry_resp.broker_order_id, "role": "entry"}]
-            execution_id = journal.insert_execution(
-                ExecutionRow(
-                    proposal_id=accepted_proposal.proposal_id,
-                    decision="submission_partial_no_stop",
-                    realized_size_pct=accepted_proposal.realized_pct,
-                    realized_dollar_size=accepted_proposal.realized_dollar_size,
-                    submitted_orders_json=json.dumps(submitted),
-                )
-            )
-            journal.insert_order(
-                self._entry_row(
-                    execution_id, accepted_proposal, entry_req, entry_resp, nbbo
-                )
-            )
-            return SubmissionFailed(
-                reason="submission_partial_no_stop",
-                execution_id=execution_id,
-            )
-
-        # --- 4. Optional take-profit ----------------------------------
-        tp_resp: SubmittedOrder | None = None
-        tp_note: str | None = None
-        tp_req = self._build_take_profit(accepted_proposal)
-        if tp_req is not None:
-            try:
-                tp_resp = broker.submit_order(tp_req)
-            except BrokerUnavailable as e:
-                # Position is protected by stop; TP failure is recoverable.
-                tp_note = f"tp_submission_failed: {e}"
-                log.warning(
-                    "execution.submit.tp_failed",
-                    extra={
-                        "event": "execution.submit.tp_failed",
-                        "symbol": proposal.symbol,
-                        "error": str(e),
-                    },
-                )
-
-        # --- 5. Journal: execution row + order rows -------------------
+        # --- 3. Journal: execution row + order rows -------------------
         submitted = [
             {"broker_order_id": entry_resp.broker_order_id, "role": "entry"},
             {"broker_order_id": stop_resp.broker_order_id, "role": "stop"},
@@ -222,16 +181,20 @@ class OrderSubmitter:
             )
         )
         journal.insert_order(
-            self._entry_row(
-                execution_id, accepted_proposal, entry_req, entry_resp, nbbo, notes=tp_note
+            self._entry_row_from_bracket(
+                execution_id, accepted_proposal, bracket_req, entry_resp, nbbo
             )
         )
         journal.insert_order(
-            self._stop_row(execution_id, accepted_proposal, stop_req, stop_resp)
+            self._stop_row_from_bracket(
+                execution_id, accepted_proposal, bracket_req, stop_resp
+            )
         )
-        if tp_resp is not None and tp_req is not None:
+        if tp_resp is not None:
             journal.insert_order(
-                self._take_profit_row(execution_id, accepted_proposal, tp_req, tp_resp)
+                self._take_profit_row_from_bracket(
+                    execution_id, accepted_proposal, bracket_req, tp_resp
+                )
             )
 
         log.info(
@@ -243,8 +206,14 @@ class OrderSubmitter:
                 "entry_broker_order_id": entry_resp.broker_order_id,
                 "stop_broker_order_id": stop_resp.broker_order_id,
                 "take_profit_broker_order_id": tp_resp.broker_order_id if tp_resp else None,
+                "order_class": "bracket" if tp_resp is not None else "oto",
             },
         )
+        # Suppress unused-variable warning — `ks` is still in the
+        # signature for backward compatibility with callers; the
+        # submission_partial_no_stop kill-switch halt that consumed it
+        # is dead code under bracket flow.
+        _ = ks
         return SubmissionAccepted(
             execution_id=execution_id,
             entry_broker_order_id=entry_resp.broker_order_id,
@@ -253,58 +222,42 @@ class OrderSubmitter:
         )
 
     # ------------------------------------------------------------------
-    # Order builders (AC-2, AC-3)
+    # Bracket / OTO order builder
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_entry(ap: AcceptedProposal) -> OrderRequest:
+    def _build_bracket(ap: AcceptedProposal) -> BracketOrderRequest:
+        """Construct a bracket / OTO request from the accepted proposal.
+
+        Class is selected by the broker adapter from `take_profit_price`:
+          - take_profit_price set    → BRACKET
+          - take_profit_price absent → OTO
+
+        Hotfix 2026-05-07: this is the single submission point for
+        normal flow. The historical separate `_build_entry` /
+        `_build_stop` / `_build_take_profit` pathway has been retired.
+        """
         p = ap.proposal
+        entry_order_type: Literal["market", "limit"]
+        entry_limit_price: float | None
         if p.entry_style == "limit":
             assert p.entry_limit_price is not None  # enforced by TradeProposal validator
-            return OrderRequest(
-                symbol=p.symbol,
-                side="buy",
-                qty=ap.qty,
-                order_type="limit",
-                tif="day",
-                client_order_id=f"prop-{ap.proposal_id}-entry",
-                limit_price=p.entry_limit_price,
-            )
-        return OrderRequest(
-            symbol=p.symbol,
-            side="buy",
-            qty=ap.qty,
-            order_type="market",
-            tif="day",
-            client_order_id=f"prop-{ap.proposal_id}-entry",
-        )
+            entry_order_type = "limit"
+            entry_limit_price = p.entry_limit_price
+        else:
+            entry_order_type = "market"
+            entry_limit_price = None
 
-    @staticmethod
-    def _build_stop(ap: AcceptedProposal) -> OrderRequest:
-        p = ap.proposal
-        return OrderRequest(
-            symbol=p.symbol,
-            side="sell",
-            qty=ap.qty,
-            order_type="stop",
-            tif="gtc",
-            client_order_id=f"prop-{ap.proposal_id}-stop",
-            stop_price=p.stop_loss_price,
-        )
-
-    @staticmethod
-    def _build_take_profit(ap: AcceptedProposal) -> OrderRequest | None:
-        p = ap.proposal
-        if p.take_profit_price is None:
-            return None
-        return OrderRequest(
-            symbol=p.symbol,
-            side="sell",
-            qty=ap.qty,
-            order_type="limit",
-            tif="gtc",
-            client_order_id=f"prop-{ap.proposal_id}-tp",
-            limit_price=p.take_profit_price,
+        return BracketOrderRequest(
+            entry_symbol=p.symbol,
+            entry_side="buy",
+            entry_qty=ap.qty,
+            entry_order_type=entry_order_type,
+            entry_tif="day",
+            entry_client_order_id=f"prop-{ap.proposal_id}-entry",
+            entry_limit_price=entry_limit_price,
+            stop_loss_price=p.stop_loss_price,
+            take_profit_price=p.take_profit_price,
         )
 
     # ------------------------------------------------------------------
@@ -312,10 +265,10 @@ class OrderSubmitter:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _entry_row(
+    def _entry_row_from_bracket(
         execution_id: int,
         ap: AcceptedProposal,
-        req: OrderRequest,
+        req: BracketOrderRequest,
         resp: SubmittedOrder,
         nbbo: Quote,
         notes: str | None = None,
@@ -323,13 +276,13 @@ class OrderSubmitter:
         return OrderRow(
             execution_id=execution_id,
             role="entry",
-            symbol=req.symbol,
-            side=req.side,
-            order_type=req.order_type,
-            qty=req.qty,
-            limit_price=req.limit_price,
-            stop_price=req.stop_price,
-            tif=req.tif,
+            symbol=req.entry_symbol,
+            side=req.entry_side,
+            order_type=req.entry_order_type,
+            qty=req.entry_qty,
+            limit_price=req.entry_limit_price,
+            stop_price=None,
+            tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
             pre_submission_bid=nbbo.bid,
@@ -341,44 +294,45 @@ class OrderSubmitter:
         )
 
     @staticmethod
-    def _stop_row(
+    def _stop_row_from_bracket(
         execution_id: int,
         ap: AcceptedProposal,
-        req: OrderRequest,
+        req: BracketOrderRequest,
         resp: SubmittedOrder,
     ) -> OrderRow:
         return OrderRow(
             execution_id=execution_id,
             role="stop",
-            symbol=req.symbol,
-            side=req.side,
-            order_type=req.order_type,
-            qty=req.qty,
-            limit_price=req.limit_price,
-            stop_price=req.stop_price,
-            tif=req.tif,
+            symbol=req.entry_symbol,
+            side="sell",
+            order_type="stop",
+            qty=req.entry_qty,
+            limit_price=None,
+            stop_price=req.stop_loss_price,
+            tif="gtc",
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
             final_status=resp.status,
         )
 
     @staticmethod
-    def _take_profit_row(
+    def _take_profit_row_from_bracket(
         execution_id: int,
         ap: AcceptedProposal,
-        req: OrderRequest,
+        req: BracketOrderRequest,
         resp: SubmittedOrder,
     ) -> OrderRow:
+        assert req.take_profit_price is not None  # caller-checked
         return OrderRow(
             execution_id=execution_id,
             role="take_profit",
-            symbol=req.symbol,
-            side=req.side,
-            order_type=req.order_type,
-            qty=req.qty,
-            limit_price=req.limit_price,
-            stop_price=req.stop_price,
-            tif=req.tif,
+            symbol=req.entry_symbol,
+            side="sell",
+            order_type="limit",
+            qty=req.entry_qty,
+            limit_price=req.take_profit_price,
+            stop_price=None,
+            tif="gtc",
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
             final_status=resp.status,

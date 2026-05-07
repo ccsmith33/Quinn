@@ -64,6 +64,52 @@ class OrderRequest(_Domain):
         return self
 
 
+class BracketOrderRequest(_Domain):
+    """Domain-level bracket / OTO order spec.
+
+    Hotfix 2026-05-07 (incident: 27 unprotected positions): Alpaca rejects a
+    sell-stop submitted back-to-back with a still-pending entry buy as a
+    wash trade (broker code 40310000). Alpaca's recommended remedy in the
+    error message itself is "use complex orders": entry + protective legs
+    submitted as a single atomic order with the broker creating the
+    children when the entry fills. This eliminates the partial-state
+    failure mode entirely — either the broker accepts the bracket (entry +
+    stop + optional TP all created) or rejects it (no exposure).
+
+    `take_profit_price` is optional. Alpaca's BRACKET class requires both
+    legs; when TP is omitted we fall back to OTO (one-triggers-other,
+    entry + stop only). The broker adapter chooses the wire-level class
+    from the presence/absence of `take_profit_price`.
+
+    Only the entry leg carries a `client_order_id`: Alpaca generates child
+    cids for the protective legs (BRACKET / OTO leg requests don't accept
+    one). Child broker order ids surface in the response and are recorded
+    on the journal `OrderRow`s.
+    """
+
+    entry_symbol: str
+    entry_side: Side
+    entry_qty: int = Field(gt=0)
+    entry_order_type: OrderType
+    entry_tif: TIF
+    entry_client_order_id: str
+    entry_limit_price: float | None = None
+    entry_extended_hours: bool = False
+
+    stop_loss_price: float
+    take_profit_price: float | None = None
+
+    @model_validator(mode="after")
+    def _check(self) -> BracketOrderRequest:
+        if self.entry_order_type == "limit" and self.entry_limit_price is None:
+            raise ValueError("entry_limit_price required for entry_order_type=limit")
+        if self.entry_order_type not in ("market", "limit"):
+            raise ValueError(
+                "bracket entries must be order_type 'market' or 'limit'"
+            )
+        return self
+
+
 class SubmittedOrder(_Domain):
     """Broker's acknowledgement after submit; canonical fields the journal records."""
 
@@ -96,6 +142,38 @@ class Position(_Domain):
     unrealized_pnl: float
 
 
+class OpenOrder(_Domain):
+    """Snapshot of a broker order that is currently open / pending fill.
+
+    Used by the Feature B / KS-5 capacity gate to count pre-market queued
+    entries that have not yet filled (incident 2026-05-07: positions only
+    show up in `get_positions()` after fill, so back-to-back pre-market
+    entries can each see "0 open positions" and bypass KS-5).
+
+    `is_entry` distinguishes BUY entries from protective SELL legs (stops
+    / TPs from prior days) so KS-5 only counts capacity that's actually
+    being consumed by new entries.
+    """
+
+    symbol: str
+    side: Side
+    qty: int
+    order_type: OrderType
+    status: OrderStatus
+    broker_order_id: str
+    client_order_id: str
+
+    @property
+    def is_entry(self) -> bool:
+        """A BUY-side open order is an entry leg (Quinn is long-only).
+
+        SELL stops / TPs from prior days surface as open orders too, but
+        they don't consume KS-5 capacity — the underlying long position
+        already counts there.
+        """
+        return self.side == "buy"
+
+
 class Quote(_Domain):
     """NBBO snapshot used by execution at submission time (pre_submission_nbbo)."""
 
@@ -106,12 +184,70 @@ class Quote(_Domain):
     ts: dt.datetime
 
 
+class BrokerRejected(Exception):
+    """Non-retryable broker rejection — distinct from `BrokerUnavailable`.
+
+    Raised when the broker returns a definitive 4xx that is NOT 429 (e.g.
+    Alpaca's 40310000 wash-trade detection on a back-to-back stop after a
+    pending entry, or a 422 insufficient buying power). Retrying these is
+    pointless — the broker has made a deterministic decision — but the
+    failure must still flow through the same execution-layer handlers as
+    a transient outage so the kill-switch halts on `submission_partial_no_stop`
+    and the journal records the partial state. See incident 2026-05-07.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        broker_code: int | str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.broker_code = broker_code
+
+
 @runtime_checkable
 class BrokerAdapter(Protocol):
     def submit_order(self, req: OrderRequest) -> SubmittedOrder: ...
+    def submit_bracket_order(
+        self, req: BracketOrderRequest
+    ) -> tuple[SubmittedOrder, SubmittedOrder, SubmittedOrder | None]:
+        """Submit an entry + protective stop (+ optional take-profit) as
+        a single atomic complex order.
+
+        Returns `(entry, stop, take_profit_or_None)`. Either ALL legs are
+        created at the broker or NONE are — partial state is impossible
+        by the broker's contract. On any failure the implementation
+        raises `BrokerRejected` (non-retryable) or `BrokerUnavailable`
+        (retries exhausted) and the caller treats this as a clean
+        `submission_failed`: no exposure, no journal order rows.
+
+        Wire-level class:
+          - take_profit_price set    → BRACKET (entry, stop, tp)
+          - take_profit_price absent → OTO     (entry, stop only)
+
+        Hotfix 2026-05-07: replaces the prior three-sequential-`submit_order`
+        flow that could leave a position unprotected when Alpaca's wash-
+        trade detector (40310000) rejected the back-to-back stop while
+        the entry buy was still pending pre-market.
+        """
+        ...
+
     def cancel_order(self, broker_order_id: str) -> None: ...
     def get_account(self) -> AccountSnapshot: ...
     def get_positions(self) -> list[Position]: ...
+    def get_open_orders(self) -> list[OpenOrder]:
+        """Return broker orders that are currently open / pending fill.
+
+        Filters to lifecycle statuses that are not yet terminal:
+        accepted, new, partially_filled, pending_new, accepted_for_bidding.
+        Used by the KS-5 capacity gate to count pre-market queued entries
+        that haven't filled yet (incident 2026-05-07).
+        """
+        ...
+
     def get_quote(self, symbol: str) -> Quote: ...
 
     def get_order_by_client_id(
@@ -154,7 +290,10 @@ class BrokerAdapter(Protocol):
 
 __all__ = [
     "AccountSnapshot",
+    "BracketOrderRequest",
     "BrokerAdapter",
+    "BrokerRejected",
+    "OpenOrder",
     "OrderRequest",
     "OrderStatus",
     "OrderType",

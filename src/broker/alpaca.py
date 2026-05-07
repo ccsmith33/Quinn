@@ -16,13 +16,16 @@ from alpaca.common.exceptions import APIError
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.enums import OrderClass, OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
+    GetOrdersRequest,
     LimitOrderRequest,
     MarketOrderRequest,
     ReplaceOrderRequest,
     StopLimitOrderRequest,
+    StopLossRequest,
     StopOrderRequest,
+    TakeProfitRequest,
 )
 from pydantic import SecretStr
 
@@ -30,6 +33,9 @@ from observability.log_port import get_logger
 
 from .protocol import (
     AccountSnapshot,
+    BracketOrderRequest,
+    BrokerRejected,
+    OpenOrder,
     OrderRequest,
     Position,
     Quote,
@@ -67,11 +73,43 @@ def _is_retryable(exc: BaseException) -> bool:
     return False
 
 
+def _wrap_api_error(exc: APIError) -> BrokerRejected:
+    """Translate a non-retryable alpaca-py `APIError` into our domain
+    exception so callers depend only on `broker.protocol`.
+
+    Hotfix 2026-05-07 (incident: 27 unprotected positions): a wash-trade
+    rejection (status 422, broker code 40310000) on a back-to-back stop
+    submission was propagating raw out of the broker abstraction and
+    escaping the `OrderSubmitter`'s `BrokerUnavailable` handler entirely
+    — the position stayed live without protection AND without a journal
+    row. Wrapping at the broker boundary lets execution catch a single
+    union (`BrokerRejected | BrokerUnavailable`) and route both to the
+    `submission_partial_no_stop` killswitch halt + journal write.
+    """
+    status = getattr(exc, "status_code", None)
+    # alpaca-py packs the broker-specific code in the `_error` dict
+    # (e.g. {"code": 40310000, "message": "..."}); fall back to None.
+    err_payload = getattr(exc, "_error", None)
+    broker_code: int | str | None = None
+    if isinstance(err_payload, dict):
+        broker_code = err_payload.get("code")
+    return BrokerRejected(
+        str(exc),
+        status_code=status,
+        broker_code=broker_code,
+    )
+
+
 def _retry(callable_: Any, *args: Any, **kwargs: Any) -> Any:
     """Run `callable_` with exponential backoff + full jitter on transient errors.
 
     Spec: base 1s, cap 60s, max 5 attempts. On exhaustion, raise BrokerUnavailable
     chained from the last error (NFR-5).
+
+    Non-retryable `APIError`s (anything that isn't 429/503) are wrapped as
+    `BrokerRejected` so they cross the broker boundary in a domain type
+    rather than the raw alpaca-py SDK exception (incident 2026-05-07).
+    Non-`APIError` exceptions still propagate raw.
     """
     last_exc: BaseException | None = None
     for attempt in range(_RETRY_MAX_ATTEMPTS):
@@ -79,6 +117,8 @@ def _retry(callable_: Any, *args: Any, **kwargs: Any) -> Any:
             return callable_(*args, **kwargs)
         except BaseException as exc:
             if not _is_retryable(exc):
+                if isinstance(exc, APIError):
+                    raise _wrap_api_error(exc) from exc
                 raise
             last_exc = exc
             if attempt == _RETRY_MAX_ATTEMPTS - 1:
@@ -125,6 +165,53 @@ def _to_alpaca_request(req: OrderRequest) -> Any:
     raise ValueError(f"unknown order_type: {req.order_type}")
 
 
+def _to_alpaca_bracket_request(req: BracketOrderRequest) -> Any:
+    """Translate a `BracketOrderRequest` into an alpaca-py order request
+    with the appropriate `order_class` (BRACKET or OTO).
+
+    Hotfix 2026-05-07 (incident: 27 unprotected positions): bracket /
+    OTO orders eliminate the wash-trade race that occurred when entry
+    + stop were submitted as separate calls pre-market. Alpaca treats
+    the bundle as a single transaction, so the back-to-back wash-trade
+    detector (40310000) does not fire on the protective leg.
+
+    Class selection:
+      - take_profit_price set    → BRACKET (entry parent + stop child + tp child)
+      - take_profit_price absent → OTO     (entry parent + stop child)
+    """
+    side = _ORDER_SIDE_MAP[req.entry_side]
+    tif = _TIF_MAP[req.entry_tif]
+    if req.take_profit_price is not None:
+        order_class = OrderClass.BRACKET
+        take_profit = TakeProfitRequest(limit_price=req.take_profit_price)
+        stop_loss = StopLossRequest(stop_price=req.stop_loss_price)
+    else:
+        order_class = OrderClass.OTO
+        take_profit = None
+        stop_loss = StopLossRequest(stop_price=req.stop_loss_price)
+
+    common: dict[str, Any] = {
+        "symbol": req.entry_symbol,
+        "qty": req.entry_qty,
+        "side": side,
+        "time_in_force": tif,
+        "client_order_id": req.entry_client_order_id,
+        "extended_hours": req.entry_extended_hours,
+        "order_class": order_class,
+        "stop_loss": stop_loss,
+    }
+    if take_profit is not None:
+        common["take_profit"] = take_profit
+
+    if req.entry_order_type == "market":
+        return MarketOrderRequest(**common)
+    if req.entry_order_type == "limit":
+        return LimitOrderRequest(limit_price=req.entry_limit_price, **common)
+    raise ValueError(
+        f"bracket entry order_type must be market or limit, got {req.entry_order_type!r}"
+    )
+
+
 def _enum_value(v: Any) -> Any:
     return v.value if hasattr(v, "value") else v
 
@@ -165,6 +252,19 @@ def _normalize_position(pos: Any) -> Position:
         avg_entry_price=float(pos.avg_entry_price),
         market_value=float(pos.market_value),
         unrealized_pnl=float(pos.unrealized_pl),
+    )
+
+
+def _normalize_open_order(o: Any) -> OpenOrder:
+    raw_type = _enum_value(getattr(o, "order_type", None) or getattr(o, "type", None))
+    return OpenOrder(
+        symbol=str(o.symbol),
+        side=_enum_value(o.side),
+        qty=int(float(o.qty)),
+        order_type=raw_type,
+        status=_enum_value(o.status),
+        broker_order_id=str(o.id),
+        client_order_id=str(o.client_order_id),
     )
 
 
@@ -216,6 +316,76 @@ class AlpacaBroker:
         raw = _retry(self._trading.submit_order, alpaca_req)
         return _normalize_submitted(raw)
 
+    def submit_bracket_order(
+        self, req: BracketOrderRequest
+    ) -> tuple[SubmittedOrder, SubmittedOrder, SubmittedOrder | None]:
+        """Submit entry + stop (+ optional TP) as a single atomic complex
+        order (BRACKET / OTO).
+
+        Alpaca returns the parent (entry) with its `legs` field populated
+        with the child orders. We split them by side / order_type:
+          - the SELL stop child  → stop leg
+          - the SELL limit child → take-profit leg
+
+        Hotfix 2026-05-07: a partial state ("entry placed, stop rejected")
+        is impossible by the broker's contract — either all legs are
+        accepted or the whole submission is rejected. Failure surfaces as
+        `BrokerRejected` / `BrokerUnavailable` and the caller treats it as
+        a clean `submission_failed` (no exposure, no journal order rows).
+        """
+        alpaca_req = _to_alpaca_bracket_request(req)
+        raw = _retry(self._trading.submit_order, alpaca_req)
+        entry = _normalize_submitted(raw)
+
+        legs = list(getattr(raw, "legs", None) or [])
+        stop_raw = next(
+            (
+                leg
+                for leg in legs
+                if _enum_value(leg.side) == "sell"
+                and _enum_value(
+                    getattr(leg, "order_type", None) or getattr(leg, "type", None)
+                )
+                == "stop"
+            ),
+            None,
+        )
+        if stop_raw is None:
+            # Defense in depth: alpaca-py contract says BRACKET/OTO always
+            # populates the stop leg. If it's missing the parent is in an
+            # unknown state — better to surface as BrokerRejected than to
+            # claim success with no stop.
+            raise BrokerRejected(
+                "bracket submission accepted but stop leg missing from response",
+                status_code=None,
+                broker_code=None,
+            )
+        stop = _normalize_submitted(stop_raw)
+
+        tp: SubmittedOrder | None = None
+        if req.take_profit_price is not None:
+            tp_raw = next(
+                (
+                    leg
+                    for leg in legs
+                    if _enum_value(leg.side) == "sell"
+                    and _enum_value(
+                        getattr(leg, "order_type", None) or getattr(leg, "type", None)
+                    )
+                    == "limit"
+                ),
+                None,
+            )
+            if tp_raw is None:
+                raise BrokerRejected(
+                    "bracket submission accepted but take-profit leg missing from response",
+                    status_code=None,
+                    broker_code=None,
+                )
+            tp = _normalize_submitted(tp_raw)
+
+        return entry, stop, tp
+
     def cancel_order(self, broker_order_id: str) -> None:
         _retry(self._trading.cancel_order_by_id, broker_order_id)
 
@@ -226,6 +396,26 @@ class AlpacaBroker:
     def get_positions(self) -> list[Position]:
         raw = _retry(self._trading.get_all_positions)
         return [_normalize_position(p) for p in raw]
+
+    def get_open_orders(self) -> list[OpenOrder]:
+        """Return broker orders that are currently open / pending fill.
+
+        Alpaca's `QueryOrderStatus.OPEN` covers the lifecycle states that
+        haven't reached a terminal disposition (filled / canceled /
+        expired / rejected): accepted, new, partially_filled, pending_new,
+        accepted_for_bidding. We rely on the broker's own classification
+        rather than filtering client-side, both because the SDK does the
+        filtering for free and because the set of "open" statuses is the
+        broker's contract, not ours.
+
+        Hotfix 2026-05-07: production saw 28 entries opened in one
+        pre-market session because each new sizing check saw 0 open
+        positions (broker hadn't filled them yet). KS-5 now consults
+        `len(positions ∪ open_buy_orders by symbol)`.
+        """
+        req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+        raw = _retry(self._trading.get_orders, filter=req)
+        return [_normalize_open_order(o) for o in raw]
 
     def get_quote(self, symbol: str) -> Quote:
         quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
@@ -254,8 +444,11 @@ class AlpacaBroker:
         """
         try:
             raw = _retry(self._trading.get_order_by_client_id, client_order_id)
-        except APIError as e:
-            if getattr(e, "status_code", None) == 404:
+        except BrokerRejected as e:
+            # 404 is "no order with that client_id" — the v1 orphan-order
+            # contract treats this as None, not an error. Other rejections
+            # (auth failure, malformed id) still propagate.
+            if e.status_code == 404:
                 return None
             raise
         if raw is None:
@@ -286,6 +479,7 @@ class AlpacaBroker:
 
 __all__ = [
     "AlpacaBroker",
+    "BrokerRejected",
     "BrokerUnavailable",
     "LIVE_ENDPOINT",
     "PAPER_ENDPOINT",

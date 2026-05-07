@@ -32,6 +32,8 @@ from analyzer.opus import OpusReviewer
 from analyzer.sonnet import SonnetAnalyzer
 from broker.protocol import (
     AccountSnapshot,
+    BracketOrderRequest,
+    OpenOrder,
     OrderRequest,
     Position,
     Quote,
@@ -70,6 +72,7 @@ class _FakeBroker:
     """
 
     submitted_orders: list[OrderRequest] = field(default_factory=list)
+    submitted_brackets: list[BracketOrderRequest] = field(default_factory=list)
     submitted_by_client_id: dict[str, SubmittedOrder] = field(default_factory=dict)
     # Pre-seeded orders simulating the broker's memory of a previous
     # process run whose journal write was lost mid-pipeline (M-4 test).
@@ -78,6 +81,10 @@ class _FakeBroker:
     # empty (no holdings); tests that exercise Feature B's capacity gate
     # can override this list to simulate a full KS-5 slate.
     positions: list[Position] = field(default_factory=list)
+    # Open broker orders visible via `get_open_orders()`. Tests that
+    # exercise the KS-5 / KS-6 pre-market queue path can populate this
+    # to simulate pending entries that haven't filled yet.
+    open_orders: list[OpenOrder] = field(default_factory=list)
     equity: float = 100_000.0
     cash: float = 100_000.0
     quote_last: float = 100.0
@@ -100,6 +107,109 @@ class _FakeBroker:
         )
         self.submitted_by_client_id[req.client_order_id] = resp
         return resp
+
+    def submit_bracket_order(
+        self, req: BracketOrderRequest
+    ) -> tuple[SubmittedOrder, SubmittedOrder, SubmittedOrder | None]:
+        """Atomic bracket / OTO stub mirroring Alpaca's contract.
+
+        Hotfix 2026-05-07: returns the entry parent + protective stop
+        child + optional take-profit child as a single transaction.
+        Records the entry under its real client_order_id and the
+        children under synthetic `<entry_cid>:bracket-stop` /
+        `<entry_cid>:bracket-tp` keys (Alpaca generates child cids
+        server-side; tests don't need to round-trip them).
+
+        For backwards-compatibility with existing integration tests that
+        introspect `submitted_orders`, we also project synthetic
+        `OrderRequest`s for each leg into that list. This preserves the
+        pre-bracket-migration test contract: integration tests still see
+        "broker received an entry buy + a sell stop (+ optional sell
+        limit)" without caring whether the wire-level submission was a
+        bracket / OTO / three separate calls.
+        """
+        self.submitted_brackets.append(req)
+
+        # Project entry leg as a synthetic OrderRequest so legacy
+        # `submitted_orders` introspection keeps working.
+        entry_req = OrderRequest(
+            symbol=req.entry_symbol,
+            side=req.entry_side,
+            qty=req.entry_qty,
+            order_type=req.entry_order_type,
+            tif=req.entry_tif,
+            client_order_id=req.entry_client_order_id,
+            limit_price=req.entry_limit_price,
+            extended_hours=req.entry_extended_hours,
+        )
+        self.submitted_orders.append(entry_req)
+
+        self.next_order_id += 1
+        entry = SubmittedOrder(
+            broker_order_id=f"fake-{self.next_order_id:06d}",
+            client_order_id=req.entry_client_order_id,
+            symbol=req.entry_symbol,
+            side=req.entry_side,
+            qty=req.entry_qty,
+            order_type=req.entry_order_type,
+            status="accepted",
+            submitted_at=dt.datetime.now(dt.UTC),
+            limit_price=req.entry_limit_price,
+            stop_price=None,
+        )
+        self.submitted_by_client_id[req.entry_client_order_id] = entry
+
+        # Project stop leg.
+        stop_req = OrderRequest(
+            symbol=req.entry_symbol,
+            side="sell",
+            qty=req.entry_qty,
+            order_type="stop",
+            tif="gtc",
+            client_order_id=f"{req.entry_client_order_id}:bracket-stop",
+            stop_price=req.stop_loss_price,
+        )
+        self.submitted_orders.append(stop_req)
+
+        self.next_order_id += 1
+        stop = SubmittedOrder(
+            broker_order_id=f"fake-{self.next_order_id:06d}",
+            client_order_id=f"{req.entry_client_order_id}:bracket-stop",
+            symbol=req.entry_symbol,
+            side="sell",
+            qty=req.entry_qty,
+            order_type="stop",
+            status="accepted",
+            submitted_at=dt.datetime.now(dt.UTC),
+            stop_price=req.stop_loss_price,
+        )
+
+        tp: SubmittedOrder | None = None
+        if req.take_profit_price is not None:
+            tp_req = OrderRequest(
+                symbol=req.entry_symbol,
+                side="sell",
+                qty=req.entry_qty,
+                order_type="limit",
+                tif="gtc",
+                client_order_id=f"{req.entry_client_order_id}:bracket-tp",
+                limit_price=req.take_profit_price,
+            )
+            self.submitted_orders.append(tp_req)
+            self.next_order_id += 1
+            tp = SubmittedOrder(
+                broker_order_id=f"fake-{self.next_order_id:06d}",
+                client_order_id=f"{req.entry_client_order_id}:bracket-tp",
+                symbol=req.entry_symbol,
+                side="sell",
+                qty=req.entry_qty,
+                order_type="limit",
+                status="accepted",
+                submitted_at=dt.datetime.now(dt.UTC),
+                limit_price=req.take_profit_price,
+            )
+
+        return entry, stop, tp
 
     def cancel_order(self, broker_order_id: str) -> None:
         return None
@@ -148,6 +258,9 @@ class _FakeBroker:
 
     def get_positions(self) -> list[Position]:
         return list(self.positions)
+
+    def get_open_orders(self) -> list[OpenOrder]:
+        return list(self.open_orders)
 
     def get_quote(self, symbol: str) -> Quote:
         return Quote(
