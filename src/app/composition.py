@@ -39,8 +39,13 @@ from broker.protocol import BrokerAdapter
 from config.loader import AppConfig
 from config.secrets import Secrets
 from execution.orders import OrderSubmitter
+from execution.pdt_budget import PDTState  # PDT-SUNSET-2026-06-04: ADR-009 wiring.
 from execution.sizing import SizingEngine
 from execution.validator import ProposalValidator
+from execution.virtual_exits import (  # PDT-SUNSET-2026-06-04
+    DeferredSellReplayer,
+    VirtualExitScanner,
+)
 from ingestion.detail_fetcher import DetailFetcher
 from ingestion.edgar_client import EdgarClient
 from ingestion.rss_loop import DiscoveredFiling, RssDiscoveryLoop
@@ -106,6 +111,13 @@ class AgentComponents:
     rss_discovery_loop: RssDiscoveryLoop | None = None
     detail_fetcher: DetailFetcher | None = None
     discovered_queue: asyncio.Queue[DiscoveredFiling] | None = None
+    # PDT-SUNSET-2026-06-04: ADR-009 — process-shared activation flag.
+    # Held on the components bundle so the agent loop can pass it to
+    # the OrderSubmitter (S-PDT-3) and the reconciler can refresh it.
+    pdt_state: PDTState | None = None
+    # PDT-SUNSET-2026-06-04: ADR-009 §"Pre-market deferred replay" —
+    # invoked once per session at boot by `AgentLoop._boot`.
+    deferred_replayer: Any | None = None
 
 
 def compose_agent(
@@ -255,6 +267,39 @@ def compose_agent(
         filings_lookup=make_journal_filings_lookup(journal.db_path),
     )
 
+    # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — activation gate. Read once
+    # at boot from the broker; refreshed every reconciler tick. The
+    # boot-time `get_account()` call is needed regardless of pdt_enabled
+    # so PDTState carries the real `last_equity` (the operator escape
+    # hatch suppresses the gate, not the read).
+    boot_account = broker.get_account()
+    pdt_state = PDTState.from_account(
+        boot_account, pdt_enabled=config.execution.pdt_enabled
+    )
+    log.info(
+        "pdt.boot",
+        extra={
+            "event": "pdt.boot",
+            "is_active": pdt_state.is_active(),
+            "last_equity": boot_account.last_equity,
+            "pdt_enabled": config.execution.pdt_enabled,
+        },
+    )
+    # PDT-SUNSET-2026-06-04: ADR-009 §3.2 — virtual exit scanner runs
+    # once per reconciler tick. Constructed here so the reconciler can
+    # be wired below.
+    virtual_exits_scanner = VirtualExitScanner(
+        broker=broker, journal=journal, pdt_state=pdt_state,
+    )
+    # PDT-SUNSET-2026-06-04: ADR-009 §"Pre-market deferred replay" —
+    # one-shot replayer invoked at boot from `AgentLoop._boot`. The
+    # boot path is the seam (no separate pre-market hook in v1); a
+    # deterministic client_order_id + Alpaca's idempotent dedup
+    # protects against double-fire on rapid restart.
+    deferred_replayer = DeferredSellReplayer(
+        broker=broker, journal=journal,
+    )
+
     # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.
     # S5.6 carry-fwd S6.5 reviewer M-3 (HIGH): wire the Telegram alerter
     # at construction so position-discrepancy notifications reach the
@@ -270,6 +315,11 @@ def compose_agent(
         alerter=_TelegramAlerterAdapter(telegram),
         retro_coordinator=retro_coordinator,
         thesis_coordinator=thesis_coordinator,
+        # PDT-SUNSET-2026-06-04: refresh the activation flag once per
+        # successful reconcile tick. ADR-009 §3.1.
+        pdt_state=pdt_state,
+        pdt_enabled=config.execution.pdt_enabled,
+        virtual_exits_scanner=virtual_exits_scanner,
     )
 
     # AlertWatcher (S8.2) — must be constructed AFTER migrations have
@@ -332,6 +382,9 @@ def compose_agent(
         rss_discovery_loop=rss_discovery_loop,
         detail_fetcher=detail_fetcher,
         discovered_queue=discovered_queue,
+        # PDT-SUNSET-2026-06-04: ADR-009 wiring.
+        pdt_state=pdt_state,
+        deferred_replayer=deferred_replayer,
     )
 
     # Lazy import to keep `app/composition.py` testable without pulling

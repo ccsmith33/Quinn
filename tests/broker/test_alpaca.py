@@ -890,3 +890,138 @@ def test_no_mode_branch_in_runtime_methods() -> None:
         next_def = src.find("def ", init_idx + 1)
         body_after_init = src[:init_idx] + src[next_def:]
         assert needle not in body_after_init, f"forbidden mode branch found: {needle!r}"
+
+
+# ---------------------------------------------------------------------------
+# PDT-SUNSET-2026-06-04: ADR-009 §3.4 — defensive 403 handler at the chokepoint.
+# Tests use a `_FakeAPIError` subclass that ALSO subclasses the real
+# `alpaca.common.exceptions.APIError` so `classify_pdt_403`'s isinstance
+# check fires. The existing fake-SDK tests above use `_FakeAPIError` (a
+# bare Exception) only because their `submit_order` test-paths predate
+# the wrap; those tests still pass because non-APIError exceptions
+# bypass the wrap's `except APIError` clause and propagate unchanged.
+# ---------------------------------------------------------------------------
+
+
+from alpaca.common.exceptions import APIError as _RealAPIError  # noqa: E402
+
+
+class _PDTFakeAPIError(_RealAPIError):
+    """Real-APIError subclass for the PDT 403 wrap tests."""
+
+    def __init__(
+        self, *, status_code: int, code: int | None = None,
+        message: str = "fake api error",
+    ) -> None:
+        Exception.__init__(self, message)
+        self._status_code = status_code
+        self._code = code
+
+    @property  # type: ignore[override]
+    def status_code(self) -> int | None:  # type: ignore[override]
+        return self._status_code
+
+    @property  # type: ignore[override]
+    def code(self) -> int | None:  # type: ignore[override]
+        return self._code
+
+
+def test_alpaca_submit_order_classifies_pdt_403(
+    paper_broker: AlpacaBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-009 §3.4: a 403 day-trade APIError is reraised as PDTBudgetExceeded."""
+    from execution.pdt_budget import PDTBudgetExceeded
+
+    # The wrap's `except APIError` clause resolves the name at runtime
+    # against `broker.alpaca.APIError`. The fake_sdk fixture replaces
+    # that binding with `_FakeAPIError` (bare Exception); restore it to
+    # the real class so our PDT subclass is matched.
+    monkeypatch.setattr(alpaca_mod, "APIError", _RealAPIError)
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_exception(
+        _PDTFakeAPIError(
+            status_code=403, code=40310100,
+            message="forbidden: client cannot day-trade",
+        )
+    )
+    req = OrderRequest(
+        symbol="AAPL", side="sell", qty=5, order_type="market",
+        tif="day", client_order_id="cid-pdt-1",
+    )
+    with pytest.raises(PDTBudgetExceeded):
+        paper_broker.submit_order(req)
+    assert len(fake_trading.submit_calls) == 1
+
+
+def test_alpaca_submit_order_passes_through_non_pdt_403(
+    paper_broker: AlpacaBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-PDT 403 (e.g. insufficient buying power) does NOT classify as
+    PDTBudgetExceeded — it surfaces as `BrokerRejected` (the wash-trade
+    hotfix domain type for non-retryable APIErrors). The PDT classifier
+    must not false-positive on non-PDT 403s."""
+    from broker.protocol import BrokerRejected
+    from execution.pdt_budget import PDTBudgetExceeded
+
+    monkeypatch.setattr(alpaca_mod, "APIError", _RealAPIError)
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_exception(
+        _PDTFakeAPIError(
+            status_code=403, code=40010001,
+            message="insufficient buying power",
+        )
+    )
+    req = OrderRequest(
+        symbol="AAPL", side="sell", qty=5, order_type="market",
+        tif="day", client_order_id="cid-pdt-2",
+    )
+    with pytest.raises(BrokerRejected) as excinfo:
+        paper_broker.submit_order(req)
+    assert not isinstance(excinfo.value, PDTBudgetExceeded)
+
+
+def test_alpaca_normalize_account_reads_pdt_fields(
+    paper_broker: AlpacaBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR-009 §3.3: `_normalize_account` reads `last_equity` +
+    `daytrade_count` defensively from the alpaca account object."""
+    fake_acct = SimpleNamespace(
+        equity="22300.0",
+        cash="5000.0",
+        buying_power="44600.0",
+        long_market_value="17300.0",
+        equity_previous_close="22000.0",
+        last_equity="22000.0",
+        daytrade_count=2,
+    )
+    monkeypatch.setattr(
+        paper_broker._trading, "get_account", lambda: fake_acct
+    )
+    snap = paper_broker.get_account()
+    assert snap.last_equity == 22_000.0
+    assert snap.daytrade_count == 2
+
+
+def test_alpaca_normalize_account_pdt_fields_defaults(
+    paper_broker: AlpacaBroker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the alpaca account object lacks `last_equity` /
+    `daytrade_count` (post-2026-07-06 API removal), defaults survive:
+    last_equity falls back to current equity, daytrade_count → 0
+    (feature naturally inerts).
+    """
+    fake_acct = SimpleNamespace(
+        equity="100000.0",
+        cash="50000.0",
+        buying_power="200000.0",
+        long_market_value="50000.0",
+        equity_previous_close="99000.0",
+    )  # no last_equity, no daytrade_count
+    monkeypatch.setattr(
+        paper_broker._trading, "get_account", lambda: fake_acct
+    )
+    snap = paper_broker.get_account()
+    assert snap.last_equity == 100_000.0  # fell back to equity
+    assert snap.daytrade_count == 0

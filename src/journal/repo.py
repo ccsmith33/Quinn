@@ -19,6 +19,7 @@ from observability.log_port import get_logger
 from .models import (
     AccountSnapshotRow,
     BackupRow,
+    DeferredSellRow,
     ExecutionRow,
     FilingRow,
     KillSwitchStateRow,
@@ -34,6 +35,7 @@ from .models import (
     ThesisReviewScheduleRow,
     UniverseMemberRow,
     UniverseSnapshotRow,
+    VirtualExitRow,
 )
 
 log = get_logger(__name__)
@@ -930,6 +932,198 @@ def get_latest_backup(db_path: str) -> BackupRow | None:
 
 
 # ---------------------------------------------------------------------------
+# PDT-SUNSET-2026-06-04: virtual_exits + deferred_sells (ADR-009).
+# Unlike the historically append-only tables above, these two have
+# explicitly-mutable state columns (`state`, `submitted_*`, `replayed_*`)
+# documented in ADR-009 §"Data model".
+# ---------------------------------------------------------------------------
+
+_VIRTUAL_EXIT_INSERT = """
+INSERT INTO virtual_exits (
+    execution_id, proposal_id, symbol, qty, role, entry_price,
+    stop_price, tp_price, state, notes
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def insert_virtual_exit(db_path: str, row: VirtualExitRow) -> int:
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            _VIRTUAL_EXIT_INSERT,
+            (
+                row.execution_id,
+                row.proposal_id,
+                row.symbol,
+                row.qty,
+                row.role,
+                row.entry_price,
+                row.stop_price,
+                row.tp_price,
+                row.state,
+                row.notes,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_active_virtual_exits(db_path: str) -> list[VirtualExitRow]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM virtual_exits WHERE state = 'active' "
+            "ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+    return [VirtualExitRow(**dict(r)) for r in rows]
+
+
+def list_active_virtual_exits_for_symbol(
+    db_path: str, symbol: str
+) -> list[VirtualExitRow]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM virtual_exits WHERE state = 'active' AND symbol = ? "
+            "ORDER BY created_at ASC, id ASC",
+            (symbol,),
+        ).fetchall()
+    return [VirtualExitRow(**dict(r)) for r in rows]
+
+
+def mark_virtual_exit_submitted(
+    db_path: str, vid: int, broker_order_id: str
+) -> None:
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE virtual_exits SET state = 'submitted', "
+                "submitted_at = CURRENT_TIMESTAMP, "
+                "submitted_broker_order_id = ? WHERE id = ?",
+                (broker_order_id, vid),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def mark_virtual_exit_obsolete(db_path: str, vid: int, reason: str) -> None:
+    """Set state='obsolete' and append `reason` to `notes`. The append
+    is delimited by '; ' so multiple obsolete reasons remain readable.
+    """
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE virtual_exits SET state = 'obsolete', "
+                "notes = CASE WHEN notes IS NULL OR notes = '' "
+                "THEN ? ELSE notes || '; ' || ? END "
+                "WHERE id = ?",
+                (reason, reason, vid),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+_DEFERRED_SELL_INSERT = """
+INSERT INTO deferred_sells (
+    virtual_exit_id, execution_id, proposal_id, symbol, qty, role,
+    trigger_price, ev_at_defer, deferred_reason, notes
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def insert_deferred_sell(db_path: str, row: DeferredSellRow) -> int:
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            _DEFERRED_SELL_INSERT,
+            (
+                row.virtual_exit_id,
+                row.execution_id,
+                row.proposal_id,
+                row.symbol,
+                row.qty,
+                row.role,
+                row.trigger_price,
+                row.ev_at_defer,
+                row.deferred_reason,
+                row.notes,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def list_unreplayed_deferred_sells(db_path: str) -> list[DeferredSellRow]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM deferred_sells WHERE replayed_at IS NULL "
+            "ORDER BY deferred_at ASC, id ASC"
+        ).fetchall()
+    return [DeferredSellRow(**dict(r)) for r in rows]
+
+
+# PDT-SUNSET-2026-06-04: S-PDT-5 supersede-race check. The replayer
+# queries this for each unreplayed deferred_sell to detect rows whose
+# source virtual_exit transitioned to 'submitted' (won the EV race on
+# a later same-session tick) or 'obsolete' (position closed externally
+# before next-session pre-market). Returns None if the virtual_exit
+# row is missing (shouldn't happen given FK, but defensive).
+def get_virtual_exit_state(db_path: str, vid: int) -> str | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT state FROM virtual_exits WHERE id = ?", (vid,)
+        ).fetchone()
+    if row is None:
+        return None
+    return str(row["state"])
+
+
+def mark_deferred_replayed(
+    db_path: str, did: int, broker_order_id: str
+) -> None:
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE deferred_sells SET replayed_at = CURRENT_TIMESTAMP, "
+                "replay_broker_order_id = ? WHERE id = ?",
+                (broker_order_id, did),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+# PDT-SUNSET-2026-06-04: ADR-009 §"Pre-market deferred replay" / S-PDT-5
+# AC-3 — closed-position skip path. Sets `replayed_at` so the row exits
+# the unreplayed queue without holding a broker order id; reason is
+# appended to `notes` for audit.
+def mark_deferred_skipped(db_path: str, did: int, reason: str) -> None:
+    """Drop a deferred_sells row from the unreplayed queue without a
+    broker submission. `replayed_at = CURRENT_TIMESTAMP`,
+    `replay_broker_order_id = NULL`, `reason` appended to notes.
+    """
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "UPDATE deferred_sells SET replayed_at = CURRENT_TIMESTAMP, "
+                "replay_broker_order_id = NULL, "
+                "notes = CASE WHEN notes IS NULL OR notes = '' "
+                "THEN ? ELSE notes || '; ' || ? END "
+                "WHERE id = ?",
+                (reason, reason, did),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+# ---------------------------------------------------------------------------
 # JournalRepo — thin object facade over the module-level functions.
 #
 # Stories that consume the journal (S6.1, S6.2, S6.4, S7.1, S7.4, S5.6) take a
@@ -961,6 +1155,47 @@ class JournalRepo:
     ) -> list[OrderRow]:
         """Reconciler hotfix — recent orders for `symbol` since `since`."""
         return get_orders_since(self.db_path, symbol=symbol, since=since)
+
+    # PDT-SUNSET-2026-06-04: ADR-009 — virtual exits + deferred sells.
+    # Bound on the facade so OrderSubmitter / VirtualExitScanner /
+    # DeferredSellReplayer can call them through the same JournalRepo
+    # the rest of the agent uses, instead of importing the module-
+    # level functions and threading `db_path` separately.
+    def insert_virtual_exit(self, row: VirtualExitRow) -> int:
+        return insert_virtual_exit(self.db_path, row)
+
+    def list_active_virtual_exits(self) -> list[VirtualExitRow]:
+        return list_active_virtual_exits(self.db_path)
+
+    def list_active_virtual_exits_for_symbol(
+        self, symbol: str
+    ) -> list[VirtualExitRow]:
+        return list_active_virtual_exits_for_symbol(self.db_path, symbol)
+
+    def mark_virtual_exit_submitted(
+        self, vid: int, broker_order_id: str
+    ) -> None:
+        mark_virtual_exit_submitted(self.db_path, vid, broker_order_id)
+
+    def mark_virtual_exit_obsolete(self, vid: int, reason: str) -> None:
+        mark_virtual_exit_obsolete(self.db_path, vid, reason)
+
+    def insert_deferred_sell(self, row: DeferredSellRow) -> int:
+        return insert_deferred_sell(self.db_path, row)
+
+    def list_unreplayed_deferred_sells(self) -> list[DeferredSellRow]:
+        return list_unreplayed_deferred_sells(self.db_path)
+
+    def get_virtual_exit_state(self, vid: int) -> str | None:
+        return get_virtual_exit_state(self.db_path, vid)
+
+    def mark_deferred_replayed(
+        self, did: int, broker_order_id: str
+    ) -> None:
+        mark_deferred_replayed(self.db_path, did, broker_order_id)
+
+    def mark_deferred_skipped(self, did: int, reason: str) -> None:
+        mark_deferred_skipped(self.db_path, did, reason)
 
     # positions, account_snapshots (S6.5 reconciler)
     def insert_position(self, row: PositionRow) -> int:

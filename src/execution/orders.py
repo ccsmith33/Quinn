@@ -4,15 +4,26 @@ For an `AcceptedProposal` (the validator + sizing combined output) the
 submitter:
 
   1. captures the pre-submission NBBO (`broker.get_quote`) per ADR-001;
-  2. submits a single atomic complex order:
-       - BRACKET when the proposal carries a take-profit price
-         (entry + stop-loss + take-profit, all created together);
-       - OTO     when the proposal has no take-profit
-         (entry + stop-loss only).
-  3. journals the execution row + one order row per leg.
+  2. submits the order(s) following ONE of two paths:
+       - PDT-SUNSET-2026-06-04 (ADR-009): under PDT mode the entry
+         is submitted alone (plain market/limit buy via
+         `broker.submit_order`); the protective stop and optional TP
+         are recorded as `virtual_exits` rows and managed in software.
+         Bracket/OTO is unsuitable here because pre-placing protective
+         legs at the broker is exactly what PDT mode exists to avoid
+         on a sub-$25k account.
+       - default flow: a single atomic complex order
+           - BRACKET when the proposal carries a take-profit price
+             (entry + stop-loss + take-profit, all created together);
+           - OTO     when the proposal has no take-profit
+             (entry + stop-loss only).
+  3. journals the execution row + one order row per leg (or
+     `virtual_exits` row(s) on the PDT path).
 
 Single code path for paper / live (D-007 sacred): no `if mode==...`
-branching here; the broker adapter is the seam.
+branching here; the broker adapter is the seam. The PDT branch is
+mode-agnostic with respect to paper/live — it depends only on
+`pdt_state.is_active()`.
 
 Hotfix 2026-05-07 (incident: 27 unprotected positions): the prior flow
 submitted entry, stop, and TP as three sequential `submit_order` calls.
@@ -53,10 +64,11 @@ from broker.protocol import (
     BracketOrderRequest,
     BrokerAdapter,
     BrokerRejected,
+    OrderRequest,
     Quote,
     SubmittedOrder,
 )
-from journal.models import ExecutionRow, OrderRow
+from journal.models import ExecutionRow, OrderRow, VirtualExitRow
 from observability.log_port import get_logger
 from proposal.schemas import TradeProposal
 
@@ -90,7 +102,9 @@ class AcceptedProposal:
 class SubmissionAccepted:
     execution_id: int
     entry_broker_order_id: str
-    stop_broker_order_id: str
+    # PDT-SUNSET-2026-06-04: ADR-009 — `None` under PDT mode (the
+    # protective leg lives in `virtual_exits`, not at the broker).
+    stop_broker_order_id: str | None
     take_profit_broker_order_id: str | None
 
 
@@ -106,6 +120,20 @@ SubmissionResult = SubmissionAccepted | SubmissionFailed
 class _JournalLike(Protocol):
     def insert_execution(self, row: ExecutionRow) -> int: ...
     def insert_order(self, row: OrderRow) -> int: ...
+    # PDT-SUNSET-2026-06-04: ADR-009 — only called from the
+    # `pdt_state.is_active()` branch; non-PDT path doesn't touch this.
+    def insert_virtual_exit(self, row: VirtualExitRow) -> int: ...
+
+
+class _PDTStateLike(Protocol):
+    """PDT-SUNSET-2026-06-04: structural protocol for `PDTState`.
+
+    Defined as a Protocol (not an import) so this module remains
+    decoupled from `execution.pdt_budget` (single-direction dependency:
+    consumers import from `pdt_budget`, not the other way around).
+    """
+
+    def is_active(self) -> bool: ...
 
 
 class _KillSwitchLike(Protocol):
@@ -124,11 +152,55 @@ class OrderSubmitter:
         broker: BrokerAdapter,
         journal: _JournalLike,
         ks: _KillSwitchLike,
+        # PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch".
+        # Optional so legacy call sites (and existing unit tests) keep
+        # working byte-for-byte. When omitted or `is_active() is False`,
+        # the entry-and-pre-place path runs unchanged.
+        pdt_state: _PDTStateLike | None = None,
     ) -> SubmissionResult:
         proposal = accepted_proposal.proposal
 
         # --- 1. Pre-submission NBBO (ADR-001) ---------------------------
         nbbo = broker.get_quote(proposal.symbol)
+
+        # PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch".
+        # Under PDT mode, submit ONLY the entry (a plain market/limit
+        # buy) and record stop/TP as `virtual_exits` rows. Bracket /
+        # OTO is *not* used here — pre-placing protective legs at the
+        # broker is precisely what PDT mode exists to avoid (a sub-$25k
+        # account would burn day-trades on every stop hit). The wash-
+        # trade race that motivated the bracket flow doesn't apply
+        # because no protective leg is submitted.
+        if pdt_state is not None and pdt_state.is_active():
+            entry_req = self._build_entry(accepted_proposal)
+            try:
+                entry_resp = broker.submit_order(entry_req)
+            except (BrokerRejected, BrokerUnavailable) as e:
+                log.error(
+                    "execution.submit.entry_failed_pdt_mode",
+                    extra={
+                        "event": "execution.submit.entry_failed_pdt_mode",
+                        "symbol": proposal.symbol,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                    },
+                )
+                execution_id = journal.insert_execution(
+                    ExecutionRow(
+                        proposal_id=accepted_proposal.proposal_id,
+                        decision="submission_failed",
+                        realized_size_pct=accepted_proposal.realized_pct,
+                        realized_dollar_size=accepted_proposal.realized_dollar_size,
+                        submitted_orders_json=json.dumps([]),
+                    )
+                )
+                return SubmissionFailed(
+                    reason="submission_failed", execution_id=execution_id
+                )
+            _ = ks  # not used on the PDT branch (no protective leg can fail)
+            return self._submit_with_virtual_exits(
+                accepted_proposal, entry_req, entry_resp, nbbo, journal
+            )
 
         # --- 2. Build + submit the bracket / OTO order ----------------
         # Single atomic call: either every leg is created at the broker
@@ -336,6 +408,212 @@ class OrderSubmitter:
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
             final_status=resp.status,
+        )
+
+
+    # ------------------------------------------------------------------
+    # PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch".
+    # The helpers below build plain (non-bracket) entry/stop/TP requests
+    # and the entry OrderRow used by the virtual-exit path. They mirror
+    # the pre-hotfix flow but are reachable ONLY from the PDT branch;
+    # the bracket flow above does not call them.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_entry(ap: AcceptedProposal) -> OrderRequest:
+        p = ap.proposal
+        if p.entry_style == "limit":
+            assert p.entry_limit_price is not None  # enforced by TradeProposal validator
+            return OrderRequest(
+                symbol=p.symbol,
+                side="buy",
+                qty=ap.qty,
+                order_type="limit",
+                tif="day",
+                client_order_id=f"prop-{ap.proposal_id}-entry",
+                limit_price=p.entry_limit_price,
+            )
+        return OrderRequest(
+            symbol=p.symbol,
+            side="buy",
+            qty=ap.qty,
+            order_type="market",
+            tif="day",
+            client_order_id=f"prop-{ap.proposal_id}-entry",
+        )
+
+    @staticmethod
+    def _build_stop(ap: AcceptedProposal) -> OrderRequest:
+        p = ap.proposal
+        return OrderRequest(
+            symbol=p.symbol,
+            side="sell",
+            qty=ap.qty,
+            order_type="stop",
+            tif="gtc",
+            client_order_id=f"prop-{ap.proposal_id}-stop",
+            stop_price=p.stop_loss_price,
+        )
+
+    @staticmethod
+    def _build_take_profit(ap: AcceptedProposal) -> OrderRequest | None:
+        p = ap.proposal
+        if p.take_profit_price is None:
+            return None
+        return OrderRequest(
+            symbol=p.symbol,
+            side="sell",
+            qty=ap.qty,
+            order_type="limit",
+            tif="gtc",
+            client_order_id=f"prop-{ap.proposal_id}-tp",
+            limit_price=p.take_profit_price,
+        )
+
+    @staticmethod
+    def _entry_row(
+        execution_id: int,
+        ap: AcceptedProposal,
+        req: OrderRequest,
+        resp: SubmittedOrder,
+        nbbo: Quote,
+        notes: str | None = None,
+    ) -> OrderRow:
+        return OrderRow(
+            execution_id=execution_id,
+            role="entry",
+            symbol=req.symbol,
+            side=req.side,
+            order_type=req.order_type,
+            qty=req.qty,
+            limit_price=req.limit_price,
+            stop_price=req.stop_price,
+            tif=req.tif,
+            broker_order_id=resp.broker_order_id,
+            submitted_at=resp.submitted_at,
+            pre_submission_bid=nbbo.bid,
+            pre_submission_ask=nbbo.ask,
+            pre_submission_last=nbbo.last,
+            pre_submission_quote_at=nbbo.ts,
+            final_status=resp.status,
+            notes=notes,
+        )
+
+    def _submit_with_virtual_exits(
+        self,
+        ap: AcceptedProposal,
+        entry_req: OrderRequest,
+        entry_resp: SubmittedOrder,
+        nbbo: Quote,
+        journal: _JournalLike,
+    ) -> SubmissionAccepted:
+        """Entry succeeded; record protective legs as `virtual_exits` rows
+        instead of submitting them to the broker.
+
+        Journal write order (AC-4): execution → entry order → virtual
+        exits (stop, then optional TP). Crash window between any two
+        writes leaves the position open with NO virtual exit; the
+        reconciler discrepancy path (existing behavior) catches it.
+        """
+        p = ap.proposal
+        stop_req = self._build_stop(ap)
+        tp_req = self._build_take_profit(ap)
+
+        # Build submitted_orders_json placeholder; virtual_exit_ids fill
+        # in after the inserts (audit trail per AC-6).
+        submitted: list[dict[str, object]] = [
+            {"broker_order_id": entry_resp.broker_order_id, "role": "entry"},
+        ]
+        execution_id = journal.insert_execution(
+            ExecutionRow(
+                proposal_id=ap.proposal_id,
+                decision="accepted",
+                realized_size_pct=ap.realized_pct,
+                realized_dollar_size=ap.realized_dollar_size,
+                # Final json patched below after the virtual_exit ids are
+                # known. Insert with the entry-only placeholder so the
+                # FK chain is valid even if a later step crashes.
+                submitted_orders_json=json.dumps(submitted),
+            )
+        )
+        journal.insert_order(
+            self._entry_row(execution_id, ap, entry_req, entry_resp, nbbo)
+        )
+
+        # ADR-009 §3.5 / §6 — entry_price = nbbo.last (closest-to-fill
+        # pre-fill price). EV ranking later compares current_price
+        # against this.
+        stop_vid = journal.insert_virtual_exit(
+            VirtualExitRow(
+                execution_id=execution_id,
+                proposal_id=ap.proposal_id,
+                symbol=p.symbol,
+                qty=ap.qty,
+                role="stop",
+                entry_price=nbbo.last,
+                stop_price=stop_req.stop_price,
+                state="active",
+            )
+        )
+        submitted.append({
+            "broker_order_id": None,
+            "role": "stop",
+            "virtual": True,
+            "virtual_exit_id": stop_vid,
+        })
+
+        tp_vid: int | None = None
+        if tp_req is not None:
+            tp_vid = journal.insert_virtual_exit(
+                VirtualExitRow(
+                    execution_id=execution_id,
+                    proposal_id=ap.proposal_id,
+                    symbol=p.symbol,
+                    qty=ap.qty,
+                    role="tp",
+                    entry_price=nbbo.last,
+                    tp_price=tp_req.limit_price,
+                    state="active",
+                )
+            )
+            submitted.append({
+                "broker_order_id": None,
+                "role": "take_profit",
+                "virtual": True,
+                "virtual_exit_id": tp_vid,
+            })
+
+        log.info(
+            "pdt.virtual_exit.created",
+            extra={
+                "event": "pdt.virtual_exit.created",
+                "execution_id": execution_id,
+                "symbol": p.symbol,
+                "stop_virtual_exit_id": stop_vid,
+                "stop_price": stop_req.stop_price,
+                "tp_virtual_exit_id": tp_vid,
+                "tp_price": tp_req.limit_price if tp_req is not None else None,
+                "entry_price": nbbo.last,
+                "qty": ap.qty,
+            },
+        )
+        log.info(
+            "execution.submit.accepted",
+            extra={
+                "event": "execution.submit.accepted",
+                "symbol": p.symbol,
+                "execution_id": execution_id,
+                "entry_broker_order_id": entry_resp.broker_order_id,
+                "stop_broker_order_id": None,
+                "take_profit_broker_order_id": None,
+                "pdt_mode": True,
+            },
+        )
+        return SubmissionAccepted(
+            execution_id=execution_id,
+            entry_broker_order_id=entry_resp.broker_order_id,
+            stop_broker_order_id=None,
+            take_profit_broker_order_id=None,
         )
 
 

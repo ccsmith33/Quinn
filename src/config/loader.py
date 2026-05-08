@@ -61,6 +61,11 @@ class ExecutionConfig(_Section):
     ks7_cash_reserve_pct: float = Field(ge=0.0, le=1.0)
     sizing_mid_pct: float = Field(ge=0.0, le=1.0)
     sizing_high_pct: float = Field(ge=0.0, le=1.0)
+    # PDT-SUNSET-2026-06-04: ADR-009 §8 — operator escape hatch for the
+    # PDT day-trade budget feature. Default True so the feature is on by
+    # default; flip to False to short-circuit `PDTState.is_active()` and
+    # revert to broker-side pre-placement of stops/TPs.
+    pdt_enabled: bool = Field(default=True)
 
 
 class ReconcilerConfig(_Section):

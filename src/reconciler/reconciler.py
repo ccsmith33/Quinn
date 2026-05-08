@@ -26,7 +26,7 @@ import datetime as dt
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Any, Protocol
 
 from broker.alpaca import BrokerUnavailable
 from broker.protocol import AccountSnapshot, BrokerAdapter, Position
@@ -123,6 +123,16 @@ class Reconciler:
         now_fn: Callable[[], dt.datetime] = _utcnow,
         retro_coordinator: _RetroCoordinatorLike | None = None,
         thesis_coordinator: _RetroCoordinatorLike | None = None,
+        # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — activation flag holder.
+        # `None` disables the refresh hook (legacy test paths). When
+        # provided, the reconciler refreshes it after every successful
+        # tick using the just-reconciled `broker_account`.
+        pdt_state: Any | None = None,
+        pdt_enabled: bool = True,
+        # PDT-SUNSET-2026-06-04: ADR-009 §"Scanner hook" — invoked
+        # after retro/thesis on every successful, non-suppressed,
+        # non-deferred tick. None disables the hook.
+        virtual_exits_scanner: Any | None = None,
     ) -> None:
         self._broker = broker
         self._journal = journal
@@ -140,6 +150,10 @@ class Reconciler:
         # lifecycle gating as `_retro`: skipped on suppressed/deferred
         # ticks; errors logged and not propagated.
         self._thesis = thesis_coordinator
+        # PDT-SUNSET-2026-06-04: ADR-009 wiring.
+        self._pdt_state = pdt_state
+        self._pdt_enabled = pdt_enabled
+        self._virtual_exits_scanner = virtual_exits_scanner
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -222,6 +236,29 @@ class Reconciler:
                         "reconciler.thesis_tick_error",
                         extra={
                             "event": "reconciler.thesis_tick_error",
+                            "error": str(e),
+                            "error_class": type(e).__name__,
+                        },
+                    )
+
+            # PDT-SUNSET-2026-06-04: ADR-009 §"Scanner hook" — virtual
+            # exit scanner runs once per successful, non-suppressed,
+            # non-deferred tick. Same protective shape as retro/thesis:
+            # errors logged, never propagated; runs synchronously
+            # (scanner is sync).
+            if (
+                self._virtual_exits_scanner is not None
+                and report is not None
+                and not report.suppressed
+                and not report.deferred
+            ):
+                try:
+                    self._virtual_exits_scanner.run_tick()
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "reconciler.scanner_tick_error",
+                        extra={
+                            "event": "reconciler.scanner_tick_error",
                             "error": str(e),
                             "error_class": type(e).__name__,
                         },
@@ -314,6 +351,27 @@ class Reconciler:
                 daypl=broker_account.daypl,
             )
         )
+
+        # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — refresh activation flag
+        # AFTER the position-reconcile body succeeded (broker_account in
+        # hand) and BEFORE retro/thesis/scanner hooks fire. The refresh
+        # is idempotent (one comparison + two attribute writes) and
+        # makes no extra broker call. Errors are caught defensively so
+        # a refresh hiccup never aborts the reconcile tick.
+        if self._pdt_state is not None:
+            try:
+                self._pdt_state.refresh(
+                    broker_account, pdt_enabled=self._pdt_enabled
+                )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "reconciler.pdt_refresh_error",
+                    extra={
+                        "event": "reconciler.pdt_refresh_error",
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
 
         if not diffs:
             log.info(

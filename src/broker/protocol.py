@@ -132,6 +132,15 @@ class AccountSnapshot(_Domain):
     long_market_value: float
     daypl: float
     snapshot_at: dt.datetime
+    # PDT-SUNSET-2026-06-04: ADR-009 §3.3 — `last_equity` is Alpaca's
+    # previous-day-close equity (drives the `< 25k` activation gate);
+    # `daytrade_count` is the rolling 5-business-day count. Defaults are
+    # backward-compatible for tests/code paths that don't yet pass them
+    # and survive Alpaca's planned 2026-07-06 field removal (last_equity
+    # falls back to current equity at the boundary; daytrade_count → 0
+    # naturally inerts the budget arithmetic).
+    last_equity: float = 0.0
+    daytrade_count: int = 0
 
 
 class Position(_Domain):

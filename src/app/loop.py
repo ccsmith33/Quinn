@@ -309,6 +309,25 @@ class AgentLoop:
         if recon_start is not None:
             await recon_start()
         await self._crash_recovery_scan()
+        # PDT-SUNSET-2026-06-04: ADR-009 §"Pre-market deferred replay"
+        # / S-PDT-5 AC-5 — one-shot drain of `deferred_sells` rows
+        # whose `deferred_at` is from a prior ET trading day. Boot is
+        # the seam (no separate pre-market hook in v1); the replayer
+        # is idempotent on duplicate client_order_id (AC-6). Errors
+        # are logged inside `run()` and never propagate.
+        replayer = self._components.deferred_replayer
+        if replayer is not None:
+            try:
+                replayer.run()
+            except Exception as e:  # noqa: BLE001 — defensive only.
+                log.error(
+                    "agent.deferred_replayer_error",
+                    extra={
+                        "event": "agent.deferred_replayer_error",
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
         log.info("agent.boot_complete", extra={"event": "agent.boot_complete"})
 
     async def _crash_recovery_scan(self) -> None:
@@ -722,6 +741,11 @@ class AgentLoop:
                 self._components.broker,
                 self._components.journal,
                 self._components.killswitch,
+                # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — branch on the
+                # process-shared activation flag. None on legacy/test
+                # paths short-circuits to the existing pre-placement
+                # behavior.
+                pdt_state=self._components.pdt_state,
             )
         except (BrokerRejected, BrokerUnavailable) as e:
             # The submitter writes journal rows for both branches and

@@ -1,8 +1,13 @@
 """Pydantic v2 row models mirroring architecture §8.1 tables."""
 
+# PDT-SUNSET-2026-06-04: VirtualExitRow + DeferredSellRow are part of the
+# PDT day-trade budget feature (ADR-009). Drop both with migration 004 on
+# FINRA PDT-rule retirement.
+
 from __future__ import annotations
 
 import datetime as dt
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
@@ -242,4 +247,40 @@ class BackupRow(_Row):
     sha256: str
     verified_at: dt.datetime | None = None
     verify_result: str | None = None
+    notes: str | None = None
+
+
+# PDT-SUNSET-2026-06-04: PDT day-trade budget rows (ADR-009 §"Data model").
+
+class VirtualExitRow(_Row):
+    id: int | None = None
+    execution_id: int
+    proposal_id: int
+    symbol: str
+    qty: int
+    role: Literal["stop", "tp"]
+    entry_price: float
+    stop_price: float | None = None
+    tp_price: float | None = None
+    state: Literal["active", "submitted", "obsolete"] = "active"
+    created_at: dt.datetime | None = None
+    submitted_at: dt.datetime | None = None
+    submitted_broker_order_id: str | None = None
+    notes: str | None = None
+
+
+class DeferredSellRow(_Row):
+    id: int | None = None
+    virtual_exit_id: int
+    execution_id: int
+    proposal_id: int
+    symbol: str
+    qty: int
+    role: Literal["stop", "tp", "thesis_close"]
+    trigger_price: float
+    ev_at_defer: float
+    deferred_at: dt.datetime | None = None
+    deferred_reason: Literal["ev_lost", "pdt_403"]
+    replayed_at: dt.datetime | None = None
+    replay_broker_order_id: str | None = None
     notes: str | None = None

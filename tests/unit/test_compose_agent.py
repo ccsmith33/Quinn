@@ -256,6 +256,110 @@ def test_compose_agent_wires_alert_watcher(
     )
 
 
+# ---------------------------------------------------------------------------
+# PDT-SUNSET-2026-06-04: ADR-009 §3.1 — boot-time PDTState wiring.
+# ---------------------------------------------------------------------------
+
+
+def _patch_broker_account(equity: float = 22_300.0):
+    """Helper: returns a context manager that replaces
+    `AlpacaBroker.get_account` with a stub returning a deterministic
+    AccountSnapshot. compose_agent calls get_account once at boot to
+    seed PDTState; the SDK is patched out at construction so we'd hit
+    a MagicMock chain otherwise."""
+    from broker.protocol import AccountSnapshot
+
+    snap = AccountSnapshot(
+        equity=equity, cash=equity, buying_power=equity * 2,
+        long_market_value=0.0, daypl=0.0,
+        snapshot_at=dt.datetime(2026, 5, 7, 14, 30, tzinfo=dt.UTC),
+        last_equity=equity, daytrade_count=0,
+    )
+    return patch("broker.alpaca.AlpacaBroker.get_account", return_value=snap)
+
+
+def test_compose_agent_constructs_pdt_state_from_boot_account(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """ADR-009 §3.1 / S-PDT-2 AC-6: compose_agent calls broker.get_account
+    once at boot and constructs a PDTState. Active flag reflects
+    `last_equity < 25000` AND `pdt_enabled`.
+    """
+    from app.composition import compose_agent
+    from execution.pdt_budget import PDTState
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+        _patch_broker_account(equity=22_300.0),
+    ):
+        loop = compose_agent(
+            cfg,
+            secrets=secrets,
+            journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    pdt_state = loop.components.pdt_state
+    assert isinstance(pdt_state, PDTState)
+    assert pdt_state.is_active() is True
+
+
+def test_compose_agent_pdt_state_inactive_above_threshold(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """`last_equity >= 25000` → inactive even with `pdt_enabled=True` (default)."""
+    from app.composition import compose_agent
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+        _patch_broker_account(equity=27_500.0),
+    ):
+        loop = compose_agent(
+            cfg, secrets=secrets, journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    assert loop.components.pdt_state is not None
+    assert loop.components.pdt_state.is_active() is False
+
+
+def test_compose_agent_reconciler_holds_pdt_state(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """The reconciler must be constructed with the same `PDTState`
+    instance held on AgentComponents — otherwise the tick refresh
+    target diverges from the consumer-visible state."""
+    from app.composition import compose_agent
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+        _patch_broker_account(equity=22_300.0),
+    ):
+        loop = compose_agent(
+            cfg, secrets=secrets, journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    rec = loop.components.reconciler
+    assert rec._pdt_state is loop.components.pdt_state
+    assert rec._pdt_enabled is True
+
+
 def test_compose_agent_paper_vs_live_only_differs_on_credentials(
     db_path: str, prompts_dir: Path, tmp_path: Path
 ) -> None:

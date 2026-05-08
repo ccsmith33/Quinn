@@ -227,9 +227,9 @@ def test_migration_003_succeeds_with_prior_orders_data(tmp_path: Path) -> None:
     ).fetchone()[0]
     assert pre_orders_count == 1
 
-    # Apply remaining migrations (003).
+    # Apply remaining migrations (003 + any later).
     final_version = apply_migrations(str(db))
-    assert final_version == 3
+    assert final_version >= 3
 
     with sqlite3.connect(str(db)) as conn:
         conn.execute("PRAGMA foreign_keys=ON")

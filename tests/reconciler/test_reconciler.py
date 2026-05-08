@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from typing import Any
 
 import pytest
 
@@ -743,3 +744,222 @@ async def test_lifecycle_start_calls_reconcile_then_stop_cancels() -> None:
     # tick interval hasn't elapsed; we test with sleep(0) immediate-tick
     # behavior — see Reconciler.start docstring.)
     assert broker.calls >= 1
+
+
+# ---------------------------------------------------------------------------
+# PDT-SUNSET-2026-06-04: ADR-009 §3.1 — activation gate refresh on tick.
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_refreshes_pdt_state_on_successful_tick() -> None:
+    """ADR-009 §3.1: after a successful reconcile, `pdt_state.refresh`
+    is called with the just-fetched broker_account."""
+    from execution.pdt_budget import PDTState
+
+    pos = [_position("ACME", 25)]
+    account = AccountSnapshot(
+        equity=22_300.0, cash=5_000.0, buying_power=44_600.0,
+        long_market_value=17_300.0, daypl=0.0,
+        snapshot_at=_MARKET_OPEN_TIME,
+        last_equity=22_000.0, daytrade_count=1,
+    )
+    broker = _FakeBroker(positions=pos, account=account)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    pdt_state = PDTState(_active=False, _last_equity=0.0)
+
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), now_fn=_now_market,
+        pdt_state=pdt_state, pdt_enabled=True,
+    )
+    rec.reconcile_now()
+
+    # Refresh ran and flipped `_active=True` (last_equity=22000 < 25000).
+    assert pdt_state.is_active() is True
+    assert pdt_state._last_equity == 22_000.0
+
+
+def test_reconcile_pdt_refresh_skipped_when_pdt_state_none() -> None:
+    """Legacy callers that don't pass `pdt_state` keep working unchanged."""
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+
+    # Construct without pdt_state (default None).
+    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
+    report = rec.reconcile_now()
+    assert report.matched is True
+    assert report.suppressed is False
+
+
+def test_reconcile_pdt_refresh_respects_pdt_enabled_false() -> None:
+    """`pdt_enabled=False` short-circuits the gate even when
+    last_equity is below threshold."""
+    from execution.pdt_budget import PDTState
+
+    pos = [_position("ACME", 25)]
+    account = AccountSnapshot(
+        equity=22_300.0, cash=5_000.0, buying_power=44_600.0,
+        long_market_value=17_300.0, daypl=0.0,
+        snapshot_at=_MARKET_OPEN_TIME,
+        last_equity=22_000.0, daytrade_count=0,
+    )
+    broker = _FakeBroker(positions=pos, account=account)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    pdt_state = PDTState(_active=True, _last_equity=22_000.0)
+
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), now_fn=_now_market,
+        pdt_state=pdt_state, pdt_enabled=False,
+    )
+    rec.reconcile_now()
+
+    # `pdt_enabled=False` forces inactive regardless of last_equity.
+    assert pdt_state.is_active() is False
+
+
+def test_reconcile_pdt_refresh_skipped_on_deferred_tick() -> None:
+    """Broker-unavailable path returns deferred=True and never calls
+    `pdt_state.refresh` — there's no fresh AccountSnapshot to feed it."""
+    from execution.pdt_budget import PDTState
+
+    broker = _FakeBroker(raise_seq=[BrokerUnavailable("offline")])
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    pdt_state = PDTState(_active=False, _last_equity=27_000.0)
+
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), now_fn=_now_market,
+        pdt_state=pdt_state, pdt_enabled=True,
+    )
+    report = rec.reconcile_now()
+
+    assert report.deferred is True
+    # Refresh did NOT run — state preserved.
+    assert pdt_state._last_equity == 27_000.0
+    assert pdt_state.is_active() is False
+
+
+# ---------------------------------------------------------------------------
+# PDT-SUNSET-2026-06-04: scanner hook (AC-11).
+# ---------------------------------------------------------------------------
+
+
+class _RecordingScanner:
+    def __init__(self, *, raises: Exception | None = None) -> None:
+        self.calls: int = 0
+        self._raises = raises
+
+    def run_tick(self) -> Any:
+        self.calls += 1
+        if self._raises is not None:
+            raise self._raises
+        from execution.virtual_exits import ScannerReport
+        return ScannerReport(0, 0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_run_loop_invokes_scanner_after_successful_tick() -> None:
+    """Scanner runs once per successful, non-suppressed, non-deferred tick."""
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    scanner = _RecordingScanner()
+    cfg = ReconcilerConfig(interval_seconds_market=1)
+    rec = Reconciler(
+        broker, journal, ks, cfg, now_fn=_now_market,
+        virtual_exits_scanner=scanner,
+    )
+    await rec.start()
+    await asyncio.sleep(0.05)
+    await rec.stop()
+    assert scanner.calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_run_loop_skips_scanner_on_suppressed_tick() -> None:
+    """Off-hours tick → suppressed=True → scanner skipped."""
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    scanner = _RecordingScanner()
+    cfg = ReconcilerConfig(interval_seconds_market=1)
+    rec = Reconciler(
+        broker, journal, ks, cfg, now_fn=_now_off,  # after-hours
+        virtual_exits_scanner=scanner,
+    )
+    await rec.start()
+    await asyncio.sleep(0.05)
+    await rec.stop()
+    # Suppressed ticks must not invoke the scanner.
+    assert scanner.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_loop_scanner_exception_does_not_crash_tick(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A scanner exception is logged at ERROR; reconciler continues."""
+    import logging
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    scanner = _RecordingScanner(raises=RuntimeError("scanner boom"))
+    cfg = ReconcilerConfig(interval_seconds_market=1)
+    rec = Reconciler(
+        broker, journal, ks, cfg, now_fn=_now_market,
+        virtual_exits_scanner=scanner,
+    )
+    with caplog.at_level(logging.ERROR, logger="reconciler.reconciler"):
+        await rec.start()
+        await asyncio.sleep(0.05)
+        await rec.stop()
+    assert scanner.calls >= 1
+    errors = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "reconciler.scanner_tick_error"
+    ]
+    assert len(errors) >= 1
+
+
+def test_reconcile_pdt_refresh_error_does_not_abort_tick(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A refresh exception is logged and swallowed; the reconcile tick
+    completes successfully."""
+    import logging
+
+    pos = [_position("ACME", 25)]
+    account = AccountSnapshot(
+        equity=22_300.0, cash=5_000.0, buying_power=44_600.0,
+        long_market_value=17_300.0, daypl=0.0,
+        snapshot_at=_MARKET_OPEN_TIME,
+        last_equity=22_000.0, daytrade_count=0,
+    )
+    broker = _FakeBroker(positions=pos, account=account)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+
+    class _BrokenPDTState:
+        def refresh(self, *_a, **_kw) -> bool:
+            raise RuntimeError("boom")
+
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), now_fn=_now_market,
+        pdt_state=_BrokenPDTState(), pdt_enabled=True,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="reconciler.reconciler"):
+        report = rec.reconcile_now()
+
+    assert report.matched is True
+    errors = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "reconciler.pdt_refresh_error"
+    ]
+    assert len(errors) == 1

@@ -235,6 +235,14 @@ def _normalize_submitted(alp: Any) -> SubmittedOrder:
 def _normalize_account(acct: Any) -> AccountSnapshot:
     equity = float(acct.equity)
     prev_close = float(getattr(acct, "equity_previous_close", equity) or equity)
+    # PDT-SUNSET-2026-06-04: ADR-009 §3.3 — defensive reads with
+    # defaults that survive Alpaca's planned 2026-07-06 field removal.
+    # `last_equity` falls back to current equity (keeps `< 25k` predicate
+    # functioning on intraday equity in the fallback case);
+    # `daytrade_count` falls back to 0 (which makes `budget_remaining=3`
+    # always — feature naturally inert post-API-removal).
+    last_equity = float(getattr(acct, "last_equity", equity) or equity)
+    daytrade_count = int(getattr(acct, "daytrade_count", 0) or 0)
     return AccountSnapshot(
         equity=equity,
         cash=float(acct.cash),
@@ -242,6 +250,8 @@ def _normalize_account(acct: Any) -> AccountSnapshot:
         long_market_value=float(acct.long_market_value),
         daypl=equity - prev_close,
         snapshot_at=dt.datetime.now(dt.UTC),
+        last_equity=last_equity,
+        daytrade_count=daytrade_count,
     )
 
 
@@ -313,7 +323,33 @@ class AlpacaBroker:
 
     def submit_order(self, req: OrderRequest) -> SubmittedOrder:
         alpaca_req = _to_alpaca_request(req)
-        raw = _retry(self._trading.submit_order, alpaca_req)
+        # PDT-SUNSET-2026-06-04: ADR-009 §3.4 — classify Alpaca's 403
+        # PDT rejection at the chokepoint and raise PDTBudgetExceeded
+        # so VirtualExitScanner can route the failed sell to
+        # `deferred_sells`. Non-PDT errors propagate as `BrokerRejected`
+        # (wash-trade hotfix 2026-05-07) — `_retry` already wraps
+        # non-retryable APIErrors before they reach this catch, so we
+        # inspect `__cause__` to recover the original APIError for
+        # classification.
+        # Local import to avoid a module-level cycle: pdt_budget imports
+        # `BrokerUnavailable` from this module.
+        from execution.pdt_budget import PDTBudgetExceeded, classify_pdt_403
+
+        try:
+            raw = _retry(self._trading.submit_order, alpaca_req)
+        except BrokerRejected as e:
+            cause = e.__cause__
+            if isinstance(cause, APIError) and classify_pdt_403(cause):
+                raise PDTBudgetExceeded(str(cause)) from cause
+            raise
+        except APIError as e:
+            # Defense-in-depth: should not occur post-hotfix (`_retry`
+            # wraps APIError → BrokerRejected), but a future change to
+            # `_retry` could re-expose APIError here. Keep the PDT
+            # classifier reachable on the raw form too.
+            if classify_pdt_403(e):
+                raise PDTBudgetExceeded(str(e)) from e
+            raise
         return _normalize_submitted(raw)
 
     def submit_bracket_order(

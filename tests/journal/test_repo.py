@@ -199,7 +199,14 @@ def test_prompt_and_proposal_lookup(db: str) -> None:
 
 
 def test_no_update_or_delete_on_append_only_tables() -> None:
-    """AC-5: defense-in-depth — repo.py contains no UPDATE/DELETE against append-only tables."""
+    """AC-5: defense-in-depth — repo.py contains no UPDATE/DELETE against append-only tables.
+
+    The PDT-feature tables `virtual_exits` and `deferred_sells` are
+    INTENTIONALLY excluded from this list — ADR-009 §"Data model" designs
+    them with mutable `state` / `replayed_at` columns and the four
+    UPDATE statements live in `mark_virtual_exit_submitted`,
+    `mark_virtual_exit_obsolete`, and `mark_deferred_replayed`.
+    """
     src = (Path(__file__).resolve().parent.parent.parent / "src" / "journal" / "repo.py").read_text(
         encoding="utf-8"
     )
@@ -222,6 +229,12 @@ def test_no_update_or_delete_on_append_only_tables() -> None:
         assert f"DELETE FROM {tbl}" not in upper, (
             f"DELETE on append-only table {tbl} found in repo.py"
         )
+    # PDT-SUNSET-2026-06-04: the four UPDATEs on virtual_exits + deferred_sells
+    # are an intentional carve-out per ADR-009. Asserting they exist locks in
+    # the design and lets the reviewer find the exact mutation sites.
+    assert "UPDATE VIRTUAL_EXITS SET STATE = 'SUBMITTED'" in upper
+    assert "UPDATE VIRTUAL_EXITS SET STATE = 'OBSOLETE'" in upper
+    assert "UPDATE DEFERRED_SELLS SET REPLAYED_AT = CURRENT_TIMESTAMP" in upper
 
 
 def test_concurrent_inserts_persist(db: str) -> None:

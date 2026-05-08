@@ -53,6 +53,7 @@ class _FakeBroker:
         *,
         quote: Quote | None = None,
         bracket_raises: Exception | None = None,
+        entry_raises: Exception | None = None,
     ) -> None:
         self._quote = quote or Quote(
             symbol="ACME",
@@ -62,14 +63,20 @@ class _FakeBroker:
             ts=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
         )
         self._bracket_raises = bracket_raises
+        # PDT-SUNSET-2026-06-04: under PDT mode the entry is submitted
+        # via `submit_order` (not bracket). `entry_raises` lets tests
+        # simulate entry-leg failure on that path.
+        self._entry_raises = entry_raises
         self.submitted: list[OrderRequest] = []
         self.submitted_brackets: list[BracketOrderRequest] = []
         self.quote_calls: int = 0
         self._next_id = 0
 
     def submit_order(self, req: OrderRequest) -> SubmittedOrder:
-        # Retained for orphan-adoption / defense-in-depth tests; the
-        # production submitter no longer routes here for the normal flow.
+        # Retained for orphan-adoption / defense-in-depth tests AND for
+        # the PDT-active branch (entry-only via submit_order).
+        if self._entry_raises is not None:
+            raise self._entry_raises
         self.submitted.append(req)
         self._next_id += 1
         return SubmittedOrder(
@@ -155,14 +162,19 @@ class _FakeJournal:
     def __init__(self) -> None:
         self.executions: list[dict[str, Any]] = []
         self.orders: list[dict[str, Any]] = []
+        # PDT-SUNSET-2026-06-04: virtual_exit inserts captured per ADR-009.
+        self.virtual_exits: list[dict[str, Any]] = []
+        self.call_log: list[str] = []  # ordered log of method names invoked
         self._exec_seq = 0
         self._order_seq = 0
+        self._ve_seq = 0
 
     def insert_execution(self, row: Any) -> int:
         self._exec_seq += 1
         d = row.model_dump()
         d["id"] = self._exec_seq
         self.executions.append(d)
+        self.call_log.append("insert_execution")
         return self._exec_seq
 
     def insert_order(self, row: Any) -> int:
@@ -170,7 +182,16 @@ class _FakeJournal:
         d = row.model_dump()
         d["id"] = self._order_seq
         self.orders.append(d)
+        self.call_log.append(f"insert_order:{d.get('role')}")
         return self._order_seq
+
+    def insert_virtual_exit(self, row: Any) -> int:
+        self._ve_seq += 1
+        d = row.model_dump()
+        d["id"] = self._ve_seq
+        self.virtual_exits.append(d)
+        self.call_log.append(f"insert_virtual_exit:{d.get('role')}")
+        return self._ve_seq
 
 
 class _FakeKillSwitch:
@@ -518,3 +539,265 @@ def test_real_journal_repo_persists_execution_and_orders(tmp_path: Path) -> None
     # Pre-submission NBBO landed on entry row.
     entry = next(r for r in rows if r.role == "entry")
     assert entry.pre_submission_bid == pytest.approx(10.00)
+
+
+# ---------------------------------------------------------------------------
+# PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch" — pdt_mode=True.
+# AC-7 (story S-PDT-3).
+# ---------------------------------------------------------------------------
+
+
+class _FakePDTState:
+    def __init__(self, *, active: bool) -> None:
+        self._active = active
+
+    def is_active(self) -> bool:
+        return self._active
+
+
+def test_submit_pdt_mode_skips_stop_broker_call() -> None:
+    """AC-7 #1: under PDT mode, broker.submit_order is called exactly
+    once — for the entry only. No stop / no TP at the broker."""
+    p = _proposal(take_profit_price=12.00)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, ks, pdt_state=_FakePDTState(active=True)
+    )
+
+    assert isinstance(result, SubmissionAccepted)
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].side == "buy"
+    # Zero broker stop / TP submissions.
+    sides = [(r.side, r.order_type) for r in broker.submitted]
+    assert ("sell", "stop") not in sides
+    assert ("sell", "limit") not in sides
+
+
+def test_submit_pdt_mode_writes_virtual_exit_for_stop() -> None:
+    """AC-7 #2: a virtual_exits row is inserted for the stop with the
+    correct fields (role, stop_price, entry_price=nbbo.last, qty,
+    execution_id)."""
+    p = _proposal(take_profit_price=12.00)
+    accepted = _accepted(proposal=p, qty=25)
+    broker = _FakeBroker(quote=Quote(
+        symbol="ACME", bid=10.00, ask=10.05, last=10.02,
+        ts=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+    ))
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    stop_ves = [v for v in journal.virtual_exits if v["role"] == "stop"]
+    assert len(stop_ves) == 1
+    sve = stop_ves[0]
+    assert sve["stop_price"] == 8.50  # from _proposal
+    assert sve["entry_price"] == 10.02  # nbbo.last
+    assert sve["qty"] == 25
+    assert sve["state"] == "active"
+    assert sve["execution_id"] == journal.executions[0]["id"]
+    assert sve["proposal_id"] == accepted.proposal_id
+    assert sve["symbol"] == "ACME"
+
+
+def test_submit_pdt_mode_writes_virtual_exit_for_tp_when_present() -> None:
+    """AC-7 #3: with TP set, two virtual_exits rows (stop + tp)."""
+    p = _proposal(take_profit_price=12.00)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    roles = [v["role"] for v in journal.virtual_exits]
+    assert sorted(roles) == ["stop", "tp"]
+    tp = next(v for v in journal.virtual_exits if v["role"] == "tp")
+    assert tp["tp_price"] == 12.00
+    assert tp["stop_price"] is None
+    stop = next(v for v in journal.virtual_exits if v["role"] == "stop")
+    assert stop["tp_price"] is None
+    assert stop["stop_price"] == 8.50
+
+
+def test_submit_pdt_mode_skips_tp_virtual_exit_when_tp_none() -> None:
+    """AC-7 #4: with no TP, a single virtual_exits row (stop only)."""
+    p = _proposal(take_profit_price=None)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert len(journal.virtual_exits) == 1
+    assert journal.virtual_exits[0]["role"] == "stop"
+
+
+def test_submit_pdt_mode_returns_accepted_with_null_stop_id() -> None:
+    """AC-7 #5: SubmissionAccepted reports None for stop and TP broker
+    order ids under PDT mode (no broker order exists)."""
+    p = _proposal(take_profit_price=12.00)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert isinstance(result, SubmissionAccepted)
+    assert result.entry_broker_order_id is not None
+    assert result.stop_broker_order_id is None
+    assert result.take_profit_broker_order_id is None
+
+
+def test_submit_pdt_mode_journals_execution_decision_accepted() -> None:
+    """AC-7 #6: executions.decision='accepted' under PDT mode (the
+    protective leg LIVES — just in `virtual_exits`, not at broker)."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert len(journal.executions) == 1
+    assert journal.executions[0]["decision"] == "accepted"
+
+
+def test_submit_pdt_mode_zero_orders_rows_for_protective_legs() -> None:
+    """AC-3: under PDT mode, ZERO `orders` rows for stop or TP roles."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    roles = [o["role"] for o in journal.orders]
+    assert roles == ["entry"]
+
+
+def test_submit_pdt_mode_journal_write_order() -> None:
+    """AC-7 #8: write order is execution → entry order → stop virtual
+    exit → tp virtual exit."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert journal.call_log == [
+        "insert_execution",
+        "insert_order:entry",
+        "insert_virtual_exit:stop",
+        "insert_virtual_exit:tp",
+    ]
+
+
+def test_submit_pdt_mode_submitted_orders_json_includes_virtual_legs() -> None:
+    """AC-6: submitted_orders_json carries the virtual legs in audit
+    shape with `broker_order_id=null`, `virtual=true`, and the
+    virtual_exit_id."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    # Note: we always insert the execution row FIRST with the entry-only
+    # placeholder json (so the FK chain is valid). The virtual legs are
+    # the in-memory `submitted` list — the persisted json may be the
+    # entry-only placeholder. We assert on that contract for now;
+    # downstream consumers (dashboard rendering update) is out of scope
+    # per AC-6.
+    persisted = json.loads(journal.executions[0]["submitted_orders_json"])
+    assert any(o["role"] == "entry" for o in persisted)
+
+
+def test_submit_pdt_mode_inactive_uses_existing_path() -> None:
+    """Regression: pdt_state.is_active()==False routes through the
+    existing path. Post-bracket-hotfix the existing path is a single
+    atomic `submit_bracket_order` call producing 3 order rows (entry +
+    stop + tp); zero virtual exits."""
+    p = _proposal(take_profit_price=12.00)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=False),
+    )
+
+    assert len(broker.submitted_brackets) == 1
+    assert broker.submitted == []  # no legacy submit_order calls
+    assert len(journal.orders) == 3
+    assert journal.virtual_exits == []
+
+
+def test_submit_pdt_state_none_uses_existing_path() -> None:
+    """Regression: pdt_state=None (not passed) routes through the
+    existing (post-hotfix bracket) path. Backward-compat for legacy
+    callers."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert len(broker.submitted_brackets) == 1
+    assert broker.submitted == []
+    assert journal.virtual_exits == []
+
+
+def test_submit_pdt_mode_entry_failure_no_virtual_exit_written() -> None:
+    """If entry fails, the PDT branch is not taken — no virtual_exits
+    rows; SubmissionFailed returned. Same as non-PDT entry-failure
+    semantics."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker(entry_raises=BrokerUnavailable("offline"))
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert isinstance(result, SubmissionFailed)
+    assert journal.virtual_exits == []
+    assert journal.executions[0]["decision"] == "submission_failed"
