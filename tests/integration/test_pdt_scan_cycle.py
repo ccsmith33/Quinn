@@ -192,3 +192,20 @@ def test_pdt_full_cycle_entry_then_scanner_submits_stop(tmp_path: Path) -> None:
         assert stop_row["submitted_at"] is not None
         # TP not crossed → still active.
         assert tp_row["state"] == "active"
+
+        # HOTFIX-2026-05-08: scanner must journal the sell to the orders
+        # table so the reconciler tolerance can explain the broker-position
+        # decrease. Look for a sell-side orders row matching the
+        # virtual_exit's broker_order_id.
+        sell_orders = conn.execute(
+            "SELECT id, role, symbol, side, order_type, qty, broker_order_id "
+            "FROM orders WHERE side='sell' ORDER BY id ASC"
+        ).fetchall()
+        assert len(sell_orders) == 1
+        sell = sell_orders[0]
+        assert sell["role"] == "stop"
+        assert sell["symbol"] == "AAPL"
+        assert sell["side"] == "sell"
+        assert sell["order_type"] == "market"
+        assert sell["qty"] == 5
+        assert sell["broker_order_id"] == stop_row["submitted_broker_order_id"]

@@ -26,7 +26,7 @@ from execution.virtual_exits import (
     VirtualExitScanner,
     compute_ev,
 )
-from journal.models import DeferredSellRow, VirtualExitRow
+from journal.models import DeferredSellRow, OrderRow, VirtualExitRow
 
 
 def _ve(
@@ -140,7 +140,9 @@ class _FakeJournal:
         self.submitted_marks: list[tuple[int, str]] = []
         self.obsolete_marks: list[tuple[int, str]] = []
         self.deferred_sells: list[DeferredSellRow] = []
+        self.orders: list[OrderRow] = []
         self._dseq = 0
+        self._oseq = 0
 
     def list_active_virtual_exits(self) -> list[VirtualExitRow]:
         return list(self._exits)
@@ -155,6 +157,12 @@ class _FakeJournal:
         self._dseq += 1
         self.deferred_sells.append(row)
         return self._dseq
+
+    # HOTFIX-2026-05-08: PDT sells must be journaled for reconciler tolerance.
+    def insert_order(self, row: OrderRow) -> int:
+        self._oseq += 1
+        self.orders.append(row)
+        return self._oseq
 
 
 class _FakeBroker:
@@ -474,8 +482,12 @@ def test_scanner_tp_uses_limit_order() -> None:
 
 def test_scanner_marks_submitted_with_broker_order_id() -> None:
     """On successful broker submit, mark_virtual_exit_submitted is
-    called with the broker's order id."""
-    exits = [_ve(id=5, role="stop", stop_price=100.0)]
+    called with the broker's order id.
+
+    HOTFIX-2026-05-08: also asserts insert_order was called so the
+    reconciler tolerance can explain the broker-position decrease.
+    """
+    exits = [_ve(id=5, role="stop", stop_price=100.0, execution_id=42)]
     j = _FakeJournal(exits=exits)
     b = _FakeBroker(quotes={"AAPL": 99.0})
     s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
@@ -484,6 +496,70 @@ def test_scanner_marks_submitted_with_broker_order_id() -> None:
     vid, boid = j.submitted_marks[0]
     assert vid == 5
     assert boid == "alp-pdt-1"
+    # HOTFIX-2026-05-08: journal got an orders row for the sell.
+    assert len(j.orders) == 1
+    o = j.orders[0]
+    assert o.execution_id == 42
+    assert o.role == "stop"
+    assert o.symbol == "AAPL"
+    assert o.side == "sell"
+    assert o.order_type == "market"
+    assert o.qty == 10
+    assert o.tif == "day"
+    assert o.broker_order_id == "alp-pdt-1"
+    assert o.submitted_at is not None
+    assert o.final_status == "accepted"
+
+
+def test_scanner_journals_tp_sell_with_take_profit_role() -> None:
+    """HOTFIX-2026-05-08: TP virtual exit submit → orders.role='take_profit'
+    (matching the entry-path bracket convention in src/execution/orders.py),
+    order_type='limit', limit_price=tp_price.
+    """
+    exits = [_ve(
+        id=8, role="tp", stop_price=None, tp_price=110.0,
+        entry_price=100.0, qty=5, execution_id=77,
+    )]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(quotes={"AAPL": 111.0})
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    s.run_tick()
+    assert len(j.orders) == 1
+    o = j.orders[0]
+    assert o.execution_id == 77
+    assert o.role == "take_profit"
+    assert o.side == "sell"
+    assert o.order_type == "limit"
+    assert o.limit_price == 110.0
+    assert o.qty == 5
+
+
+def test_scanner_does_not_journal_on_403_defer() -> None:
+    """HOTFIX-2026-05-08: a 403 (PDTBudgetExceeded) defers the row — no
+    broker order was created, so no orders row should be journaled."""
+    exits = [_ve(id=99, role="stop", stop_price=100.0, qty=5)]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(
+        quotes={"AAPL": 99.0},
+        submit_raises={"pdt-vexit-99": PDTBudgetExceeded("403")},
+    )
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    s.run_tick()
+    assert j.orders == []  # no broker submit succeeded → no journal row
+
+
+def test_scanner_does_not_journal_on_transient_failure() -> None:
+    """HOTFIX-2026-05-08: a transient BrokerUnavailable means no broker
+    submit succeeded — no orders row should be journaled."""
+    exits = [_ve(id=1, role="stop", stop_price=100.0, qty=5)]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(
+        quotes={"AAPL": 99.0},
+        submit_raises={"pdt-vexit-1": BrokerUnavailable("503")},
+    )
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    s.run_tick()
+    assert j.orders == []
 
 
 def test_scanner_emits_tick_log(

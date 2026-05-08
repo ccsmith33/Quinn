@@ -221,6 +221,23 @@ def test_pdt_full_replay_cycle(tmp_path: Path) -> None:
         v_state = journal.get_virtual_exit_state(row["virtual_exit_id"])
         assert v_state == "submitted"
 
+        # HOTFIX-2026-05-08: replayer must journal the sell to the orders
+        # table so the reconciler tolerance can explain the broker-position
+        # decrease. The orders row's broker_order_id matches
+        # deferred_sells.replay_broker_order_id.
+        sell_orders = conn.execute(
+            "SELECT role, symbol, side, order_type, qty, broker_order_id "
+            "FROM orders WHERE side='sell' ORDER BY id ASC"
+        ).fetchall()
+        assert len(sell_orders) == 1
+        sell = sell_orders[0]
+        assert sell["role"] == "stop"
+        assert sell["symbol"] == "AAPL"
+        assert sell["side"] == "sell"
+        assert sell["order_type"] == "market"
+        assert sell["qty"] == 5
+        assert sell["broker_order_id"] == row["replay_broker_order_id"]
+
 
 def test_pdt_replayer_skips_row_superseded_by_same_session_submit(
     tmp_path: Path,

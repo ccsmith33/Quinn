@@ -17,7 +17,7 @@ from broker.alpaca import BrokerUnavailable
 from broker.protocol import OrderRequest, Position, Quote, SubmittedOrder
 from execution.pdt_budget import PDTBudgetExceeded
 from execution.virtual_exits import DeferredSellReplayer, ReplayReport
-from journal.models import DeferredSellRow
+from journal.models import DeferredSellRow, OrderRow
 
 
 def _drow(
@@ -70,6 +70,10 @@ class _FakeJournal:
         # mark_virtual_exit_submitted calls so the replayer's source-V
         # transition to 'submitted' is testable.
         self.virtual_exits_submitted: list[tuple[int, str]] = []
+        # HOTFIX-2026-05-08: capture journaled sell orders so replayer
+        # paths can be verified to insert OrderRows for reconciler tolerance.
+        self.orders: list[OrderRow] = []
+        self._oseq = 0
 
     def list_active_virtual_exits(self) -> list: return []  # unused here
 
@@ -92,6 +96,12 @@ class _FakeJournal:
 
     def get_virtual_exit_state(self, vid: int) -> str | None:
         return self._ve_states.get(vid, "active")
+
+    # HOTFIX-2026-05-08: PDT sells must be journaled for reconciler tolerance.
+    def insert_order(self, row: OrderRow) -> int:
+        self._oseq += 1
+        self.orders.append(row)
+        return self._oseq
 
 
 class _FakeBroker:
@@ -180,8 +190,12 @@ def test_replayer_skips_today_rows() -> None:
 
 def test_replayer_replays_yesterday_row() -> None:
     """deferred_at=yesterday; position open → broker.submit called once;
-    row marked replayed; replay_broker_order_id set."""
-    j = _FakeJournal(unreplayed=[_drow(id=42, role="stop")])
+    row marked replayed; replay_broker_order_id set.
+
+    HOTFIX-2026-05-08: also asserts insert_order was called so the
+    reconciler tolerance can explain the broker-position decrease.
+    """
+    j = _FakeJournal(unreplayed=[_drow(id=42, role="stop", execution_id=200)])
     b = _FakeBroker()
     r = DeferredSellReplayer(broker=b, journal=j, now_fn=_now_premarket)
     report = r.run()
@@ -194,6 +208,19 @@ def test_replayer_replays_yesterday_row() -> None:
     assert submitted.qty == 5
     assert submitted.order_type == "market"  # stop → market replay
     assert j.replayed_marks == [(42, "alp-replay-1")]
+    # HOTFIX-2026-05-08: journal got an orders row for the sell.
+    assert len(j.orders) == 1
+    o = j.orders[0]
+    assert o.execution_id == 200
+    assert o.role == "stop"
+    assert o.symbol == "AAPL"
+    assert o.side == "sell"
+    assert o.order_type == "market"
+    assert o.qty == 5
+    assert o.tif == "day"
+    assert o.broker_order_id == "alp-replay-1"
+    assert o.submitted_at is not None
+    assert o.final_status == "accepted"
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +358,7 @@ def test_duplicate_client_order_id_reconciles() -> None:
         def status_code(self) -> int:  # type: ignore[override]
             return self._status_code
 
-    j = _FakeJournal(unreplayed=[_drow(id=55)])
+    j = _FakeJournal(unreplayed=[_drow(id=55, execution_id=400)])
     b = _FakeBroker(submit_responses={"pdt-replay-55": _DupAPIError()})
     # The previous boot's order is what the lookup returns.
     b.set_lookup_response("pdt-replay-55", SubmittedOrder(
@@ -345,6 +372,18 @@ def test_duplicate_client_order_id_reconciles() -> None:
     assert report.replayed == 1
     assert b.lookups == ["pdt-replay-55"]
     assert j.replayed_marks == [(55, "alp-prior-boot-1")]
+    # HOTFIX-2026-05-08: the duplicate-reconcile branch must also journal
+    # the sell so resumed-from-crash paths don't leave the reconciler
+    # halting. Uses the EXISTING (prior-boot) broker_order_id, not the
+    # failed dup-submit attempt.
+    assert len(j.orders) == 1
+    o = j.orders[0]
+    assert o.execution_id == 400
+    assert o.role == "stop"
+    assert o.broker_order_id == "alp-prior-boot-1"
+    assert o.side == "sell"
+    assert o.order_type == "market"
+    assert o.qty == 5
 
 
 # ---------------------------------------------------------------------------

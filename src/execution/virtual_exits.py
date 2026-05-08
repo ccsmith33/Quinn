@@ -39,14 +39,14 @@ from typing import Protocol
 from alpaca.common.exceptions import APIError
 
 from broker.alpaca import BrokerUnavailable
-from broker.protocol import BrokerAdapter, OrderRequest
+from broker.protocol import BrokerAdapter, OrderRequest, SubmittedOrder
 from config.calendar import ET
 from execution.pdt_budget import (
     PDTBudgetExceeded,
     PDTState,
     compute_budget_remaining,
 )
-from journal.models import DeferredSellRow, VirtualExitRow
+from journal.models import DeferredSellRow, OrderRow, VirtualExitRow
 from observability.log_port import get_logger
 
 log = get_logger(__name__)
@@ -67,6 +67,9 @@ class _JournalLike(Protocol):
     def mark_deferred_skipped(self, did: int, reason: str) -> None: ...
     # Supersede-race check (replayer-side guard).
     def get_virtual_exit_state(self, vid: int) -> str | None: ...
+    # HOTFIX-2026-05-08: PDT sells must be journaled for reconciler
+    # tolerance to explain the broker-position decrease.
+    def insert_order(self, row: OrderRow) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -300,6 +303,16 @@ class VirtualExitScanner:
                     },
                 )
                 continue
+            # HOTFIX-2026-05-08: PDT sells must be journaled for reconciler
+            # tolerance to explain the broker-position decrease.
+            self._journal.insert_order(
+                _build_sell_order_row(
+                    execution_id=r.execution_id,
+                    role=r.role,
+                    req=req,
+                    resp=resp,
+                )
+            )
             self._journal.mark_virtual_exit_submitted(
                 r.id, broker_order_id=resp.broker_order_id
             )
@@ -448,6 +461,41 @@ def _to_replay_request(d: DeferredSellRow) -> OrderRequest:
             client_order_id=f"pdt-replay-{d.id}",
         )
     raise ValueError(f"unsupported deferred_sells role: {d.role!r}")
+
+
+# HOTFIX-2026-05-08: PDT sells must be journaled for reconciler tolerance
+# to explain the broker-position decrease (otherwise the reconciler halts on
+# every virtual-stop fire). Map virtual_exits / deferred_sells role to the
+# journal `orders.role` convention used by the entry path
+# (src/execution/orders.py): "stop" → "stop", "tp" → "take_profit",
+# "thesis_close" → "thesis_close".
+def _order_role_for_pdt_sell(role: str) -> str:
+    if role == "tp":
+        return "take_profit"
+    return role
+
+
+def _build_sell_order_row(
+    *,
+    execution_id: int,
+    role: str,
+    req: OrderRequest,
+    resp: SubmittedOrder,
+) -> OrderRow:
+    return OrderRow(
+        execution_id=execution_id,
+        role=_order_role_for_pdt_sell(role),
+        symbol=req.symbol,
+        side=req.side,
+        order_type=req.order_type,
+        qty=req.qty,
+        limit_price=req.limit_price,
+        stop_price=req.stop_price,
+        tif=req.tif,
+        broker_order_id=resp.broker_order_id,
+        submitted_at=resp.submitted_at,
+        final_status=resp.status,
+    )
 
 
 def _is_duplicate_client_order_id(exc: BaseException) -> bool:
@@ -614,6 +662,19 @@ class DeferredSellReplayer:
                             req.client_order_id
                         )
                         if existing is not None and d.id is not None:
+                            # HOTFIX-2026-05-08: PDT sells must be journaled
+                            # for reconciler tolerance to explain the
+                            # broker-position decrease. Use the existing
+                            # (prior-boot) broker_order_id since this branch
+                            # reconciles with an order already at the broker.
+                            self._journal.insert_order(
+                                _build_sell_order_row(
+                                    execution_id=d.execution_id,
+                                    role=d.role,
+                                    req=req,
+                                    resp=existing,
+                                )
+                            )
                             self._journal.mark_deferred_replayed(
                                 d.id, broker_order_id=existing.broker_order_id
                             )
@@ -650,6 +711,17 @@ class DeferredSellReplayer:
                     continue
 
                 if d.id is not None:
+                    # HOTFIX-2026-05-08: PDT sells must be journaled for
+                    # reconciler tolerance to explain the broker-position
+                    # decrease.
+                    self._journal.insert_order(
+                        _build_sell_order_row(
+                            execution_id=d.execution_id,
+                            role=d.role,
+                            req=req,
+                            resp=resp,
+                        )
+                    )
                     self._journal.mark_deferred_replayed(
                         d.id, broker_order_id=resp.broker_order_id
                     )
