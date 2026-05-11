@@ -76,10 +76,16 @@ class ReconcilerConfig(_Section):
     # that just filled). If the recent orders fully account for the diff,
     # the reconciler treats it as expected — no halt — and snapshots the
     # broker's truth. Genuine unexplained divergence (manual broker
-    # action, corruption) still halts. Default 30 minutes covers the
-    # window between submission and the next reconciler tick plus a
-    # cushion for slow fills; raising it loosens the safety net.
-    expected_fill_window_minutes: int = Field(default=30, gt=0)
+    # action, corruption) still halts.
+    #
+    # HOTFIX-2026-05-11: default widened from 30 min to 7 days (10_080 min).
+    # `tif='day'` entries submitted on a Friday afternoon can fill at the
+    # following Monday open, ~64 h later — the old 30-minute window halted
+    # every Monday-morning fill burst against a Friday submission. A 7-day
+    # window comfortably spans a weekend + a long-weekend holiday and is
+    # still bounded enough that genuinely stale broker-side state (a manual
+    # operator action a week ago) won't slip through silently.
+    expected_fill_window_minutes: int = Field(default=10_080, gt=0)
 
 
 class KillSwitchConfig(_Section):

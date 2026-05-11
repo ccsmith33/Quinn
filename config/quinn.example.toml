@@ -62,7 +62,11 @@ interval_seconds_market = 300
 # reconciler does not halt (it just snapshots broker truth). Genuine
 # unexplained divergence still halts. Raise to loosen the safety net,
 # lower to tighten it.
-expected_fill_window_minutes = 30
+# HOTFIX-2026-05-11: widened from 30 min to 7 days (10_080) so a `tif=day`
+# entry submitted Friday afternoon and filled at Monday open (~64h later)
+# is still explainable. Bounded enough that genuinely stale state from a
+# week ago won't slip through silently.
+expected_fill_window_minutes = 10080
 
 [killswitch]
 ks1_daily_loss_pct = 0.03

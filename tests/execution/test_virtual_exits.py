@@ -421,7 +421,13 @@ def test_scanner_unrelated_broker_unavailable_skips_no_defer(
 
 def test_scanner_position_closed_externally_marks_obsolete() -> None:
     """AC-9 #16 / AC-7: virtual exit for symbol not in broker positions
-    → row marked obsolete; not submitted; not deferred."""
+    → row marked obsolete; not submitted; not deferred.
+
+    HOTFIX-2026-05-11: post-grace behavior. The closed-externally check
+    now requires N consecutive missing ticks (default 3) before firing.
+    A genuine manual close still ends up marked obsolete; this regression
+    asserts that final state.
+    """
     exits = [_ve(id=42, symbol="MSFT", role="stop", stop_price=100.0)]
     j = _FakeJournal(exits=exits)
     # broker has AAPL but no MSFT
@@ -433,11 +439,104 @@ def test_scanner_position_closed_externally_marks_obsolete() -> None:
         quotes={"AAPL": 99.0},
     )
     s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    # Three consecutive missing ticks to clear the grace.
+    s.run_tick()
+    s.run_tick()
     report = s.run_tick()
     assert j.obsolete_marks == [(42, "position_closed_externally")]
     assert b.submitted == []
     assert j.deferred_sells == []
     assert report.submitted == 0
+
+
+# HOTFIX-2026-05-11: consecutive-miss grace before marking
+# position_closed_externally. Prevents the open-of-day fill-burst race
+# where get_positions() reports stale (pre-9:30) state and the scanner
+# nukes virtual_exits for not-yet-filled symbols.
+
+def test_scanner_grace_period_first_miss_does_not_mark_obsolete() -> None:
+    """HOTFIX-2026-05-11: virtual_exit for symbol X; broker.get_positions()
+    doesn't report X. On the first miss the row must remain active and
+    not be marked obsolete — it's a fill-burst transient.
+    """
+    exits = [_ve(id=99, symbol="MSFT", role="stop", stop_price=100.0)]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(
+        positions=[Position(
+            symbol="AAPL", qty=10, avg_entry_price=100.0,
+            market_value=1000.0, unrealized_pnl=0.0,
+        )],
+        quotes={"AAPL": 99.0, "MSFT": 99.0},
+    )
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    report = s.run_tick()
+    # The exit is NOT yet marked obsolete (grace period covers transient
+    # open-of-day fill-burst).
+    assert j.obsolete_marks == []
+    assert report.submitted == 0
+
+
+def test_scanner_grace_period_clears_on_position_reappearing() -> None:
+    """HOTFIX-2026-05-11: if the position later reappears in
+    broker.get_positions() (fill landed), the miss counter must reset so
+    a future transient miss restarts the grace period (no permanent
+    flag).
+    """
+    exits = [_ve(id=99, symbol="MSFT", role="stop", stop_price=100.0)]
+    j = _FakeJournal(exits=exits)
+
+    b = _FakeBroker(
+        positions=[Position(
+            symbol="AAPL", qty=10, avg_entry_price=100.0,
+            market_value=1000.0, unrealized_pnl=0.0,
+        )],
+        quotes={"AAPL": 99.0, "MSFT": 99.0},
+    )
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    # Two consecutive missing ticks — still under threshold.
+    s.run_tick()
+    s.run_tick()
+    assert j.obsolete_marks == []
+    # MSFT fill arrives — position present this tick. Counter resets.
+    b._positions = [
+        Position(symbol="AAPL", qty=10, avg_entry_price=100.0,
+                 market_value=1000.0, unrealized_pnl=0.0),
+        Position(symbol="MSFT", qty=10, avg_entry_price=100.0,
+                 market_value=1000.0, unrealized_pnl=0.0),
+    ]
+    s.run_tick()
+    assert j.obsolete_marks == []
+    # MSFT vanishes again — counter restarted from zero, so two more
+    # consecutive misses still don't trip.
+    b._positions = [
+        Position(symbol="AAPL", qty=10, avg_entry_price=100.0,
+                 market_value=1000.0, unrealized_pnl=0.0),
+    ]
+    s.run_tick()
+    s.run_tick()
+    assert j.obsolete_marks == []
+
+
+def test_scanner_marks_obsolete_after_consecutive_misses_threshold() -> None:
+    """HOTFIX-2026-05-11: a position genuinely closed externally (manual
+    sell via the broker UI) is still detected and marked obsolete — just
+    after a short grace delay. Threshold is 3 consecutive misses.
+    """
+    exits = [_ve(id=42, symbol="MSFT", role="stop", stop_price=100.0)]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(
+        positions=[Position(
+            symbol="AAPL", qty=10, avg_entry_price=100.0,
+            market_value=1000.0, unrealized_pnl=0.0,
+        )],
+        quotes={"AAPL": 99.0, "MSFT": 99.0},
+    )
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    s.run_tick()  # miss 1
+    s.run_tick()  # miss 2
+    assert j.obsolete_marks == []
+    s.run_tick()  # miss 3 — trips the grace; mark obsolete.
+    assert j.obsolete_marks == [(42, "position_closed_externally")]
 
 
 def test_scanner_client_order_id_is_pdt_vexit_id() -> None:

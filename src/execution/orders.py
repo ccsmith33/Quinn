@@ -163,6 +163,43 @@ class OrderSubmitter:
         # --- 1. Pre-submission NBBO (ADR-001) ---------------------------
         nbbo = broker.get_quote(proposal.symbol)
 
+        # HOTFIX-2026-05-11: inverted-stop guardrail. 2026-05-08 AORT
+        # (proposal 1035) — analyzer (Haiku) produced
+        # `stop_loss_price=30.5` for a long entry that filled at ~$25.31.
+        # The scanner fired the crossed stop on the very next tick after
+        # entry, instant-self-sell, one PDT slot burned for ~$19.85 of
+        # locked loss. Reject before any broker round-trip on both the
+        # PDT and bracket paths. `nbbo.last` is the pre-submission price
+        # reference the virtual_exit / bracket code uses elsewhere; using
+        # it here keeps semantics consistent and adds no new broker
+        # fetch. The schema currently restricts `direction` to "long";
+        # the short branch is scaffolded for forward-compat.
+        if self._is_inverted_stop(proposal, entry_price=nbbo.last):
+            log.error(
+                "executor.invalid_stop_rejected",
+                extra={
+                    "event": "executor.invalid_stop_rejected",
+                    "proposal_id": accepted_proposal.proposal_id,
+                    "symbol": proposal.symbol,
+                    "direction": proposal.direction,
+                    "entry_price": nbbo.last,
+                    "stop_price": proposal.stop_loss_price,
+                },
+            )
+            execution_id = journal.insert_execution(
+                ExecutionRow(
+                    proposal_id=accepted_proposal.proposal_id,
+                    decision="submission_failed",
+                    realized_size_pct=accepted_proposal.realized_pct,
+                    realized_dollar_size=accepted_proposal.realized_dollar_size,
+                    submitted_orders_json=json.dumps([]),
+                )
+            )
+            _ = ks  # no halt — pre-submission rejection creates no exposure
+            return SubmissionFailed(
+                reason="submission_failed", execution_id=execution_id
+            )
+
         # PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch".
         # Under PDT mode, submit ONLY the entry (a plain market/limit
         # buy) and record stop/TP as `virtual_exits` rows. Bracket /
@@ -292,6 +329,30 @@ class OrderSubmitter:
             stop_broker_order_id=stop_resp.broker_order_id,
             take_profit_broker_order_id=tp_resp.broker_order_id if tp_resp else None,
         )
+
+    # ------------------------------------------------------------------
+    # HOTFIX-2026-05-11: inverted-stop guardrail
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_inverted_stop(
+        proposal: TradeProposal, *, entry_price: float
+    ) -> bool:
+        """Return True when the proposal's protective stop is wrong-side
+        of `entry_price` — i.e., the stop would fire immediately on or
+        right after entry.
+
+        Long: stop must sit strictly below entry, else the next tick
+        crosses the threshold and the position self-sells.
+        Short: stop must sit strictly above entry (scaffolded for future;
+        TradeProposal.direction is currently constrained to "long" by
+        the schema).
+        """
+        sp = proposal.stop_loss_price
+        if proposal.direction == "long":
+            return sp >= entry_price
+        # direction == 'short' (forward-compat scaffolding):
+        return sp <= entry_price
 
     # ------------------------------------------------------------------
     # Bracket / OTO order builder

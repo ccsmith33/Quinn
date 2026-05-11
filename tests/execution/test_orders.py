@@ -801,3 +801,178 @@ def test_submit_pdt_mode_entry_failure_no_virtual_exit_written() -> None:
     assert isinstance(result, SubmissionFailed)
     assert journal.virtual_exits == []
     assert journal.executions[0]["decision"] == "submission_failed"
+
+
+# ---------------------------------------------------------------------------
+# HOTFIX-2026-05-11: inverted-stop guardrail (executor rejects long entries
+# whose stop_loss_price >= entry_price). Symptom: 2026-05-08 AORT
+# (proposal 1035) where analyzer Haiku produced stop_loss_price=30.5 for a
+# long entry that filled at ~$25.31. Scanner immediately fired the crossed
+# stop on the next tick after entry; instant-self-sell wasted a PDT slot.
+# ---------------------------------------------------------------------------
+
+def test_pdt_long_entry_rejects_inverted_stop() -> None:
+    """HOTFIX-2026-05-11: long entry whose stop is at or above the
+    pre-submission last price must NOT be submitted. Execution row
+    recorded as submission_failed; zero broker entry calls; zero
+    virtual_exits.
+    """
+    # Quote last = 10.02; stop_loss_price = 15.00 → inverted for a long.
+    accepted = _accepted(
+        proposal=_proposal(),  # default stop_loss_price=8.50; override below
+    )
+    # Build a proposal with an explicitly inverted stop. _proposal's
+    # `stop_loss_price` default is 8.50; we need to override to 15.00
+    # while still passing schema validation (gt=0 — fine).
+    p = TradeProposal.model_validate({
+        "symbol": "AORT",
+        "direction": "long",
+        "size_pct_of_capital": 0.05,
+        "entry_style": "market_open",
+        "stop_loss_price": 15.00,  # > nbbo.last=10.02 → inverted
+        "time_horizon_days": 10,
+        "conviction": 8,
+        "thesis": (
+            "Strong fundamentals with material 8-K disclosure indicating "
+            "near-term catalyst per filing analysis."
+        ),
+        "signals": ["8-K item 2.02 strong earnings beat"],
+        "exit_conditions": ["thesis breaks; stop hit; 30 days elapsed"],
+        "risk_factors": ["macro risk; sector rotation; news risk"],
+    })
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, ks,
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert isinstance(result, SubmissionFailed)
+    assert result.reason == "submission_failed"
+    # NO entry submission attempted.
+    assert broker.submitted == []
+    # No virtual_exits — entry never happened.
+    assert journal.virtual_exits == []
+    # Execution row records the rejection so the audit trail is intact.
+    assert len(journal.executions) == 1
+    assert journal.executions[0]["decision"] == "submission_failed"
+    # No KS halt — the rejection is purely defensive; no exposure created.
+    assert ks.halts == []
+
+
+def test_pdt_long_entry_rejects_stop_equal_to_entry_price() -> None:
+    """HOTFIX-2026-05-11: stop_loss_price exactly equal to nbbo.last is
+    also rejected — a stop at-or-above entry on a long crosses
+    immediately (stops are inclusive on the boundary).
+    """
+    p = TradeProposal.model_validate({
+        "symbol": "AORT",
+        "direction": "long",
+        "size_pct_of_capital": 0.05,
+        "entry_style": "market_open",
+        "stop_loss_price": 10.02,  # == nbbo.last
+        "time_horizon_days": 10,
+        "conviction": 8,
+        "thesis": (
+            "Strong fundamentals with material 8-K disclosure indicating "
+            "near-term catalyst per filing analysis."
+        ),
+        "signals": ["8-K item 2.02 strong earnings beat"],
+        "exit_conditions": ["thesis breaks; stop hit; 30 days elapsed"],
+        "risk_factors": ["macro risk; sector rotation; news risk"],
+    })
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert isinstance(result, SubmissionFailed)
+    assert broker.submitted == []
+    assert journal.virtual_exits == []
+
+
+def test_pdt_long_entry_accepts_valid_stop_below_entry() -> None:
+    """HOTFIX-2026-05-11 regression: a legitimate stop below entry price
+    is still accepted on the PDT path.
+    """
+    # Default _proposal: stop_loss_price=8.50, _FakeBroker quote.last=10.02
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert isinstance(result, SubmissionAccepted)
+    # Entry submitted, virtual_exits written.
+    assert len(broker.submitted) == 1
+    stop_ves = [v for v in journal.virtual_exits if v["role"] == "stop"]
+    assert len(stop_ves) == 1
+
+
+def test_bracket_long_entry_rejects_inverted_stop() -> None:
+    """HOTFIX-2026-05-11: same guardrail applies on the non-PDT bracket
+    path. Even though Alpaca server-side bracket validation would
+    catch this, fail fast locally so the proposal is journaled as
+    submission_failed before any broker round-trip — and so a future
+    broker that doesn't validate is still safe.
+    """
+    p = TradeProposal.model_validate({
+        "symbol": "AORT",
+        "direction": "long",
+        "size_pct_of_capital": 0.05,
+        "entry_style": "market_open",
+        "stop_loss_price": 15.00,  # > nbbo.last=10.02
+        "time_horizon_days": 10,
+        "conviction": 8,
+        "thesis": (
+            "Strong fundamentals with material 8-K disclosure indicating "
+            "near-term catalyst per filing analysis."
+        ),
+        "signals": ["8-K item 2.02 strong earnings beat"],
+        "exit_conditions": ["thesis breaks; stop hit; 30 days elapsed"],
+        "risk_factors": ["macro risk; sector rotation; news risk"],
+    })
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    # No pdt_state → bracket flow.
+    result = submitter.submit(accepted, broker, journal, ks)
+
+    assert isinstance(result, SubmissionFailed)
+    assert result.reason == "submission_failed"
+    # NO bracket submission attempted.
+    assert broker.submitted_brackets == []
+    assert broker.submitted == []
+    assert journal.orders == []
+    assert journal.executions[0]["decision"] == "submission_failed"
+
+
+def test_bracket_long_entry_accepts_valid_stop_below_entry() -> None:
+    """HOTFIX-2026-05-11 regression: default proposal (stop_loss_price=8.50,
+    nbbo.last=10.02) still routes through bracket submission cleanly.
+    """
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionAccepted)
+    assert len(broker.submitted_brackets) == 1

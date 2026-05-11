@@ -388,6 +388,9 @@ class Reconciler:
         # for by a recent bracket-leg submission (entry-buy fill increases
         # broker qty; stop/TP-sell fill decreases it) are "expected" and
         # do not halt. Avg_entry mismatches are always unexpected.
+        # HOTFIX-2026-05-11: default window widened to 7 days so the
+        # weekend-spanning Friday-PM-submitted / Monday-open-filled case
+        # classifies as expected.
         window_minutes = self._cfg.expected_fill_window_minutes
         since = now - dt.timedelta(minutes=window_minutes)
         expected: list[ExplainedDiff] = []

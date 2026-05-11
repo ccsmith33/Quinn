@@ -159,13 +159,31 @@ def _to_sell_request(r: VirtualExitRow) -> OrderRequest:
     raise ValueError(f"unsupported virtual_exit role: {r.role!r}")
 
 
+# HOTFIX-2026-05-11: consecutive-miss threshold for marking a virtual
+# exit obsolete via the position_closed_externally path. The 2026-05-11
+# open-of-day incident: scanner ran during the partial-fill window
+# right after 9:30 ET, broker.get_positions() returned a stale view
+# (some symbols still queued), and one tick was enough to nuke
+# virtual_exits for not-yet-filled symbols — leaving them unprotected
+# once the fills landed seconds later. Requiring N consecutive misses
+# before the obsolete-mark fires absorbs the fill burst without
+# eternally postponing the legitimate manual-close case.
+_POSITION_MISS_THRESHOLD = 3
+
+
 class VirtualExitScanner:
     """Once-per-reconciler-tick scanner. Constructed in composition,
     invoked from `reconciler._run_loop` after the retro/thesis hooks.
 
-    Stateless across ticks — every tick re-reads the journal, the
-    account, and per-symbol quotes. The PDTState reference is shared
-    with the agent loop and reconciler (single source of truth).
+    Re-reads the journal, account, and per-symbol quotes every tick.
+    The PDTState reference is shared with the agent loop and reconciler
+    (single source of truth).
+
+    HOTFIX-2026-05-11: maintains a small in-memory miss counter per
+    virtual_exit id so the position_closed_externally check can require
+    N consecutive missing ticks before firing. Counter resets the
+    instant the position reappears, so an open-of-day fill-burst race
+    can't drift past the grace window indefinitely.
     """
 
     def __init__(
@@ -178,6 +196,9 @@ class VirtualExitScanner:
         self._broker = broker
         self._journal = journal
         self._pdt_state = pdt_state
+        # HOTFIX-2026-05-11: virtual_exit.id -> consecutive missing ticks.
+        # Bounded by the active virtual_exit count; trimmed on every tick.
+        self._position_miss_counts: dict[int, int] = {}
 
     def run_tick(self) -> ScannerReport:
         if not self._pdt_state.is_active():
@@ -197,26 +218,67 @@ class VirtualExitScanner:
 
         # Mark virtual exits whose underlying position has been closed
         # externally (operator manual exit) — ADR-009 / S-PDT-4 AC-7.
-        # These are removed from the active set and not considered for
-        # ranking.
+        # HOTFIX-2026-05-11: require `_POSITION_MISS_THRESHOLD` consecutive
+        # missing ticks before marking obsolete. The 2026-05-11 open-of-day
+        # incident: scanner ran ~1s after a halt during the 9:30 partial-fill
+        # window; broker.get_positions() did not yet contain the fresh
+        # Monday-open buys, and the scanner nuked virtual_exits for those
+        # symbols — they were unprotected by the time their fills landed
+        # seconds later. The counter resets the tick a position reappears,
+        # so a transient absence cannot accumulate across unrelated days.
         live_exits: list[VirtualExitRow] = []
+        seen_ids: set[int] = set()
         for e in exits:
+            if e.id is None:
+                # Defensive — DB always assigns ids; never gate live_exits
+                # on a row with no id.
+                continue
+            seen_ids.add(e.id)
             if e.symbol not in open_symbols:
-                if e.id is not None:
+                miss_count = self._position_miss_counts.get(e.id, 0) + 1
+                self._position_miss_counts[e.id] = miss_count
+                if miss_count >= _POSITION_MISS_THRESHOLD:
                     self._journal.mark_virtual_exit_obsolete(
                         e.id, reason="position_closed_externally"
                     )
-                log.info(
-                    "pdt.virtual_exit.obsolete",
-                    extra={
-                        "event": "pdt.virtual_exit.obsolete",
-                        "virtual_exit_id": e.id,
-                        "symbol": e.symbol,
-                        "reason": "position_closed_externally",
-                    },
-                )
+                    log.info(
+                        "pdt.virtual_exit.obsolete",
+                        extra={
+                            "event": "pdt.virtual_exit.obsolete",
+                            "virtual_exit_id": e.id,
+                            "symbol": e.symbol,
+                            "reason": "position_closed_externally",
+                            "consecutive_misses": miss_count,
+                        },
+                    )
+                    # Drop from the in-memory grace map; row is now
+                    # obsolete in the journal so it won't return next
+                    # tick from list_active_virtual_exits().
+                    self._position_miss_counts.pop(e.id, None)
+                else:
+                    log.info(
+                        "pdt.virtual_exit.position_missing_grace",
+                        extra={
+                            "event": "pdt.virtual_exit.position_missing_grace",
+                            "virtual_exit_id": e.id,
+                            "symbol": e.symbol,
+                            "consecutive_misses": miss_count,
+                            "threshold": _POSITION_MISS_THRESHOLD,
+                        },
+                    )
                 continue
+            # Position present — reset the grace counter (if any). A
+            # missing-then-present sequence shouldn't accumulate; only
+            # truly consecutive misses count.
+            if e.id in self._position_miss_counts:
+                self._position_miss_counts.pop(e.id, None)
             live_exits.append(e)
+
+        # Garbage-collect counters for ids that have left the active set
+        # entirely (row moved to 'submitted' / 'obsolete' on a prior tick).
+        # Bounds the dict to the active virtual_exits at any moment.
+        for stale_id in [vid for vid in self._position_miss_counts if vid not in seen_ids]:
+            self._position_miss_counts.pop(stale_id, None)
 
         # Quote per unique symbol (one fetch per symbol, regardless of
         # how many virtual_exit rows reference it).

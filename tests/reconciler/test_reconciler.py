@@ -601,6 +601,55 @@ def test_window_guard_excludes_stale_orders() -> None:
     assert queried_since == _MARKET_OPEN_TIME - dt.timedelta(minutes=30)
 
 
+# HOTFIX-2026-05-11: reconciler tolerance lookback widened to span a
+# weekend gap between Friday-PM submission and Monday open fill. Default
+# is 7 calendar days (10_080 minutes); operators may tune.
+def test_weekend_spanning_fill_explained_with_default_window() -> None:
+    """Friday-afternoon submitted entry buy fills at Monday open (~64h
+    later). The reconciler must classify the broker-position increase as
+    expected (no halt) using the default `expected_fill_window_minutes`
+    (post-hotfix: ~7 days). Real symptom on 2026-05-11 (~13:31 ET): 8
+    Friday-PM-submitted orders filled at Monday open, the prior 30-minute
+    lookback couldn't span the weekend and the reconciler halted.
+    """
+    broker = _FakeBroker(positions=[_position("ABCD", 50)])
+    journal = _FakeJournal(
+        expected_positions=[],
+        recent_orders=[
+            _order(
+                symbol="ABCD",
+                role="entry",
+                side="buy",
+                qty=50,
+                # 65 hours back — Friday-PM submission, Monday-AM fill.
+                submitted_at=_MARKET_OPEN_TIME - dt.timedelta(hours=65),
+                order_id=101,
+            ),
+        ],
+    )
+    ks = _FakeKillSwitch()
+    # Use the production default (no explicit override) so the test
+    # locks in the widened lookback. If default narrows again, this
+    # test fires.
+    rec = Reconciler(
+        broker, journal, ks,
+        ReconcilerConfig(interval_seconds_market=300),
+        now_fn=_now_market,
+    )
+
+    report = rec.reconcile_now()
+
+    assert report.matched is True
+    assert report.diffs == []
+    assert len(report.explained_diffs) == 1
+    assert ks.halts == []
+    # Lookback cutoff must be ≥ 65 hours behind `now` to span the
+    # weekend; locks the hotfix-widened default in place.
+    assert len(journal.get_orders_since_calls) == 1
+    _sym, queried_since = journal.get_orders_since_calls[0]
+    assert _MARKET_OPEN_TIME - queried_since >= dt.timedelta(hours=65)
+
+
 def test_mixed_diffs_halt_if_any_unexpected() -> None:
     """Two diffs in one tick — one explained by recent orders (CXW), one
     not (XYZ). Halt fires; payload distinguishes the two classifications.
