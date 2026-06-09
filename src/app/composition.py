@@ -225,7 +225,10 @@ def compose_agent(
     )
 
     # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.
-    validator = ProposalValidator()
+    # D-079 §3.2: exit-geometry floor wired from config.
+    validator = ProposalValidator(
+        min_reward_risk=config.execution.min_reward_risk,
+    )
     sizer = SizingEngine()
     submitter = OrderSubmitter()
 
