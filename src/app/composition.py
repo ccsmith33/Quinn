@@ -23,7 +23,7 @@ import asyncio
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from analyzer.anthropic_client import AnthropicClient
 from analyzer.opus import OpusReviewer
@@ -41,6 +41,10 @@ from config.secrets import Secrets
 from execution.exit_policy import ExitPolicyTicker
 from execution.orders import OrderSubmitter
 from execution.pdt_budget import PDTState  # PDT-SUNSET-2026-06-04: ADR-009 wiring.
+from execution.pdt_transition import (  # PDT-TRANSITION-D-077: survives P2.
+    ConverterBroker,
+    PDTTransitionConverter,
+)
 from execution.sizing import SizingEngine
 from execution.validator import ProposalValidator
 from execution.virtual_exits import (  # PDT-SUNSET-2026-06-04
@@ -126,6 +130,11 @@ class AgentComponents:
     # PDT-SUNSET-2026-06-04: ADR-009 §"Pre-market deferred replay" —
     # invoked once per session at boot by `AgentLoop._boot`.
     deferred_replayer: Any | None = None
+    # PDT-TRANSITION-D-077 (ADR-012 §4.2): one-shot boot-time converter
+    # of active virtual exits to GTC broker orders; runs before the
+    # deferred replayer. Survives the P2 tag-removal PR; removed in the
+    # post-soak cleanup.
+    pdt_transition_converter: Any | None = None
 
 
 def compose_agent(
@@ -313,6 +322,15 @@ def compose_agent(
     deferred_replayer = DeferredSellReplayer(
         broker=broker, journal=journal,
     )
+    # PDT-TRANSITION-D-077 (ADR-012 §4.2): boot-time converter, wired
+    # ahead of the replayer in `AgentLoop._boot`. The cast bridges the
+    # §5 merge order: WS2 adds `submit_oco_sell` to the broker before
+    # WS3-P1 merges; until then the converter's per-group isolation
+    # degrades an unexpected missing method to a logged error while the
+    # scanner keeps covering the affected exits.
+    pdt_transition_converter = PDTTransitionConverter(
+        broker=cast("ConverterBroker", broker), journal=journal,
+    )
 
     # WS1 (D-078, ADR-010) — poll-based fill ingestion, invoked at the
     # top of every reconcile tick (inside the Reconciler; deliberately
@@ -421,6 +439,8 @@ def compose_agent(
         # PDT-SUNSET-2026-06-04: ADR-009 wiring.
         pdt_state=pdt_state,
         deferred_replayer=deferred_replayer,
+        # PDT-TRANSITION-D-077: ADR-012 §4.2 wiring (survives P2).
+        pdt_transition_converter=pdt_transition_converter,
     )
 
     # Lazy import to keep `app/composition.py` testable without pulling
