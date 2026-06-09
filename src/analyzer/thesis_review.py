@@ -51,13 +51,28 @@ class ThesisAdjustStop:
 
 
 @dataclass(frozen=True)
+class ThesisAdjustTakeProfit:
+    """D-079 §3.4 — raise-only TP actuator (let-winners-run). Lowering a
+    TP is expressible as `close`; a lowerable TP would reintroduce the
+    tighten-only pressure S-4 diagnosed. Raise-only is enforced at apply
+    time by the coordinator (new_tp must clear the current quote)."""
+
+    rationale: str
+    new_tp_price: float
+
+
+@dataclass(frozen=True)
 class ThesisReviewMalformed:
     raw_response: str
     error: str
 
 
 ThesisReviewResult = (
-    ThesisHold | ThesisClose | ThesisAdjustStop | ThesisReviewMalformed
+    ThesisHold
+    | ThesisClose
+    | ThesisAdjustStop
+    | ThesisAdjustTakeProfit
+    | ThesisReviewMalformed
 )
 
 
@@ -227,10 +242,13 @@ def _parse(raw: str) -> ThesisReviewResult:
     if not isinstance(payload, dict):
         return ThesisReviewMalformed(raw_response=raw, error="top-level must be object")
     decision = payload.get("decision")
-    if decision not in ("hold", "close", "adjust_stop"):
+    if decision not in ("hold", "close", "adjust_stop", "adjust_take_profit"):
         return ThesisReviewMalformed(
             raw_response=raw,
-            error=f"decision must be hold|close|adjust_stop, got {decision!r}",
+            error=(
+                "decision must be hold|close|adjust_stop|adjust_take_profit, "
+                f"got {decision!r}"
+            ),
         )
     rationale = payload.get("rationale")
     if not isinstance(rationale, str) or not (50 <= len(rationale) <= 4000):
@@ -241,20 +259,30 @@ def _parse(raw: str) -> ThesisReviewResult:
         return ThesisHold(rationale=rationale)
     if decision == "close":
         return ThesisClose(rationale=rationale)
-    # adjust_stop
+    # adjust_stop / adjust_take_profit both require a modifications object
+    # carrying their own price key — the actions must not cross wires.
     mods = payload.get("modifications")
     if not isinstance(mods, dict):
         return ThesisReviewMalformed(
             raw_response=raw,
-            error="adjust_stop requires modifications object",
+            error=f"{decision} requires modifications object",
         )
-    new_stop = mods.get("new_stop_price")
-    if not isinstance(new_stop, (int, float)) or new_stop <= 0:
+    if decision == "adjust_stop":
+        new_stop = mods.get("new_stop_price")
+        if not isinstance(new_stop, (int, float)) or new_stop <= 0:
+            return ThesisReviewMalformed(
+                raw_response=raw,
+                error=f"new_stop_price must be positive number, got {new_stop!r}",
+            )
+        return ThesisAdjustStop(rationale=rationale, new_stop_price=float(new_stop))
+    # adjust_take_profit (D-079 §3.4)
+    new_tp = mods.get("new_tp_price")
+    if not isinstance(new_tp, (int, float)) or new_tp <= 0:
         return ThesisReviewMalformed(
             raw_response=raw,
-            error=f"new_stop_price must be positive number, got {new_stop!r}",
+            error=f"new_tp_price must be positive number, got {new_tp!r}",
         )
-    return ThesisAdjustStop(rationale=rationale, new_stop_price=float(new_stop))
+    return ThesisAdjustTakeProfit(rationale=rationale, new_tp_price=float(new_tp))
 
 
 def _decision_string(result: ThesisReviewResult) -> str:
@@ -264,11 +292,16 @@ def _decision_string(result: ThesisReviewResult) -> str:
         return "close"
     if isinstance(result, ThesisAdjustStop):
         return "adjust_stop"
+    if isinstance(result, ThesisAdjustTakeProfit):
+        return "adjust_take_profit"
     return "malformed"
 
 
 def _rationale(result: ThesisReviewResult) -> str:
-    if isinstance(result, (ThesisHold, ThesisClose, ThesisAdjustStop)):
+    if isinstance(
+        result,
+        (ThesisHold, ThesisClose, ThesisAdjustStop, ThesisAdjustTakeProfit),
+    ):
         return result.rationale
     return f"[malformed: {result.error}]"  # type: ignore[union-attr]
 
@@ -276,11 +309,14 @@ def _rationale(result: ThesisReviewResult) -> str:
 def _modifications_json(result: ThesisReviewResult) -> str | None:
     if isinstance(result, ThesisAdjustStop):
         return json.dumps({"new_stop_price": result.new_stop_price})
+    if isinstance(result, ThesisAdjustTakeProfit):
+        return json.dumps({"new_tp_price": result.new_tp_price})
     return None
 
 
 __all__ = [
     "ThesisAdjustStop",
+    "ThesisAdjustTakeProfit",
     "ThesisClose",
     "ThesisHold",
     "ThesisReviewContext",
