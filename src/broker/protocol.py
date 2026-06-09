@@ -315,6 +315,46 @@ class BrokerAdapter(Protocol):
         """
         ...
 
+    def replace_limit_order(
+        self,
+        broker_order_id: str,
+        *,
+        new_limit_price: float,
+        client_order_id: str,
+    ) -> SubmittedOrder:
+        """Atomically replace a live limit (take-profit) order's price
+        (D-079 §7.2 — the `adjust_take_profit` actuator).
+
+        Same safety contract as `replace_stop_order`: Alpaca's PATCH
+        /v2/orders/{id} either accepts the replacement (new order id,
+        no gap) or rejects it leaving the original limit order live.
+        Implementations MUST raise on any failure.
+        """
+        ...
+
+    def submit_oco_sell(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        limit_price: float | None,
+        client_order_id: str,
+    ) -> tuple[SubmittedOrder, SubmittedOrder | None]:
+        """Sell-side protective pair for an EXISTING position (D-079 §7.3).
+
+        limit_price set  → Alpaca OCO (TP limit + stop), both GTC, linked
+                           — the broker cancels one when the other fills.
+        limit_price None → plain GTC stop sell.
+
+        Returns `(stop, take_profit_or_None)`. Atomic per the broker's
+        OCO contract: either both legs are created or the submission is
+        rejected; implementations raise on failure. Consumed by the WS3
+        `PDTTransitionConverter` (ADR-012) — the signature is part of
+        the cross-workstream contract.
+        """
+        ...
+
 
 __all__ = [
     "AccountSnapshot",

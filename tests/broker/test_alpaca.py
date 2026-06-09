@@ -75,9 +75,13 @@ class _FakeTradingClient:
         }
         self.submit_calls: list[Any] = []
         self.cancel_calls: list[str] = []
+        # D-079 §7.2: replace surface — (order_id, ReplaceOrderRequest) pairs.
+        self.replace_calls: list[tuple[str, Any]] = []
         # Configurable behaviour; tests mutate via the instance attached to broker.
         self._submit_responses: list[Any] = []
         self._submit_exceptions: list[Exception | None] = []
+        self._replace_responses: list[Any] = []
+        self._replace_exceptions: list[Exception | None] = []
         # Hotfix 2026-05-07: open-orders surface (KS-5 pending-buy gate).
         self._open_orders_response: list[Any] = []
 
@@ -89,6 +93,14 @@ class _FakeTradingClient:
     def queue_submit_exception(self, exc: Exception) -> None:
         self._submit_responses.append(None)
         self._submit_exceptions.append(exc)
+
+    def queue_replace_response(self, resp: Any) -> None:
+        self._replace_responses.append(resp)
+        self._replace_exceptions.append(None)
+
+    def queue_replace_exception(self, exc: Exception) -> None:
+        self._replace_responses.append(None)
+        self._replace_exceptions.append(exc)
 
     # ---- SDK surface ----
     def submit_order(self, order_data: Any) -> Any:
@@ -103,6 +115,16 @@ class _FakeTradingClient:
 
     def cancel_order_by_id(self, order_id: str) -> None:
         self.cancel_calls.append(order_id)
+
+    def replace_order_by_id(self, order_id: str, order_data: Any) -> Any:
+        self.replace_calls.append((order_id, order_data))
+        if self._replace_exceptions:
+            exc = self._replace_exceptions.pop(0)
+            resp = self._replace_responses.pop(0)
+            if exc is not None:
+                raise exc
+            return resp
+        return _make_fake_alpaca_order(symbol="AAPL", qty=1)
 
     def get_account(self) -> Any:
         return SimpleNamespace(
@@ -249,6 +271,47 @@ def _make_fake_bracket_response(
         limit_price=str(entry_limit_price) if entry_limit_price is not None else None,
         stop_price=None,
         legs=legs,
+    )
+
+
+def _make_fake_oco_response(
+    *,
+    symbol: str,
+    qty: int,
+    take_profit_price: float,
+    stop_price: float,
+) -> Any:
+    """Fake alpaca-py response for a sell-side OCO submission (D-079 §7.3).
+
+    Alpaca returns the take-profit LIMIT order as the parent with the
+    stop child in `.legs` — the mirror of the bracket response shape,
+    minus the entry."""
+    stop_leg = SimpleNamespace(
+        id=uuid.uuid4(),
+        client_order_id=f"cid-{symbol}-oco-stop",
+        symbol=symbol,
+        side=SimpleNamespace(value="sell"),
+        qty=str(qty),
+        order_type=SimpleNamespace(value="stop"),
+        type=SimpleNamespace(value="stop"),
+        status=SimpleNamespace(value="held"),
+        submitted_at=dt.datetime(2026, 6, 9, 14, 30, tzinfo=dt.UTC),
+        limit_price=None,
+        stop_price=str(stop_price),
+    )
+    return SimpleNamespace(
+        id=uuid.uuid4(),
+        client_order_id=f"cid-{symbol}-oco",
+        symbol=symbol,
+        side=SimpleNamespace(value="sell"),
+        qty=str(qty),
+        order_type=SimpleNamespace(value="limit"),
+        type=SimpleNamespace(value="limit"),
+        status=SimpleNamespace(value="accepted"),
+        submitted_at=dt.datetime(2026, 6, 9, 14, 30, tzinfo=dt.UTC),
+        limit_price=str(take_profit_price),
+        stop_price=None,
+        legs=[stop_leg],
     )
 
 
@@ -1025,3 +1088,219 @@ def test_alpaca_normalize_account_pdt_fields_defaults(
     snap = paper_broker.get_account()
     assert snap.last_equity == 100_000.0  # fell back to equity
     assert snap.daytrade_count == 0
+
+
+# ---------------------------------------------------------------------------
+# D-079 §7.2 — replace_limit_order: atomic PATCH of a live TP limit order.
+# Same safety contract as replace_stop_order: raise on failure, original
+# order stands. Wire-level assertions per quality-standards (actuator tests
+# assert broker-call arguments, not just normalized returns).
+# ---------------------------------------------------------------------------
+
+
+def test_replace_limit_order_sends_patch_with_new_limit_price(
+    paper_broker: AlpacaBroker,
+) -> None:
+    from alpaca.trading.requests import ReplaceOrderRequest
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_replace_response(
+        _make_fake_alpaca_order(symbol="ACME", qty=10)
+    )
+
+    out = paper_broker.replace_limit_order(
+        "broker-tp-001",
+        new_limit_price=14.25,
+        client_order_id="thesis-adjtp-42",
+    )
+
+    assert len(fake_trading.replace_calls) == 1
+    order_id, sent = fake_trading.replace_calls[0]
+    assert order_id == "broker-tp-001"
+    assert isinstance(sent, ReplaceOrderRequest)
+    assert sent.limit_price == 14.25
+    assert sent.stop_price is None  # limit replace must not carry a stop price
+    assert sent.client_order_id == "thesis-adjtp-42"
+    assert isinstance(out, SubmittedOrder)
+
+
+def test_replace_limit_order_propagates_rejection(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """On a definitive rejection the adapter raises BrokerRejected — the
+    caller's contract is 'original TP still live, do not proceed'."""
+    fake_trading = paper_broker._trading
+    fake_trading.queue_replace_exception(
+        _FakeAPIError(422, "order is not replaceable")
+    )
+
+    with pytest.raises(BrokerRejected):
+        paper_broker.replace_limit_order(
+            "broker-tp-001",
+            new_limit_price=14.25,
+            client_order_id="thesis-adjtp-43",
+        )
+
+
+def test_replace_stop_order_sends_patch_with_new_stop_price(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Wire-level regression for the existing stop replace (previously
+    only covered at the adapter-fake level in integration tests)."""
+    from alpaca.trading.requests import ReplaceOrderRequest
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_replace_response(
+        _make_fake_alpaca_order(symbol="ACME", qty=10)
+    )
+
+    paper_broker.replace_stop_order(
+        "broker-stop-001",
+        new_stop_price=11.80,
+        client_order_id="thesis-adjstop-42",
+    )
+
+    order_id, sent = fake_trading.replace_calls[0]
+    assert order_id == "broker-stop-001"
+    assert isinstance(sent, ReplaceOrderRequest)
+    assert sent.stop_price == 11.80
+    assert sent.limit_price is None
+    assert sent.client_order_id == "thesis-adjstop-42"
+
+
+# ---------------------------------------------------------------------------
+# D-079 §7.3 — submit_oco_sell: protective sell pair for an existing
+# position. limit_price set → Alpaca OCO (TP limit parent + stop child,
+# both GTC, linked). limit_price None → plain GTC stop sell. Consumed by
+# WS3's PDTTransitionConverter — the signature is load-bearing.
+# ---------------------------------------------------------------------------
+
+
+def test_submit_oco_sell_sends_oco_class_with_both_legs(
+    paper_broker: AlpacaBroker,
+) -> None:
+    from alpaca.trading.enums import OrderClass, OrderSide, TimeInForce
+    from alpaca.trading.requests import (
+        LimitOrderRequest,
+        StopLossRequest,
+        TakeProfitRequest,
+    )
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_response(
+        _make_fake_oco_response(
+            symbol="ACME", qty=13, take_profit_price=14.0, stop_price=9.5
+        )
+    )
+
+    stop, tp = paper_broker.submit_oco_sell(
+        symbol="ACME",
+        qty=13,
+        stop_price=9.5,
+        limit_price=14.0,
+        client_order_id="pdt-convert-7",
+    )
+
+    assert len(fake_trading.submit_calls) == 1
+    sent = fake_trading.submit_calls[0]
+    assert isinstance(sent, LimitOrderRequest)
+    assert sent.order_class == OrderClass.OCO
+    assert sent.side == OrderSide.SELL
+    assert sent.time_in_force == TimeInForce.GTC
+    assert sent.symbol == "ACME"
+    assert sent.qty == 13
+    assert sent.client_order_id == "pdt-convert-7"
+    assert isinstance(sent.take_profit, TakeProfitRequest)
+    assert sent.take_profit.limit_price == 14.0
+    assert isinstance(sent.stop_loss, StopLossRequest)
+    assert sent.stop_loss.stop_price == 9.5
+
+    # Response split: stop child + TP parent, both normalized.
+    assert stop.order_type == "stop"
+    assert stop.stop_price == 9.5
+    assert tp is not None
+    assert tp.order_type == "limit"
+    assert tp.limit_price == 14.0
+
+
+def test_submit_oco_sell_without_limit_price_sends_plain_gtc_stop(
+    paper_broker: AlpacaBroker,
+) -> None:
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import StopOrderRequest
+
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_response(
+        SimpleNamespace(
+            id=uuid.uuid4(),
+            client_order_id="pdt-convert-8",
+            symbol="ACME",
+            side=SimpleNamespace(value="sell"),
+            qty="13",
+            order_type=SimpleNamespace(value="stop"),
+            type=SimpleNamespace(value="stop"),
+            status=SimpleNamespace(value="accepted"),
+            submitted_at=dt.datetime(2026, 6, 9, 14, 30, tzinfo=dt.UTC),
+            limit_price=None,
+            stop_price="9.5",
+        )
+    )
+
+    stop, tp = paper_broker.submit_oco_sell(
+        symbol="ACME",
+        qty=13,
+        stop_price=9.5,
+        limit_price=None,
+        client_order_id="pdt-convert-8",
+    )
+
+    sent = fake_trading.submit_calls[0]
+    assert isinstance(sent, StopOrderRequest)
+    assert sent.side == OrderSide.SELL
+    assert sent.time_in_force == TimeInForce.GTC
+    assert sent.stop_price == 9.5
+    assert sent.client_order_id == "pdt-convert-8"
+    assert stop.order_type == "stop"
+    assert stop.stop_price == 9.5
+    assert tp is None
+
+
+def test_submit_oco_sell_missing_stop_leg_raises(
+    paper_broker: AlpacaBroker,
+) -> None:
+    """Defense in depth mirroring submit_bracket_order: an OCO response
+    without the stop child means the broker state is unknown — surface
+    BrokerRejected rather than claim success without a stop."""
+    fake_trading = paper_broker._trading
+    resp = _make_fake_oco_response(
+        symbol="ACME", qty=13, take_profit_price=14.0, stop_price=9.5
+    )
+    resp.legs = []  # broker returned the TP parent but no stop child
+    fake_trading.queue_submit_response(resp)
+
+    with pytest.raises(BrokerRejected, match="stop leg missing"):
+        paper_broker.submit_oco_sell(
+            symbol="ACME",
+            qty=13,
+            stop_price=9.5,
+            limit_price=14.0,
+            client_order_id="pdt-convert-9",
+        )
+
+
+def test_submit_oco_sell_propagates_rejection(
+    paper_broker: AlpacaBroker,
+) -> None:
+    fake_trading = paper_broker._trading
+    fake_trading.queue_submit_exception(
+        _FakeAPIError(422, "insufficient qty available")
+    )
+
+    with pytest.raises(BrokerRejected):
+        paper_broker.submit_oco_sell(
+            symbol="ACME",
+            qty=13,
+            stop_price=9.5,
+            limit_price=14.0,
+            client_order_id="pdt-convert-10",
+        )

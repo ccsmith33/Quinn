@@ -34,6 +34,10 @@ def test_protocol_methods_present() -> None:
         "get_positions",
         "get_open_orders",
         "get_quote",
+        # D-079 §7.2/§7.3: TP-raise actuator + the protective sell pair
+        # the WS3 PDT converter consumes.
+        "replace_limit_order",
+        "submit_oco_sell",
     }
     actual = {name for name in dir(BrokerAdapter) if not name.startswith("_")}
     assert expected.issubset(actual), f"missing: {expected - actual}"
