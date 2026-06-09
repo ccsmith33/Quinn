@@ -386,7 +386,14 @@ class OrderSubmitter:
             entry_side="buy",
             entry_qty=ap.qty,
             entry_order_type=entry_order_type,
-            entry_tif="day",
+            # D-079 §3.1 (kills O-6): Alpaca applies ONE time_in_force to
+            # the whole bracket group; children inherit it. The prior
+            # "day" value silently expired the protective stop and TP at
+            # end of entry day — from day 2 the position was unmanaged
+            # while the journal claimed GTC coverage. The now-possible
+            # stale GTC *entry* is cancelled after entry day by
+            # ExitPolicyTicker hygiene (§3.6).
+            entry_tif="gtc",
             entry_client_order_id=f"prop-{ap.proposal_id}-entry",
             entry_limit_price=entry_limit_price,
             stop_loss_price=p.stop_loss_price,
@@ -442,7 +449,9 @@ class OrderSubmitter:
             qty=req.entry_qty,
             limit_price=None,
             stop_price=req.stop_loss_price,
-            tif="gtc",
+            # D-079 §3.1 honesty: record the TIF actually sent (children
+            # inherit the group TIF), never a hardcoded value.
+            tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
             final_status=resp.status,
@@ -465,7 +474,8 @@ class OrderSubmitter:
             qty=req.entry_qty,
             limit_price=req.take_profit_price,
             stop_price=None,
-            tif="gtc",
+            # D-079 §3.1 honesty: TIF actually sent, never hardcoded.
+            tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
             final_status=resp.status,

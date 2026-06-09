@@ -295,8 +295,8 @@ def test_bracket_submission_writes_three_journal_rows() -> None:
 
 
 def test_limit_entry_uses_entry_limit_price() -> None:
-    """Test #2: entry_style=limit → limit BUY at entry_limit_price, TIF=day,
-    routed through the bracket flow.
+    """Test #2: entry_style=limit → limit BUY at entry_limit_price,
+    routed through the bracket flow with the group-wide GTC TIF (D-079 §3.1).
     """
     p = _proposal(entry_style="limit", entry_limit_price=9.95)
     accepted = _accepted(proposal=p)
@@ -311,7 +311,65 @@ def test_limit_entry_uses_entry_limit_price() -> None:
     bracket = broker.submitted_brackets[0]
     assert bracket.entry_order_type == "limit"
     assert bracket.entry_limit_price == 9.95
-    assert bracket.entry_tif == "day"
+    assert bracket.entry_tif == "gtc"
+
+
+# ---------------------------------------------------------------------------
+# D-079 §3.1 — GTC protective legs, honestly journaled (kills O-6).
+# Alpaca applies ONE time_in_force to the whole bracket group; children
+# inherit it. The pre-fix code sent entry_tif="day" (so stop and TP silently
+# expired at end of entry day) while journaling tif="gtc" for both legs —
+# the audit record claimed protection that did not exist.
+# ---------------------------------------------------------------------------
+
+def test_bracket_group_tif_is_gtc() -> None:
+    """D-079 §3.1: the bracket request carries TIF=gtc so the protective
+    stop and TP survive past entry day (children inherit the group TIF)."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert broker.submitted_brackets[0].entry_tif == "gtc"
+
+
+def test_bracket_journal_rows_record_tif_actually_sent() -> None:
+    """D-079 §3.1 honesty: every journal row's `tif` equals the TIF that
+    was actually sent on the bracket request — derived from the request,
+    not hardcoded, so journal and broker can never diverge again."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    sent_tif = broker.submitted_brackets[0].entry_tif
+    assert sent_tif == "gtc"
+    assert len(journal.orders) == 3
+    for row in journal.orders:
+        assert row["tif"] == sent_tif, (
+            f"journal row role={row['role']!r} records tif={row['tif']!r} "
+            f"but the broker was sent {sent_tif!r}"
+        )
+
+
+def test_oto_journal_rows_record_tif_actually_sent() -> None:
+    """Same honesty contract on the OTO (no-TP) path."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=None))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    sent_tif = broker.submitted_brackets[0].entry_tif
+    assert sent_tif == "gtc"
+    assert {row["role"] for row in journal.orders} == {"entry", "stop"}
+    for row in journal.orders:
+        assert row["tif"] == sent_tif
 
 
 def test_no_tp_when_take_profit_price_omitted() -> None:
