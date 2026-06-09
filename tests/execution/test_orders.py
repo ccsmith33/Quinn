@@ -1034,3 +1034,26 @@ def test_bracket_long_entry_accepts_valid_stop_below_entry() -> None:
 
     assert isinstance(result, SubmissionAccepted)
     assert len(broker.submitted_brackets) == 1
+
+
+def test_bracket_journal_rows_leave_final_status_null_pending_fill() -> None:
+    """D-078 §7.4 lifecycle contract: `orders.final_status` is a
+    deferred-completion field — NULL until the WS1 FillIngestor records
+    a terminal disposition. Submission-time broker acks ('accepted',
+    'new') are not terminal and must not be written here, or
+    `get_orders_pending_fill` (final_status IS NULL) would never see
+    the order and the §2.2 lifecycle classifier could not explain its
+    fill."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert len(journal.orders) == 3
+    for row in journal.orders:
+        assert row["final_status"] is None, (
+            f"role={row['role']!r} wrote final_status={row['final_status']!r} "
+            "at submission; must stay NULL until a terminal fill outcome"
+        )

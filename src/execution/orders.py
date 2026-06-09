@@ -429,7 +429,12 @@ class OrderSubmitter:
             pre_submission_ask=nbbo.ask,
             pre_submission_last=nbbo.last,
             pre_submission_quote_at=nbbo.ts,
-            final_status=resp.status,
+            # D-078 §7.4: final_status is a deferred-completion field —
+            # NULL until the FillIngestor records a terminal disposition.
+            # The broker ack (resp.status: 'accepted'/'new') is not
+            # terminal and would hide the order from
+            # get_orders_pending_fill (final_status IS NULL).
+            final_status=None,
             notes=notes,
         )
 
@@ -454,7 +459,7 @@ class OrderSubmitter:
             tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
-            final_status=resp.status,
+            final_status=None,  # deferred completion (D-078 §7.4)
         )
 
     @staticmethod
@@ -478,7 +483,7 @@ class OrderSubmitter:
             tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
-            final_status=resp.status,
+            final_status=None,  # deferred completion (D-078 §7.4)
         )
 
 
