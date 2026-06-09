@@ -229,7 +229,18 @@ class PDTTransitionConverter:
         if symbol not in open_symbols:
             # Leave rows 'active' — scanner still covers them, and its
             # consecutive-miss grace owns the obsolete-marking decision.
+            # Logged per group so the §4.4 operator verification can
+            # triage any active-row residue straight from the log.
             self._counts["skipped"] += 1
+            log.info(
+                "pdt_transition.skipped_no_position",
+                extra={
+                    "event": "pdt_transition.skipped_no_position",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "virtual_exit_ids": [r.id for r in rows],
+                },
+            )
             return
 
         stop = next((r for r in rows if r.role == "stop"), None)
