@@ -149,3 +149,34 @@ def test_no_trade_record_thesis_too_short_rejected() -> None:
                 "signals_considered": [],
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# D-079 §3.5 — optional analyzer-proposed trailing distance (ADR-011).
+# ---------------------------------------------------------------------------
+
+
+def test_trade_proposal_trail_distance_pct_optional() -> None:
+    p = validate_trade_proposal(_trade_proposal_minimal())
+    assert p.trail_distance_pct is None
+
+
+def test_trade_proposal_trail_distance_pct_accepted_in_bounds() -> None:
+    payload = _trade_proposal_minimal()
+    payload["trail_distance_pct"] = 4.5
+    p = validate_trade_proposal(payload)
+    assert p.trail_distance_pct == 4.5
+
+
+def test_trade_proposal_trail_distance_pct_below_bound_rejected() -> None:
+    bad = _trade_proposal_minimal()
+    bad["trail_distance_pct"] = 0.4  # < 0.5 lower bound
+    with pytest.raises(ProposalSchemaError):
+        validate_trade_proposal(bad)
+
+
+def test_trade_proposal_trail_distance_pct_above_bound_rejected() -> None:
+    bad = _trade_proposal_minimal()
+    bad["trail_distance_pct"] = 20.5  # > 20 upper bound
+    with pytest.raises(ProposalSchemaError):
+        validate_trade_proposal(bad)
