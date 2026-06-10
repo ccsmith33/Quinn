@@ -376,7 +376,12 @@ class PDTTransitionConverter:
                     execution_id=execution_id, role=matched.role, req_or_so=existing
                 )
             )
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            # W3-L4: only the broker_order_id UNIQUE violation means
+            # already-journaled; any other integrity failure is a real
+            # error and must hit the per-group isolation handler.
+            if "orders.broker_order_id" not in str(exc):
+                raise
             log.warning(
                 "pdt_transition.heal_already_journaled",
                 extra={

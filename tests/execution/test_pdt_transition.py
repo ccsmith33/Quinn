@@ -612,6 +612,76 @@ def test_heal_dead_order_leaves_group_active_no_resubmit(
     assert broker.oco_calls == []
 
 
+def test_heal_unrelated_integrity_error_is_a_group_error() -> None:
+    """W3-L4: only the orders.broker_order_id UNIQUE violation reads as
+    already-journaled. Any other IntegrityError (e.g. an FK failure) is
+    a real defect — it must propagate to the per-group handler, leaving
+    the rows 'active' and unmarked instead of being silently absorbed."""
+
+    class _FkFailJournal(_FakeJournal):
+        def insert_order(self, row: Any) -> int:
+            raise sqlite3.IntegrityError("FOREIGN KEY constraint failed")
+
+    exits = [
+        _vexit(1, execution_id=42, symbol="AAPL", role="stop", stop_price=95.0),
+    ]
+    prior = _submitted(
+        "alp-prior-1", "pdt-convert-1", "AAPL", 10,
+        order_type="stop", stop_price=95.0,
+    )
+    broker = _FakeBroker(
+        positions=[_position("AAPL")],
+        quotes={"AAPL": _quote("AAPL", 100.0)},
+        existing={"pdt-convert-1": prior},
+    )
+    journal = _FkFailJournal(exits)
+    report = _run(broker, journal)
+
+    assert report.errors == 1
+    assert report.healed == 0
+    assert journal.exits[1].state == "active"
+
+
+def test_dead_order_not_marked_even_when_already_journaled() -> None:
+    """W3-M1 x W3-H2 interaction: boot N journaled the conversion order,
+    crashed before the mark, and the order then DIED between boots. The
+    status gate runs upstream of _heal_group, so the already-journaled
+    path must never be reached — the group stays 'active' (scanner
+    covers) instead of being blindly marked submitted against a dead
+    order."""
+    exits = [
+        _vexit(1, execution_id=42, symbol="AAPL", role="stop", stop_price=95.0),
+        _vexit(2, execution_id=42, symbol="AAPL", role="tp", tp_price=120.0),
+    ]
+    prior = _submitted(
+        "alp-prior-1", "pdt-convert-1", "AAPL", 10,
+        order_type="stop", stop_price=95.0, status="canceled",
+    )
+    broker = _FakeBroker(
+        positions=[_position("AAPL")],
+        quotes={"AAPL": _quote("AAPL", 100.0)},
+        existing={"pdt-convert-1": prior},
+    )
+    journal = _FakeJournal(exits)
+    # Boot N's journal write survived the crash.
+    journal.orders.append(OrderRow(
+        execution_id=42, role="stop", symbol="AAPL", side="sell",
+        order_type="stop", qty=10, stop_price=95.0, tif="gtc",
+        broker_order_id="alp-prior-1", submitted_at=_NOW,
+        notes="D-077 conversion",
+    ))
+    report = _run(broker, journal)
+
+    assert report.errors == 1
+    assert report.healed == 0
+    # No duplicate journal write, no mark, no new submissions.
+    assert [o.broker_order_id for o in journal.orders] == ["alp-prior-1"]
+    assert journal.exits[1].state == "active"
+    assert journal.exits[2].state == "active"
+    assert broker.submitted == []
+    assert broker.oco_calls == []
+
+
 @pytest.mark.parametrize(
     "live_status",
     ["new", "pending_new", "partially_filled", "filled", "pending_cancel"],
