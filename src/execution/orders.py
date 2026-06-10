@@ -200,6 +200,37 @@ class OrderSubmitter:
                 reason="submission_failed", execution_id=execution_id
             )
 
+        # D-079 §3.2 executor backstop: TP ≤ entry on a long is the same
+        # AORT-class inversion on the take-profit side — the limit sell
+        # would fill immediately at entry for zero reward. The proposal
+        # validator is the primary gate (journaled `exit_geometry`
+        # rejection); this guard is defense-in-depth for surfaces the
+        # validator never sees (replays, thesis-driven TP changes).
+        if self._is_inverted_take_profit(proposal, entry_price=nbbo.last):
+            log.error(
+                "executor.invalid_tp_rejected",
+                extra={
+                    "event": "executor.invalid_tp_rejected",
+                    "proposal_id": accepted_proposal.proposal_id,
+                    "symbol": proposal.symbol,
+                    "direction": proposal.direction,
+                    "entry_price": nbbo.last,
+                    "take_profit_price": proposal.take_profit_price,
+                },
+            )
+            execution_id = journal.insert_execution(
+                ExecutionRow(
+                    proposal_id=accepted_proposal.proposal_id,
+                    decision="submission_failed",
+                    realized_size_pct=accepted_proposal.realized_pct,
+                    realized_dollar_size=accepted_proposal.realized_dollar_size,
+                    submitted_orders_json=json.dumps([]),
+                )
+            )
+            return SubmissionFailed(
+                reason="submission_failed", execution_id=execution_id
+            )
+
         # PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch".
         # Under PDT mode, submit ONLY the entry (a plain market/limit
         # buy) and record stop/TP as `virtual_exits` rows. Bracket /
@@ -353,6 +384,26 @@ class OrderSubmitter:
             return sp >= entry_price
         # direction == 'short' (forward-compat scaffolding):
         return sp <= entry_price
+
+    @staticmethod
+    def _is_inverted_take_profit(
+        proposal: TradeProposal, *, entry_price: float
+    ) -> bool:
+        """Return True when the optional take-profit is wrong-side of
+        `entry_price` (D-079 §3.2 backstop).
+
+        Long: TP must sit strictly above entry, else the limit sell
+        fills immediately for zero (or negative) reward. A no-TP
+        proposal never trips this — TP stays optional (D-009).
+        Short: scaffolded mirror, like `_is_inverted_stop`.
+        """
+        tp = proposal.take_profit_price
+        if tp is None:
+            return False
+        if proposal.direction == "long":
+            return tp <= entry_price
+        # direction == 'short' (forward-compat scaffolding):
+        return tp >= entry_price
 
     # ------------------------------------------------------------------
     # Bracket / OTO order builder

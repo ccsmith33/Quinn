@@ -1036,6 +1036,109 @@ def test_bracket_long_entry_accepts_valid_stop_below_entry() -> None:
     assert len(broker.submitted_brackets) == 1
 
 
+def test_bracket_long_entry_rejects_tp_at_or_below_entry() -> None:
+    """D-079 §3.2 executor backstop: TP ≤ entry on a long is the
+    AORT-class inversion on the take-profit side — the limit sell would
+    fill immediately at entry. Reject at submit time, before any broker
+    round-trip, exactly like the inverted-stop guard beside it. The
+    proposal validator is the primary gate; this backstop covers
+    surfaces the validator never sees (replays, thesis-driven TP
+    changes)."""
+    p = TradeProposal.model_validate({
+        "symbol": "AORT",
+        "direction": "long",
+        "size_pct_of_capital": 0.05,
+        "entry_style": "market_open",
+        "stop_loss_price": 8.50,
+        "take_profit_price": 9.75,  # < nbbo.last=10.02 → inverted TP
+        "time_horizon_days": 10,
+        "conviction": 8,
+        "thesis": (
+            "Strong fundamentals with material 8-K disclosure indicating "
+            "near-term catalyst per filing analysis."
+        ),
+        "signals": ["8-K item 2.02 strong earnings beat"],
+        "exit_conditions": ["thesis breaks; stop hit; 30 days elapsed"],
+        "risk_factors": ["macro risk; sector rotation; news risk"],
+    })
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    ks = _FakeKillSwitch()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, ks)
+
+    assert isinstance(result, SubmissionFailed)
+    assert result.reason == "submission_failed"
+    assert broker.submitted_brackets == []
+    assert broker.submitted == []
+    assert journal.orders == []
+    assert journal.executions[0]["decision"] == "submission_failed"
+    # No KS halt — pre-submission rejection creates no exposure.
+    assert ks.halts == []
+
+
+def test_bracket_long_entry_rejects_tp_equal_to_entry_price() -> None:
+    """D-079 §3.2: TP exactly at the pre-submission last is rejected —
+    the boundary fill extracts zero reward for full risk."""
+    p = TradeProposal.model_validate({
+        "symbol": "AORT",
+        "direction": "long",
+        "size_pct_of_capital": 0.05,
+        "entry_style": "market_open",
+        "stop_loss_price": 8.50,
+        "take_profit_price": 10.02,  # == nbbo.last
+        "time_horizon_days": 10,
+        "conviction": 8,
+        "thesis": (
+            "Strong fundamentals with material 8-K disclosure indicating "
+            "near-term catalyst per filing analysis."
+        ),
+        "signals": ["8-K item 2.02 strong earnings beat"],
+        "exit_conditions": ["thesis breaks; stop hit; 30 days elapsed"],
+        "risk_factors": ["macro risk; sector rotation; news risk"],
+    })
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionFailed)
+    assert broker.submitted_brackets == []
+
+
+def test_bracket_long_entry_accepts_tp_above_entry() -> None:
+    """D-079 §3.2 regression: a TP above the pre-submission last still
+    routes through bracket submission cleanly (12.00 > 10.02)."""
+    accepted = _accepted(proposal=_proposal(take_profit_price=12.00))
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionAccepted)
+    assert len(broker.submitted_brackets) == 1
+
+
+def test_bracket_long_entry_no_tp_skips_tp_backstop() -> None:
+    """D-079 §3.2: TP is optional (D-009 discretion) — a no-TP proposal
+    must not trip the TP backstop (it relies on stop + trailing +
+    thesis review)."""
+    accepted = _accepted(proposal=_proposal())  # no take_profit_price
+    broker = _FakeBroker()
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionAccepted)
+    assert len(broker.submitted_brackets) == 1
+
+
 def test_bracket_journal_rows_leave_final_status_null_pending_fill() -> None:
     """D-078 §7.4 lifecycle contract: `orders.final_status` is a
     deferred-completion field — NULL until the WS1 FillIngestor records
