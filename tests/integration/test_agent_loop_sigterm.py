@@ -74,8 +74,10 @@ async def test_agent_loop_sigterm_completes_in_flight(
     from prompts.loader import PromptBuilder
     from pathlib import Path
 
+    from prompts.loader import ACTIVE_SONNET_ANALYSIS_PROMPT
+
     pb = PromptBuilder(Path("src/prompts"))
-    pv = pb.prompt_version("sonnet_filing_analysis_v1")
+    pv = pb.prompt_version(ACTIVE_SONNET_ANALYSIS_PROMPT)
     f2_decision_id = compute_decision_id(
         filing_id=f2.id, model_id="claude-sonnet-4-6", prompt_version=pv
     )

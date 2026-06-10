@@ -922,13 +922,16 @@ async def test_e2e_with_real_prompt_builder_and_store(
     from proposal.store import ProposalStore
 
     builder = PromptBuilder(prompt_dir=Path("src/prompts"))
-    sonnet_pv = builder.prompt_version("sonnet_filing_analysis_v1")
-    from prompts.loader import ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT
+    from prompts.loader import (
+        ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT,
+        ACTIVE_SONNET_ANALYSIS_PROMPT,
+    )
+    sonnet_pv = builder.prompt_version(ACTIVE_SONNET_ANALYSIS_PROMPT)
     opus_pv = builder.prompt_version(ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT)
 
     # Register composed prompt-versions BEFORE the call (S5.6 carry-forward).
     # This is what S5.6 wiring will own; this test pins the contract.
-    for pv, name in ((sonnet_pv, "sonnet_filing_analysis_v1"),
+    for pv, name in ((sonnet_pv, ACTIVE_SONNET_ANALYSIS_PROMPT),
                      (opus_pv, ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT)):
         # Verify the lock helper can see the underlying file (exercises
         # the lock helper's import path as a side effect).

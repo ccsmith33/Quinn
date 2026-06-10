@@ -323,11 +323,12 @@ def test_real_prompt_files_load(tmp_path: Path) -> None:
     )
 
 
-def test_d079_v2_prompts_ship_and_v2_is_active_for_opus_stages() -> None:
+def test_d079_v2_prompts_ship_and_v2_is_active_for_all_stages() -> None:
     """D-079 §3.2/§3.4: the v2 prompt files exist beside byte-identical
-    v1s (ADR-005 — new versions, never in-place edits); the Opus stages
-    compose v2; the sonnet stage stays on v1 until the loop.py
-    decision-id mirror flips with it (see ACTIVE_SONNET_ANALYSIS_PROMPT)."""
+    v1s (ADR-005 — new versions, never in-place edits) and ALL stages
+    compose v2. The sonnet flip landed at integration together with
+    loop._compose_decision_id importing ACTIVE_SONNET_ANALYSIS_PROMPT,
+    so the decision-id mirror moves with the constant by construction."""
     from prompts.loader import (
         ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT,
         ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
@@ -346,7 +347,7 @@ def test_d079_v2_prompts_ship_and_v2_is_active_for_opus_stages() -> None:
 
     assert ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT == "opus_proposal_review_v2"
     assert ACTIVE_OPUS_THESIS_REVIEW_PROMPT == "opus_thesis_review_v2"
-    assert ACTIVE_SONNET_ANALYSIS_PROMPT == "sonnet_filing_analysis_v1"
+    assert ACTIVE_SONNET_ANALYSIS_PROMPT == "sonnet_filing_analysis_v2"
 
     builder = PromptBuilder(pdir)
     # The composed thesis-review v2 carries the new decision and the v2

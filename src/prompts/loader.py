@@ -135,16 +135,13 @@ _PROMPT_DEFS: dict[str, list[tuple[str, str]]] = {
     ],
 }
 
-# Active prompt per pipeline stage. The Opus stages run v2 (D-079).
+# Active prompt per pipeline stage — all stages run v2 (D-079).
 #
-# The SONNET stage stays on v1 until integration: `loop.py:946` (WS3's
-# file this epic) mirrors the analyzer's decision-id derivation with a
-# hardcoded "sonnet_filing_analysis_v1" literal — flipping this constant
-# without that line is a silent decision-id mismatch (the loop would
-# never find the proposal it just analyzed). Escalated to team-lead;
-# the integration pass flips this constant and the loop literal
-# together (or points the loop at this constant).
-ACTIVE_SONNET_ANALYSIS_PROMPT = "sonnet_filing_analysis_v1"
+# loop._compose_decision_id mirrors the analyzer's decision-id
+# derivation by importing ACTIVE_SONNET_ANALYSIS_PROMPT, so flipping
+# this constant moves both sides together (the v1-era hardcoded
+# literal was a silent-mismatch hazard, removed at integration).
+ACTIVE_SONNET_ANALYSIS_PROMPT = "sonnet_filing_analysis_v2"
 ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT = "opus_proposal_review_v2"
 ACTIVE_OPUS_THESIS_REVIEW_PROMPT = "opus_thesis_review_v2"
 

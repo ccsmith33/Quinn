@@ -959,12 +959,16 @@ class AgentLoop:
 
     def _compose_decision_id(self, filing: FilingRow) -> str:
         """Mirror SonnetAnalyzer's decision_id derivation so the loop
-        can look up the persisted proposal after analyze() returns."""
+        can look up the persisted proposal after analyze() returns.
+        The prompt name MUST be the constant the builder resolves for
+        the analyzer (ACTIVE_SONNET_ANALYSIS_PROMPT) — a diverging
+        literal here silently mismatches decision ids."""
         from analyzer.sonnet import compute_decision_id
+        from prompts.loader import ACTIVE_SONNET_ANALYSIS_PROMPT
 
         sonnet_model_id = self._components.analyzer._sonnet_model_id  # noqa: SLF001
         prompt_version = self._components.analyzer._builder.prompt_version(  # noqa: SLF001
-            "sonnet_filing_analysis_v1"
+            ACTIVE_SONNET_ANALYSIS_PROMPT
         )
         return compute_decision_id(
             filing_id=filing.id,
