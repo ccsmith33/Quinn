@@ -69,8 +69,15 @@ HOLD_RESCHEDULE_DAYS = 7
 # is in one of these (or gone). Anything else (accepted / new /
 # partially_filled / pending_*) means the original order is still live
 # at the broker, so the failed replace is transient: retry tomorrow.
+#
+# `done_for_day` is deliberately NOT here (W2-L3 alignment with the
+# converter's healable set): an Alpaca GTC order parked done_for_day
+# resumes next session — it is standing protection, and re-placing
+# over it would race a second full-qty sell against it (the oversell
+# class this epic excises). Treat as transient; the PATCH succeeds
+# when the order resumes.
 _DEAD_ORDER_STATUSES = frozenset(
-    {"expired", "canceled", "done_for_day", "rejected", "replaced",
+    {"expired", "canceled", "rejected", "replaced",
      "suspended", "stopped"}
 )
 
@@ -98,7 +105,7 @@ def _default_get_live_protective_order(
     try:
         # WS1 §7.4 — lands with the merge train; missing name raises
         # ImportError until then, so the except arm below covers it.
-        from journal.repo import (  # type: ignore[attr-defined]
+        from journal.repo import (
             get_live_protective_order,
         )
     except ImportError:
@@ -132,7 +139,7 @@ def _default_record_order_outcome(
     try:
         # WS1 §7.4 — lands with the merge train; missing name raises
         # ImportError until then, so the except arm below covers it.
-        from journal.repo import (  # type: ignore[attr-defined]
+        from journal.repo import (
             record_order_outcome,
         )
     except ImportError:

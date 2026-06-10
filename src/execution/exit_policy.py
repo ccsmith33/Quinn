@@ -94,7 +94,7 @@ def _default_record_order_outcome(
     try:
         # WS1 §7.4 — lands with the merge train; missing name raises
         # ImportError until then, so the except arm below covers it.
-        from journal.repo import (  # type: ignore[attr-defined]
+        from journal.repo import (
             record_order_outcome,
         )
     except ImportError:
