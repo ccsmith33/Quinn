@@ -206,6 +206,13 @@ def test_no_update_or_delete_on_append_only_tables() -> None:
     them with mutable `state` / `replayed_at` columns and the four
     UPDATE statements live in `mark_virtual_exit_submitted`,
     `mark_virtual_exit_obsolete`, and `mark_deferred_replayed`.
+
+    ORDERS allows exactly ONE UPDATE site as of D-078 (ADR-010): the fill
+    columns (`final_status`, `realized_fill_*`) are deferred-completion
+    fields that transition NULL→value once via `record_order_outcome`
+    (idempotent on identical re-call, raises on conflicting re-call).
+    Rows are still never deleted; DELETE remains forbidden and the single
+    UPDATE site is pinned below.
     """
     src = (Path(__file__).resolve().parent.parent.parent / "src" / "journal" / "repo.py").read_text(
         encoding="utf-8"
@@ -215,7 +222,6 @@ def test_no_update_or_delete_on_append_only_tables() -> None:
         "PROPOSALS",
         "PROPOSAL_REVIEWS",
         "EXECUTIONS",
-        "ORDERS",
         "POSITIONS",
         "ACCOUNT_SNAPSHOTS",
         "KILL_SWITCH_STATE",
@@ -229,12 +235,55 @@ def test_no_update_or_delete_on_append_only_tables() -> None:
         assert f"DELETE FROM {tbl}" not in upper, (
             f"DELETE on append-only table {tbl} found in repo.py"
         )
+    # D-078 (ADR-010): orders fill-completion is the ONLY update path —
+    # exactly one UPDATE ORDERS statement, and never a DELETE.
+    assert upper.count("UPDATE ORDERS") == 1, (
+        "orders allows exactly one UPDATE site (record_order_outcome)"
+    )
+    assert "DELETE FROM ORDERS" not in upper
     # PDT-SUNSET-2026-06-04: the four UPDATEs on virtual_exits + deferred_sells
     # are an intentional carve-out per ADR-009. Asserting they exist locks in
     # the design and lets the reviewer find the exact mutation sites.
     assert "UPDATE VIRTUAL_EXITS SET STATE = 'SUBMITTED'" in upper
     assert "UPDATE VIRTUAL_EXITS SET STATE = 'OBSOLETE'" in upper
     assert "UPDATE DEFERRED_SELLS SET REPLAYED_AT = CURRENT_TIMESTAMP" in upper
+
+
+def test_record_order_outcome_is_sole_orders_update_in_codebase() -> None:
+    """NFR-16a guard (D-078, delta §2.1 item 3): `record_order_outcome`
+    is the ONLY UPDATE statement against `orders` anywhere in src/ —
+    same grep-test pattern as the D-007 no-mode-branch lint. The four
+    fill-outcome columns transition NULL→value exactly once through that
+    single site; any second writer is an invariant violation, not a
+    style problem."""
+    src_root = Path(__file__).resolve().parent.parent.parent / "src"
+    update_sites: list[str] = []
+    delete_sites: list[str] = []
+    for py in src_root.rglob("*.py"):
+        for lineno, line in enumerate(
+            py.read_text(encoding="utf-8").splitlines(), start=1
+        ):
+            upper_line = line.upper()
+            if "UPDATE ORDERS" in upper_line:
+                update_sites.append(f"{py.relative_to(src_root)}:{lineno}")
+            if "DELETE FROM ORDERS" in upper_line:
+                delete_sites.append(f"{py.relative_to(src_root)}:{lineno}")
+    assert delete_sites == [], (
+        f"DELETE against orders found: {delete_sites}"
+    )
+    assert len(update_sites) == 1, (
+        "exactly one UPDATE orders site is blessed "
+        f"(record_order_outcome in journal/repo.py); found: {update_sites}"
+    )
+    assert update_sites[0].startswith("journal/repo.py"), update_sites
+    # Pin the site to record_order_outcome itself: the UPDATE must occur
+    # AFTER the function's def and before the next top-level def.
+    repo_src = (src_root / "journal" / "repo.py").read_text(encoding="utf-8")
+    fn_start = repo_src.index("def record_order_outcome(")
+    fn_end = repo_src.index("\ndef ", fn_start)
+    assert "UPDATE orders" in repo_src[fn_start:fn_end], (
+        "the single UPDATE orders site must live inside record_order_outcome"
+    )
 
 
 def test_concurrent_inserts_persist(db: str) -> None:

@@ -697,6 +697,120 @@ def get_orders_since(
 
 
 # ---------------------------------------------------------------------------
+# orders — fill-outcome API (D-078, delta §2.1/§7.4, ADR-010)
+# ---------------------------------------------------------------------------
+
+class OrderOutcomeConflict(Exception):
+    """Raised when `record_order_outcome` would overwrite an already-recorded
+    outcome with different values, or targets an unknown order id.
+
+    NFR-16 reading (ADR-010): the fill columns are deferred-completion
+    fields; they transition NULL→value exactly once. An identical re-call
+    is an idempotent no-op; a conflicting one is corruption and must raise.
+    """
+
+
+def get_orders_pending_fill(db_path: str) -> list[OrderRow]:
+    """All `orders` rows with `final_status IS NULL` — submitted to the
+    broker, terminal outcome not yet recorded. Polled by the FillIngestor
+    every reconcile tick (≤ ~15 rows at v1 volume; idx_orders_pending_fill).
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE final_status IS NULL ORDER BY id ASC"
+        ).fetchall()
+    return [OrderRow(**dict(r)) for r in rows]
+
+
+def record_order_outcome(
+    db_path: str,
+    order_id: int,
+    final_status: str,
+    *,
+    fill_price: float | None,
+    fill_qty: int | None,
+    fill_at: _dt.datetime | None,
+) -> None:
+    """One-time NULL→value completion of an order's fill columns.
+
+    Idempotent on an identical re-call; raises `OrderOutcomeConflict` on a
+    re-call with different values or an unknown `order_id`. Rows are never
+    deleted or re-edited — this is state-machine completion, not history
+    mutation (delta §2.1 item 3).
+    """
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT final_status, realized_fill_price, realized_fill_qty, "
+            "realized_fill_at FROM orders WHERE id = ?",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            raise OrderOutcomeConflict(f"no orders row with id={order_id}")
+        if row["final_status"] is not None:
+            same = (
+                row["final_status"] == final_status
+                and row["realized_fill_price"] == fill_price
+                and row["realized_fill_qty"] == fill_qty
+            )
+            if same:
+                return  # idempotent no-op
+            raise OrderOutcomeConflict(
+                f"order {order_id} outcome already recorded as "
+                f"{row['final_status']!r}; refusing to overwrite with "
+                f"{final_status!r}"
+            )
+        _exec_write(
+            conn,
+            "UPDATE orders SET final_status = ?, realized_fill_price = ?, "
+            "realized_fill_qty = ?, realized_fill_at = ? WHERE id = ?",
+            (final_status, fill_price, fill_qty, fill_at, order_id),
+        )
+
+
+def get_lifecycle_orders_for_symbol(
+    db_path: str, *, symbol: str, filled_since: _dt.datetime
+) -> list[OrderRow]:
+    """Orders for `symbol` that can still explain a position diff
+    (delta §2.2): pending fill (`final_status IS NULL` — regardless of
+    age, killing the RC-2 submitted_at time bomb) or filled with
+    `realized_fill_at` on/after `filled_since` (callers pass now − 2 ticks).
+    `partially_filled_closed` rows carry real fill qty and qualify too.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE symbol = ? AND ("
+            "  final_status IS NULL"
+            "  OR (final_status IN ('filled', 'partially_filled_closed')"
+            "      AND realized_fill_at >= ?)"
+            ") ORDER BY id ASC",
+            (symbol, filled_since),
+        ).fetchall()
+    return [OrderRow(**dict(r)) for r in rows]
+
+
+def get_live_protective_order(
+    db_path: str, execution_id: int, *, roles: tuple[str, ...]
+) -> OrderRow | None:
+    """The newest pending-fill (`final_status IS NULL`) order for the
+    execution whose role is in `roles`. WS2's adjust_stop / ratchet paths
+    use this to find the live broker-side stop; newest wins because a
+    replacement chain appends a new row per PATCH (delta §3.3).
+    """
+    if not roles:
+        return None
+    placeholders = ", ".join("?" for _ in roles)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            f"SELECT * FROM orders WHERE execution_id = ? "
+            f"AND final_status IS NULL AND role IN ({placeholders}) "
+            f"ORDER BY id DESC LIMIT 1",
+            (execution_id, *roles),
+        ).fetchone()
+    d = _row_to_dict(row)
+    return OrderRow(**d) if d is not None else None
+
+
+# ---------------------------------------------------------------------------
 # positions (append-only)
 # ---------------------------------------------------------------------------
 
@@ -720,6 +834,35 @@ def insert_position(db_path: str, row: PositionRow) -> int:
             ),
         )
         return int(cur.lastrowid or 0)
+
+
+def insert_position_tombstone(
+    db_path: str,
+    *,
+    symbol: str,
+    source: str,
+    notes: str,
+    snapshot_at: _dt.datetime | None = None,
+) -> int:
+    """Append a qty=0 `positions` row marking `symbol` closed (D-078,
+    delta §2.1 item 4). `get_open_positions` / `has_open_position` take
+    the latest row per symbol, so a tombstone drops the symbol from the
+    journal's open view with no change to either reader. Closes are new
+    rows, never edits (NFR-16).
+    """
+    return insert_position(
+        db_path,
+        PositionRow(
+            snapshot_at=snapshot_at or _dt.datetime.now(_dt.UTC),
+            source=source,
+            symbol=symbol,
+            qty=0,
+            avg_entry_price=0.0,
+            market_value=0.0,
+            unrealized_pnl=0.0,
+            notes=notes,
+        ),
+    )
 
 
 def get_latest_position_for_symbol(db_path: str, symbol: str) -> PositionRow | None:
@@ -790,6 +933,24 @@ def get_latest_kill_switch_state(db_path: str) -> KillSwitchStateRow:
             "kill_switch_state has no rows; seed row missing — schema is corrupt"
         )
     return KillSwitchStateRow(**dict(row))
+
+
+def get_kill_switch_halts_since_last_resume(
+    db_path: str,
+) -> list[KillSwitchStateRow]:
+    """Halted rows newer than the most recent 'active' row — i.e. the
+    UNRESOLVED halt window (WS1 dedupe, D-078 delta §2.3). The seed row
+    is state='active', so the subquery always has an anchor; the list is
+    empty whenever the switch is currently active.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM kill_switch_state "
+            "WHERE state = 'halted' AND set_at > ("
+            "  SELECT MAX(set_at) FROM kill_switch_state WHERE state = 'active'"
+            ") ORDER BY set_at ASC",
+        ).fetchall()
+    return [KillSwitchStateRow(**dict(r)) for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -1197,6 +1358,59 @@ class JournalRepo:
     def mark_deferred_skipped(self, did: int, reason: str) -> None:
         mark_deferred_skipped(self.db_path, did, reason)
 
+    # orders fill-outcome API (D-078, delta §7.4)
+    def get_orders_pending_fill(self) -> list[OrderRow]:
+        return get_orders_pending_fill(self.db_path)
+
+    def record_order_outcome(
+        self,
+        order_id: int,
+        final_status: str,
+        *,
+        fill_price: float | None,
+        fill_qty: int | None,
+        fill_at: _dt.datetime | None,
+    ) -> None:
+        record_order_outcome(
+            self.db_path,
+            order_id,
+            final_status,
+            fill_price=fill_price,
+            fill_qty=fill_qty,
+            fill_at=fill_at,
+        )
+
+    def get_lifecycle_orders_for_symbol(
+        self, symbol: str, filled_since: _dt.datetime
+    ) -> list[OrderRow]:
+        return get_lifecycle_orders_for_symbol(
+            self.db_path, symbol=symbol, filled_since=filled_since
+        )
+
+    def get_live_protective_order(
+        self, execution_id: int, roles: tuple[str, ...]
+    ) -> OrderRow | None:
+        return get_live_protective_order(self.db_path, execution_id, roles=roles)
+
+    def insert_position_tombstone(
+        self,
+        symbol: str,
+        source: str,
+        notes: str,
+        *,
+        snapshot_at: _dt.datetime | None = None,
+    ) -> int:
+        return insert_position_tombstone(
+            self.db_path,
+            symbol=symbol,
+            source=source,
+            notes=notes,
+            snapshot_at=snapshot_at,
+        )
+
+    def get_latest_position_for_symbol(self, symbol: str) -> PositionRow | None:
+        return get_latest_position_for_symbol(self.db_path, symbol)
+
     # positions, account_snapshots (S6.5 reconciler)
     def insert_position(self, row: PositionRow) -> int:
         return insert_position(self.db_path, row)
@@ -1207,6 +1421,9 @@ class JournalRepo:
     # kill_switch_state (S7.1)
     def insert_kill_switch_state(self, row: KillSwitchStateRow) -> None:
         insert_kill_switch_state(self.db_path, row)
+
+    def get_kill_switch_halts_since_last_resume(self) -> list[KillSwitchStateRow]:
+        return get_kill_switch_halts_since_last_resume(self.db_path)
 
     def get_latest_kill_switch_state(self) -> KillSwitchStateRow | None:
         try:
