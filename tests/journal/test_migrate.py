@@ -84,7 +84,13 @@ def test_idempotent(tmp_path: Path) -> None:
     assert v1 == v2
     with sqlite3.connect(str(db)) as conn:
         rows = conn.execute("SELECT COUNT(*) FROM meta").fetchone()
-    assert rows[0] == v1
+    # One meta row per migration FILE, not per version number — the
+    # Option-B epic reserves numbers per workstream (005 = WS1, 006 =
+    # WS2, 007 = WS3), so a branch can legitimately carry a gap and
+    # `apply_migrations` returns max(version), not a contiguous count.
+    from journal.migrate import _discover_migrations
+
+    assert rows[0] == len(_discover_migrations())
 
 
 def test_wal_mode_enabled(tmp_path: Path) -> None:
