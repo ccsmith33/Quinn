@@ -218,6 +218,11 @@ def _enum_value(v: Any) -> Any:
 
 def _normalize_submitted(alp: Any) -> SubmittedOrder:
     raw_type = _enum_value(getattr(alp, "order_type", None) or getattr(alp, "type", None))
+    # WS1 (D-078): fill detail for the FillIngestor's get_order_by_id poll.
+    # getattr defaults keep submission-time responses (and older fakes)
+    # working — those orders simply haven't filled yet.
+    filled_avg_price = getattr(alp, "filled_avg_price", None)
+    filled_qty = getattr(alp, "filled_qty", None)
     return SubmittedOrder(
         broker_order_id=str(alp.id),
         client_order_id=str(alp.client_order_id),
@@ -229,6 +234,11 @@ def _normalize_submitted(alp: Any) -> SubmittedOrder:
         submitted_at=alp.submitted_at,
         limit_price=float(alp.limit_price) if alp.limit_price is not None else None,
         stop_price=float(alp.stop_price) if alp.stop_price is not None else None,
+        filled_avg_price=(
+            float(filled_avg_price) if filled_avg_price is not None else None
+        ),
+        filled_qty=int(float(filled_qty)) if filled_qty is not None else 0,
+        filled_at=getattr(alp, "filled_at", None),
     )
 
 
@@ -484,6 +494,24 @@ class AlpacaBroker:
             # 404 is "no order with that client_id" — the v1 orphan-order
             # contract treats this as None, not an error. Other rejections
             # (auth failure, malformed id) still propagate.
+            if e.status_code == 404:
+                return None
+            raise
+        if raw is None:
+            return None
+        return _normalize_submitted(raw)
+
+    def get_order_by_id(self, broker_order_id: str) -> SubmittedOrder | None:
+        """WS1 (D-078, delta §7.1, ADR-010) — FillIngestor poll target.
+
+        GET /v2/orders/{id}; the response carries `filled_avg_price` /
+        `filled_qty` / `filled_at`, normalized into the SubmittedOrder
+        fill fields. 404 → None per the BrokerAdapter contract (an order
+        the broker has purged is not a transport error).
+        """
+        try:
+            raw = _retry(self._trading.get_order_by_id, broker_order_id)
+        except BrokerRejected as e:
             if e.status_code == 404:
                 return None
             raise

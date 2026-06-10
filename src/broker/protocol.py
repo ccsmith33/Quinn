@@ -111,7 +111,12 @@ class BracketOrderRequest(_Domain):
 
 
 class SubmittedOrder(_Domain):
-    """Broker's acknowledgement after submit; canonical fields the journal records."""
+    """Broker's acknowledgement after submit; canonical fields the journal records.
+
+    WS1 (D-078, delta §7.1): also the response shape of `get_order_by_id`,
+    so it carries the broker's fill detail. Fill fields default to empty
+    for submission-time acknowledgements (nothing has filled yet).
+    """
 
     broker_order_id: str
     client_order_id: str
@@ -123,6 +128,9 @@ class SubmittedOrder(_Domain):
     submitted_at: dt.datetime
     limit_price: float | None = None
     stop_price: float | None = None
+    filled_avg_price: float | None = None
+    filled_qty: int = 0
+    filled_at: dt.datetime | None = None
 
 
 class AccountSnapshot(_Domain):
@@ -271,6 +279,17 @@ class BrokerAdapter(Protocol):
         broker already accepted the order and we must NOT submit
         again. Returns `None` when the broker has no record.
         Implementations must treat 404 as None — do not raise.
+        """
+        ...
+
+    def get_order_by_id(self, broker_order_id: str) -> SubmittedOrder | None:
+        """GET /v2/orders/{id} — current status + fill detail for a
+        previously-submitted order (WS1, D-078, delta §7.1, ADR-010).
+
+        The FillIngestor polls this for every journaled order with
+        `final_status IS NULL` on each reconcile tick. Returns None on
+        404 (mirrors `get_order_by_client_id` — do not raise for a
+        missing order).
         """
         ...
 
