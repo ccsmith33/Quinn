@@ -38,6 +38,7 @@ from broker.alpaca import AlpacaBroker
 from broker.protocol import BrokerAdapter
 from config.loader import AppConfig
 from config.secrets import Secrets
+from execution.exit_policy import ExitPolicyTicker
 from execution.orders import OrderSubmitter
 from execution.pdt_budget import PDTState  # PDT-SUNSET-2026-06-04: ADR-009 wiring.
 from execution.sizing import SizingEngine
@@ -318,6 +319,19 @@ def compose_agent(
     # NOT a loop.py hook — that is the WS1/WS3 seam resolution).
     fill_ingestor = FillIngestor(broker=broker, journal=journal)
 
+    # D-079 §3.5/§3.6 — exit-policy ticker (trailing ratchet +
+    # stale-entry hygiene). Runs once per reconciler tick, after the
+    # thesis hook, in the slot the PDT scanner vacates in P2, via the
+    # `exit_policy_ticker` ctor seam WS1's reconciler exposes
+    # (ADR-011: process down never lowers protection — the broker-side
+    # GTC orders remain the protection when the ticker isn't running).
+    exit_policy_ticker = ExitPolicyTicker(
+        journal=journal,
+        broker=broker,
+        trail_activation_r=config.execution.trail_activation_r,
+        min_ratchet_step_pct=config.execution.min_ratchet_step_pct,
+    )
+
     # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.
     # S5.6 carry-fwd S6.5 reviewer M-3 (HIGH): wire the Telegram alerter
     # at construction so position-discrepancy notifications reach the
@@ -340,6 +354,8 @@ def compose_agent(
         virtual_exits_scanner=virtual_exits_scanner,
         # WS1 (D-078): fill truth first, every tick.
         fill_ingestor=fill_ingestor,
+        # D-079 §3.5: exit-policy hook, after the thesis hook.
+        exit_policy_ticker=exit_policy_ticker,
     )
 
     # AlertWatcher (S8.2) — must be constructed AFTER migrations have

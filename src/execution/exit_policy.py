@@ -120,9 +120,10 @@ def _default_record_order_outcome(
 class ExitPolicyTicker:
     """Deterministic per-tick exit-policy actuator (D-079 §3.5/§3.6).
 
-    Implements the reconciler hook shape (`async def run_tick`) the
-    retro / thesis coordinators established; runs after the thesis hook
-    in composition order.
+    Implements the reconciler's exit-policy hook shape — a *sync*
+    `run_tick`, like the scanner's, per WS1's seam (the reconciler
+    invokes it without await); runs after the thesis hook in
+    composition order.
     """
 
     def __init__(
@@ -152,7 +153,7 @@ class ExitPolicyTicker:
             )
         )
 
-    async def run_tick(self) -> None:
+    def run_tick(self) -> None:
         """One exit-policy tick. Errors on a single execution/order are
         logged and never stop the rest of the tick (same protective
         shape as the retro/thesis hooks)."""

@@ -10,7 +10,6 @@ Actuator tests assert broker-call ARGUMENTS, not just journal writes.
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import json
 from pathlib import Path
@@ -328,7 +327,9 @@ def _tick(
         now_fn=lambda: now,
         **kwargs,
     )
-    asyncio.run(ticker.run_tick())
+    # Sync, like the scanner hook — WS1's reconciler seam invokes the
+    # exit-policy ticker without await.
+    ticker.run_tick()
     return ticker
 
 
