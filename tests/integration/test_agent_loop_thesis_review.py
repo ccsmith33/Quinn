@@ -517,13 +517,16 @@ def _seed_prompts(db: str, prompt_builder: Any) -> tuple[str, str]:
             content_hash="x" * 64,
         ),
     )
-    thesis_pv = prompt_builder.prompt_version("opus_thesis_review_v1")
+    # The thesis reviewer composes the ACTIVE prompt (v2 since D-079).
+    from prompts.loader import ACTIVE_OPUS_THESIS_REVIEW_PROMPT
+
+    thesis_pv = prompt_builder.prompt_version(ACTIVE_OPUS_THESIS_REVIEW_PROMPT)
     insert_prompt(
         db,
         PromptRow(
             prompt_version=thesis_pv,
-            name="opus_thesis_review_v1",
-            file_path="src/prompts/opus_thesis_review_v1.txt",
+            name=ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
+            file_path=f"src/prompts/{ACTIVE_OPUS_THESIS_REVIEW_PROMPT}.txt",
             content_hash="y" * 64,
         ),
     )

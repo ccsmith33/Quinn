@@ -58,13 +58,15 @@ def _seed_prompt(db: str) -> str:
 
 def _seed_opus_prompt(db: str, prompt_builder: Any) -> str:
     """Register the real Opus prompt version so proposal_reviews FK holds."""
-    pv = prompt_builder.prompt_version("opus_proposal_review_v1")
+    from prompts.loader import ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT
+
+    pv = prompt_builder.prompt_version(ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT)
     insert_prompt(
         db,
         PromptRow(
             prompt_version=pv,
-            name="opus_proposal_review_v1",
-            file_path="src/prompts/opus_proposal_review_v1.txt",
+            name=ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT,
+            file_path=f"src/prompts/{ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT}.txt",
             content_hash="y" * 64,
         ),
     )

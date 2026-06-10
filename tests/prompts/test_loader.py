@@ -34,14 +34,25 @@ def _make_prompt_dir(root: Path) -> Path:
     (root / "fragments").mkdir(parents=True)
     (root / "schemas").mkdir()
 
-    # Top-level prompts.
+    # Top-level prompts. The v2s exist because the builder's ACTIVE_*
+    # names (D-079) compose them; v1s stay for the version-roll tests.
     (root / "sonnet_filing_analysis_v1.txt").write_text(
         "# Sonnet filing analysis prompt v1\n"
         "Include: <<role>> <<rules_invariant>> <<output_schema>>\n"
         "Schema: <<schemas/trade_proposal.json>>\n"
     )
+    (root / "sonnet_filing_analysis_v2.txt").write_text(
+        "# Sonnet filing analysis prompt v2\n"
+        "Include: <<role>> <<rules_invariant>> <<output_schema>>\n"
+        "Schema: <<schemas/trade_proposal_v2.json>>\n"
+    )
     (root / "opus_proposal_review_v1.txt").write_text(
         "# Opus proposal review prompt v1\n"
+        "Include: <<role>> <<rules_invariant>>\n"
+        "Schema: <<schemas/opus_proposal_review.json>>\n"
+    )
+    (root / "opus_proposal_review_v2.txt").write_text(
+        "# Opus proposal review prompt v2\n"
         "Include: <<role>> <<rules_invariant>>\n"
         "Schema: <<schemas/opus_proposal_review.json>>\n"
     )
@@ -66,6 +77,9 @@ def _make_prompt_dir(root: Path) -> Path:
     )
     (root / "schemas" / "opus_proposal_review.json").write_text(
         json.dumps({"title": "OpusProposalReview", "type": "object"})
+    )
+    (root / "schemas" / "trade_proposal_v2.json").write_text(
+        json.dumps({"title": "TradeProposal", "type": "object"})
     )
     return root
 
@@ -307,6 +321,52 @@ def test_real_prompt_files_load(tmp_path: Path) -> None:
     assert builder.prompt_version("sonnet_filing_analysis_v1").startswith(
         "sonnet_filing_analysis_v1@"
     )
+
+
+def test_d079_v2_prompts_ship_and_v2_is_active_for_opus_stages() -> None:
+    """D-079 §3.2/§3.4: the v2 prompt files exist beside byte-identical
+    v1s (ADR-005 — new versions, never in-place edits); the Opus stages
+    compose v2; the sonnet stage stays on v1 until the loop.py
+    decision-id mirror flips with it (see ACTIVE_SONNET_ANALYSIS_PROMPT)."""
+    from prompts.loader import (
+        ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT,
+        ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
+        ACTIVE_SONNET_ANALYSIS_PROMPT,
+    )
+
+    pdir = Path(__file__).resolve().parent.parent.parent / "src" / "prompts"
+    for name in (
+        "sonnet_filing_analysis_v2",
+        "opus_proposal_review_v2",
+        "opus_thesis_review_v2",
+    ):
+        assert (pdir / f"{name}.txt").is_file()
+    assert (pdir / "schemas" / "thesis_review_v2.json").is_file()
+    assert (pdir / "schemas" / "trade_proposal_v2.json").is_file()
+
+    assert ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT == "opus_proposal_review_v2"
+    assert ACTIVE_OPUS_THESIS_REVIEW_PROMPT == "opus_thesis_review_v2"
+    assert ACTIVE_SONNET_ANALYSIS_PROMPT == "sonnet_filing_analysis_v1"
+
+    builder = PromptBuilder(pdir)
+    # The composed thesis-review v2 carries the new decision and the v2
+    # schema (adjust_take_profit / new_tp_price).
+    composed = builder._composed_system_bytes(  # noqa: SLF001
+        "opus_thesis_review_v2"
+    ).decode("utf-8")
+    assert "adjust_take_profit" in composed
+    assert "new_tp_price" in composed
+    # Symmetric exit guidance reached the proposal reviewer.
+    review_composed = builder._composed_system_bytes(  # noqa: SLF001
+        "opus_proposal_review_v2"
+    ).decode("utf-8")
+    assert "widen" in review_composed
+    # The sonnet v2 states the R:R floor and the trail field.
+    sonnet_composed = builder._composed_system_bytes(  # noqa: SLF001
+        "sonnet_filing_analysis_v2"
+    ).decode("utf-8")
+    assert "1.5" in sonnet_composed
+    assert "trail_distance_pct" in sonnet_composed
 
 
 def test_committed_lock_matches_committed_files() -> None:

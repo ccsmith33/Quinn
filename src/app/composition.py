@@ -67,11 +67,17 @@ from universe.api import Universe
 log = get_logger(__name__)
 
 # Names whose composed pv must be registered before any LLM call. Maps
-# 1:1 to `_PROMPT_DEFS` in `prompts.loader`.
+# 1:1 to `_PROMPT_DEFS` in `prompts.loader`. The D-079 v2s are
+# registered alongside the v1s: the Opus stages run v2 now, the sonnet
+# stage flips at integration (see ACTIVE_SONNET_ANALYSIS_PROMPT in
+# prompts.loader) — pre-registering makes the flip journal-safe.
 _COMPOSED_PROMPT_NAMES: tuple[str, ...] = (
     "sonnet_filing_analysis_v1",
+    "sonnet_filing_analysis_v2",
     "opus_proposal_review_v1",
+    "opus_proposal_review_v2",
     "opus_thesis_review_v1",
+    "opus_thesis_review_v2",
 )
 
 
