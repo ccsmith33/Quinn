@@ -17,9 +17,26 @@ still-running scanner keeps covering it.
 Per execution group with `state='active'` rows on a broker-open position:
 
 1. Idempotency pre-check: `get_order_by_client_id('pdt-convert-{vid}')`
-   per row — a hit means a prior boot already converted this group and
-   crashed before the journal write; journal the found order, mark the
-   rows, submit nothing (the established crash-recovery pattern).
+   per row — a hit on a LIVE (or executed) order means a prior boot
+   already converted this group and crashed before the journal write;
+   journal the found order, mark the rows, submit nothing (the
+   established crash-recovery pattern). A hit on a DEAD order
+   (rejected/canceled/expired/suspended/replaced — async rejection, a
+   broker sweep, or a deliberate operator cancel during triage) is NOT
+   healed: journaling it would flip the group to `submitted`, stop the
+   scanner, and silently leave the position with zero live protection
+   (the 2026-05-07 unprotected-positions class). Instead the group is
+   counted as an error, logged as `pdt_transition.heal_dead_order`, and
+   left `active` so the scanner keeps covering it. Recovery is a
+   deliberate OPERATOR step, not an automatic resubmit: a dead order
+   here can mean the operator intentionally canceled it (the cutover
+   runbook's manual-stop-cancellation gate), and a `replaced` order
+   means live protection already exists at the broker under a different
+   id — auto-resubmitting under a fresh client id could double-sell.
+   The Task #7 runbook owns the triage step: inspect the dead order at
+   the broker, then either place protection manually and mark the
+   group's rows obsolete, or close the position (the converter then
+   logs `skipped_no_position` and the scanner grace retires the rows).
 2. Already-breached stop (`quote.last <= stop_price`): immediate market
    sell — a GTC stop below market triggers instantly anyway, with worse
    price control. A sibling TP row is marked obsolete (the market sell
@@ -33,8 +50,9 @@ Per execution group with `state='active'` rows on a broker-open position:
    unjournaled PDT sells make broker-position decreases unexplainable
    and halt the reconciler — then `mark_virtual_exit_submitted`.
 5. Drain: every unreplayed `deferred_sells` row whose source virtual
-   exit was converted this run, or whose position is already closed, is
-   invalidated with notes. The converter runs BEFORE the deferred
+   exit was converted this run ('invalidated: superseded by D-077
+   conversion'), or whose position is already closed ('invalidated:
+   position closed'), is invalidated with that note. The converter runs BEFORE the deferred
    replayer in `AgentLoop._boot` (ordering is load-bearing), so the
    replayer can never double-sell against a freshly-converted order.
 
@@ -45,6 +63,7 @@ positions. The scanner's consecutive-miss grace owns that call
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -56,6 +75,27 @@ log = get_logger(__name__)
 
 _CONVERSION_ORDER_NOTE = "D-077 conversion"
 _DEFERRED_INVALIDATION_NOTE = "invalidated: superseded by D-077 conversion"
+_DEFERRED_CLOSED_NOTE = "invalidated: position closed"
+
+# W3-H2: a client-id pre-check hit is healable only while the order is
+# live at the broker (or executed). Everything else — the review's dead
+# set {rejected, canceled, expired, suspended, replaced} plus any status
+# this module doesn't recognize ('calculated'/'stopped'/'held' fail safe
+# into the dead path) — means the prior boot's conversion died between
+# boots and the position is protected by nothing but the still-running
+# scanner.
+_HEALABLE_ORDER_STATUSES = frozenset(
+    {
+        "accepted",
+        "new",
+        "pending_new",
+        "partially_filled",
+        "filled",
+        "done_for_day",
+        "pending_cancel",
+        "pending_replace",
+    }
+)
 
 
 class ConverterBroker(Protocol):
@@ -127,7 +167,13 @@ def _conversion_order_row(
         tif="gtc" if so.order_type in ("stop", "limit") else "day",
         broker_order_id=so.broker_order_id,
         submitted_at=so.submitted_at,
-        final_status=so.status,
+        # D-078 §7.4: final_status is a deferred-completion field — NULL
+        # until the FillIngestor records a terminal disposition. The
+        # broker ack (so.status: 'accepted'/'new') is not terminal and
+        # would hide the order from get_orders_pending_fill
+        # (final_status IS NULL), making a converted GTC leg's fill
+        # permanently unexplainable to the §2.2 classifier.
+        final_status=None,
         notes=_CONVERSION_ORDER_NOTE,
     )
 
@@ -186,11 +232,16 @@ class PDTTransitionConverter:
         for d in unreplayed:
             if d.id is None:
                 continue
-            if d.virtual_exit_id in converted_vids or d.symbol not in open_symbols:
-                self._journal.mark_deferred_skipped(
-                    d.id, reason=_DEFERRED_INVALIDATION_NOTE
-                )
-                invalidated += 1
+            # Distinct notes per delta §4.2 step 5: superseded-by-
+            # conversion vs. position-already-closed (triage granularity).
+            if d.virtual_exit_id in converted_vids:
+                reason = _DEFERRED_INVALIDATION_NOTE
+            elif d.symbol not in open_symbols:
+                reason = _DEFERRED_CLOSED_NOTE
+            else:
+                continue
+            self._journal.mark_deferred_skipped(d.id, reason=reason)
+            invalidated += 1
 
         report = ConversionReport(
             converted_market=self._counts["market"],
@@ -247,12 +298,39 @@ class PDTTransitionConverter:
         tp = next((r for r in rows if r.role == "tp"), None)
 
         # -- Step 1: idempotency pre-check (prior-boot crash heal) -------
+        dead: SubmittedOrder | None = None
         for r in rows:
             assert r.id is not None  # filtered by caller
             existing = self._broker.get_order_by_client_id(_client_id(r.id))
-            if existing is not None:
+            if existing is None:
+                continue
+            if existing.status in _HEALABLE_ORDER_STATUSES:
                 self._heal_group(execution_id, r, rows, existing, converted_vids)
                 return
+            dead = existing
+        if dead is not None:
+            # W3-H2: the prior boot's conversion DIED between boots
+            # (async rejection, broker sweep, or operator cancel during
+            # triage — an expected action under the runbook's manual-
+            # stop-cancellation gate). Journaling it would flip the
+            # group to 'submitted' and stop the scanner with zero live
+            # protection left (the 2026-05-07 class). Leave the rows
+            # 'active' (scanner covers), surface loudly, and let the
+            # operator triage — see the module docstring for why this
+            # is deliberately NOT an automatic resubmit.
+            self._counts["errors"] += 1
+            log.error(
+                "pdt_transition.heal_dead_order",
+                extra={
+                    "event": "pdt_transition.heal_dead_order",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "client_order_id": dead.client_order_id,
+                    "broker_order_id": dead.broker_order_id,
+                    "order_status": dead.status,
+                },
+            )
+            return
 
         # -- Step 2: already-breached stop → market sell ------------------
         if stop is not None:
@@ -284,12 +362,30 @@ class PDTTransitionConverter:
         journal write. Journal the found order; close out every row in
         the group against it. An OCO partner leg is not recoverable by
         client id — the matched order's journaled sell row still lets
-        the lifecycle classifier explain either leg's fill (symbol-keyed)."""
-        self._journal.insert_order(
-            _conversion_order_row(
-                execution_id=execution_id, role=matched.role, req_or_so=existing
+        the lifecycle classifier explain either leg's fill (symbol-keyed).
+
+        A prior boot may also have crashed AFTER the journal write but
+        before mark_virtual_exit_submitted: the row already exists, and
+        re-inserting trips orders.broker_order_id's UNIQUE constraint.
+        That violation IS the already-journaled signal — consume it and
+        carry on to the mark step, or the group errors on every boot
+        and the rows stay pinned 'active' (W3-M1)."""
+        try:
+            self._journal.insert_order(
+                _conversion_order_row(
+                    execution_id=execution_id, role=matched.role, req_or_so=existing
+                )
             )
-        )
+        except sqlite3.IntegrityError:
+            log.warning(
+                "pdt_transition.heal_already_journaled",
+                extra={
+                    "event": "pdt_transition.heal_already_journaled",
+                    "execution_id": execution_id,
+                    "symbol": matched.symbol,
+                    "broker_order_id": existing.broker_order_id,
+                },
+            )
         for r in rows:
             assert r.id is not None
             self._journal.mark_virtual_exit_submitted(
