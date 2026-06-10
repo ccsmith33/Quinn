@@ -540,6 +540,96 @@ class AlpacaBroker:
         )
         return _normalize_submitted(raw)
 
+    def replace_limit_order(
+        self,
+        broker_order_id: str,
+        *,
+        new_limit_price: float,
+        client_order_id: str,
+    ) -> SubmittedOrder:
+        """D-079 §7.2 — atomic limit-price replacement (the TP-raise
+        actuator). Same PATCH semantics as `replace_stop_order`: accept
+        means a new order id with no uncovered window; reject leaves
+        the original take-profit live."""
+        replace_req = ReplaceOrderRequest(
+            limit_price=new_limit_price,
+            client_order_id=client_order_id,
+        )
+        raw = _retry(
+            self._trading.replace_order_by_id, broker_order_id, replace_req
+        )
+        return _normalize_submitted(raw)
+
+    def submit_oco_sell(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        limit_price: float | None,
+        client_order_id: str,
+    ) -> tuple[SubmittedOrder, SubmittedOrder | None]:
+        """D-079 §7.3 — protective sell pair for an existing position.
+
+        limit_price set  → Alpaca OCO: the take-profit LIMIT order is the
+                           parent, the stop child arrives in `legs`. One
+                           leg filling cancels the other broker-side.
+        limit_price None → plain GTC stop sell (no OCO wrapper needed).
+
+        Wire shape per Alpaca's OCO contract: `order_class=oco`,
+        `type=limit`, `take_profit.limit_price` + `stop_loss.stop_price`;
+        no top-level limit_price (the take_profit object drives the TP
+        leg). Mirrors `submit_bracket_order`'s defense-in-depth: a
+        response missing the stop child surfaces as BrokerRejected
+        rather than claiming success without a stop.
+        """
+        if limit_price is None:
+            stop_req = OrderRequest(
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                order_type="stop",
+                tif="gtc",
+                client_order_id=client_order_id,
+                stop_price=stop_price,
+            )
+            return self.submit_order(stop_req), None
+
+        oco_req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            order_class=OrderClass.OCO,
+            take_profit=TakeProfitRequest(limit_price=limit_price),
+            stop_loss=StopLossRequest(stop_price=stop_price),
+            client_order_id=client_order_id,
+        )
+        raw = _retry(self._trading.submit_order, oco_req)
+        tp = _normalize_submitted(raw)
+
+        legs = list(getattr(raw, "legs", None) or [])
+        stop_raw = next(
+            (
+                leg
+                for leg in legs
+                if _enum_value(leg.side) == "sell"
+                and _enum_value(
+                    getattr(leg, "order_type", None) or getattr(leg, "type", None)
+                )
+                == "stop"
+            ),
+            None,
+        )
+        if stop_raw is None:
+            raise BrokerRejected(
+                "oco submission accepted but stop leg missing from response",
+                status_code=None,
+                broker_code=None,
+            )
+        stop = _normalize_submitted(stop_raw)
+        return stop, tp
+
 
 __all__ = [
     "AlpacaBroker",

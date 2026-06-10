@@ -89,6 +89,11 @@ class _FakeBroker:
     # exercise the KS-5 / KS-6 pre-market queue path can populate this
     # to simulate pending entries that haven't filled yet.
     open_orders: list[OpenOrder] = field(default_factory=list)
+    # Mutating-call recorders for the D-079 exit actuators — actuator
+    # tests assert broker-call ARGUMENTS, not just journal writes.
+    replaced_stops: list[dict[str, Any]] = field(default_factory=list)
+    replaced_limits: list[dict[str, Any]] = field(default_factory=list)
+    submitted_oco: list[dict[str, Any]] = field(default_factory=list)
     equity: float = 100_000.0
     cash: float = 100_000.0
     quote_last: float = 100.0
@@ -165,13 +170,17 @@ class _FakeBroker:
         self.submitted_by_client_id[req.entry_client_order_id] = entry
         self.submitted_by_broker_id[entry.broker_order_id] = entry
 
-        # Project stop leg.
+        # Project stop leg. HONEST TIF (D-079 §3.1): Alpaca applies one
+        # time_in_force to the whole bracket group — children inherit
+        # the entry's TIF. The old hardcoded "gtc" here mirrored the
+        # journal's O-6 lie and would have masked a regression to DAY
+        # protective legs.
         stop_req = OrderRequest(
             symbol=req.entry_symbol,
             side="sell",
             qty=req.entry_qty,
             order_type="stop",
-            tif="gtc",
+            tif=req.entry_tif,
             client_order_id=f"{req.entry_client_order_id}:bracket-stop",
             stop_price=req.stop_loss_price,
         )
@@ -193,12 +202,14 @@ class _FakeBroker:
 
         tp: SubmittedOrder | None = None
         if req.take_profit_price is not None:
+            # Honest TIF projection — children inherit the group TIF
+            # (D-079 §3.1, same as the stop leg above).
             tp_req = OrderRequest(
                 symbol=req.entry_symbol,
                 side="sell",
                 qty=req.entry_qty,
                 order_type="limit",
-                tif="gtc",
+                tif=req.entry_tif,
                 client_order_id=f"{req.entry_client_order_id}:bracket-tp",
                 limit_price=req.take_profit_price,
             )
@@ -275,6 +286,13 @@ class _FakeBroker:
         # Atomic replace stub mirroring Alpaca's PATCH semantics: the
         # broker emits a new SubmittedOrder with the same protective
         # role but updated stop_price.
+        self.replaced_stops.append(
+            {
+                "old_id": broker_order_id,
+                "new_stop_price": new_stop_price,
+                "client_order_id": client_order_id,
+            }
+        )
         self.next_order_id += 1
         resp = SubmittedOrder(
             broker_order_id=f"fake-replace-{self.next_order_id:06d}",
@@ -289,6 +307,90 @@ class _FakeBroker:
         )
         self.submitted_by_client_id[client_order_id] = resp
         return resp
+
+    def replace_limit_order(
+        self,
+        broker_order_id: str,
+        *,
+        new_limit_price: float,
+        client_order_id: str,
+    ) -> SubmittedOrder:
+        # Atomic replace stub for the live TP leg (D-079 §7.2): same
+        # PATCH semantics as `replace_stop_order` — new order id, no
+        # gap; on failure the original limit order stands (a failing
+        # variant lives in the per-test fakes that need it).
+        self.replaced_limits.append(
+            {
+                "old_id": broker_order_id,
+                "new_limit_price": new_limit_price,
+                "client_order_id": client_order_id,
+            }
+        )
+        self.next_order_id += 1
+        resp = SubmittedOrder(
+            broker_order_id=f"fake-replace-limit-{self.next_order_id:06d}",
+            client_order_id=client_order_id,
+            symbol="REPLACED",
+            side="sell",
+            qty=1,
+            order_type="limit",
+            status="accepted",
+            submitted_at=dt.datetime.now(dt.UTC),
+            limit_price=new_limit_price,
+        )
+        self.submitted_by_client_id[client_order_id] = resp
+        return resp
+
+    def submit_oco_sell(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        limit_price: float | None,
+        client_order_id: str,
+    ) -> tuple[SubmittedOrder, SubmittedOrder | None]:
+        # Sell-side protective pair for an existing position (D-079
+        # §7.3). limit_price set → linked OCO stop+TP; None → plain GTC
+        # stop. Atomic: both legs recorded in one call.
+        self.submitted_oco.append(
+            {
+                "symbol": symbol,
+                "qty": qty,
+                "stop_price": stop_price,
+                "limit_price": limit_price,
+                "client_order_id": client_order_id,
+            }
+        )
+        self.next_order_id += 1
+        stop = SubmittedOrder(
+            broker_order_id=f"fake-oco-stop-{self.next_order_id:06d}",
+            client_order_id=f"{client_order_id}-stop",
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            order_type="stop",
+            status="accepted",
+            submitted_at=dt.datetime.now(dt.UTC),
+            stop_price=stop_price,
+        )
+        self.submitted_by_client_id[stop.client_order_id] = stop
+        tp: SubmittedOrder | None = None
+        if limit_price is not None:
+            self.next_order_id += 1
+            tp = SubmittedOrder(
+                broker_order_id=f"fake-oco-tp-{self.next_order_id:06d}",
+                client_order_id=f"{client_order_id}-tp",
+                symbol=symbol,
+                side="sell",
+                qty=qty,
+                order_type="limit",
+                status="accepted",
+                submitted_at=dt.datetime.now(dt.UTC),
+                limit_price=limit_price,
+            )
+            self.submitted_by_client_id[tp.client_order_id] = tp
+        return stop, tp
 
     def get_account(self) -> AccountSnapshot:
         return AccountSnapshot(

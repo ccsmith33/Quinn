@@ -66,6 +66,15 @@ class ExecutionConfig(_Section):
     # default; flip to False to short-circuit `PDTState.is_active()` and
     # revert to broker-side pre-placement of stops/TPs.
     pdt_enabled: bool = Field(default=True)
+    # D-079 §3.2 — exit-geometry floor: minimum reward:risk a proposal
+    # with a take-profit must clear. Tunable when H3 prod data lands.
+    min_reward_risk: float = Field(default=1.5, gt=0.0)
+    # D-079 §3.5 / ADR-011 — trailing ratchet: engage once the winner has
+    # earned `trail_activation_r` multiples of its initial risk distance;
+    # raise the broker stop only when the new target clears the current
+    # stop by `min_ratchet_step_pct` percent (bounds PATCH chatter).
+    trail_activation_r: float = Field(default=1.0, gt=0.0)
+    min_ratchet_step_pct: float = Field(default=0.25, ge=0.0)
 
 
 class ReconcilerConfig(_Section):

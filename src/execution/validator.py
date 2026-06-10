@@ -49,6 +49,7 @@ RejectReason = Literal[
     "kill_switch",
     "universe",
     "price_floor",
+    "exit_geometry",
     "insufficient_capital",
     "direction_unsupported",
     "pending_capacity",
@@ -104,7 +105,14 @@ class ProposalValidator:
     The `journal` parameter on `validate()` is reserved for forward
     compatibility with S6.4's execution-row write path; this story does not
     persist anything (AC-7).
+
+    `min_reward_risk` (D-079 §3.2, default 1.5): the exit-geometry floor.
+    Wired from `config.execution.min_reward_risk` at composition; tunable
+    when the H3 prod-data verdict lands (D-080).
     """
+
+    def __init__(self, *, min_reward_risk: float = 1.5) -> None:
+        self._min_reward_risk = min_reward_risk
 
     def validate(
         self,
@@ -160,6 +168,42 @@ class ProposalValidator:
         quote: Quote = broker.get_quote(proposal.symbol)
         if quote.bid < _PRICE_FLOOR_USD or quote.last < _PRICE_FLOOR_USD:
             return self._reject(proposal, "price_floor")
+
+        # 5.5 Exit-geometry floor (D-079 §3.2, kills S-4's unconstrained
+        #     half). Longs only in v1. Entry reference: the intended fill —
+        #     entry_limit_price for limit entries, quote.last otherwise
+        #     (same reference the executor's inverted-stop guard uses).
+        #     TP is optional (D-009 discretion preserved): a no-TP proposal
+        #     relies on stop + trailing ratchet + thesis review and is not
+        #     gated here.
+        if proposal.take_profit_price is not None:
+            entry_ref = (
+                proposal.entry_limit_price
+                if proposal.entry_style == "limit"
+                and proposal.entry_limit_price is not None
+                else quote.last
+            )
+            risk = entry_ref - proposal.stop_loss_price
+            reward = proposal.take_profit_price - entry_ref
+            # tp <= entry is the AORT-class inversion on the TP side;
+            # stop >= entry makes the risk denominator non-positive —
+            # both are geometry the floor cannot price.
+            if reward <= 0 or risk <= 0:
+                return self._reject(proposal, "exit_geometry")
+            if reward / risk < self._min_reward_risk:
+                log.info(
+                    "execution.validator.exit_geometry_below_floor",
+                    extra={
+                        "event": "execution.validator.exit_geometry_below_floor",
+                        "symbol": proposal.symbol,
+                        "entry_ref": entry_ref,
+                        "stop_loss_price": proposal.stop_loss_price,
+                        "take_profit_price": proposal.take_profit_price,
+                        "reward_risk": reward / risk,
+                        "min_reward_risk": self._min_reward_risk,
+                    },
+                )
+                return self._reject(proposal, "exit_geometry")
 
         # 6. Capital. AC-6 stub: realized_dollar_size = requested size as a
         #    fraction of equity. S6.3 replaces this with the real sizing

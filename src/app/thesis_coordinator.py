@@ -7,8 +7,8 @@ Drives the open-position thesis-review pipeline:
      - confirm position is still open (stop/TP may have closed it)
      - build review context (price, days held, filings since entry)
      - call ThesisReviewer (Opus)
-     - apply decision: hold | close | adjust_stop
-     - write follow-up schedule (hold / adjust_stop) or none (close)
+     - apply decision: hold | close | adjust_stop | adjust_take_profit
+     - write follow-up schedule (hold / adjust_*) or none (close)
 
 CRITICAL safety constraint (per task description + reviewer pre-read):
 - For `adjust_stop`, the broker's atomic `replace_stop_order` call is
@@ -32,11 +32,13 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from broker.protocol import BrokerAdapter, OrderRequest
+from journal.exit_policy import set_stop_order_journal_id
 from journal.models import (
     OrderRow,
     ThesisReviewScheduleRow,
 )
 from journal.repo import (
+    connect,
     find_due_thesis_reviews,
     get_orders_for_execution,
     get_proposal_by_id,
@@ -48,6 +50,7 @@ from observability.log_port import get_logger
 
 from analyzer.thesis_review import (
     ThesisAdjustStop,
+    ThesisAdjustTakeProfit,
     ThesisClose,
     ThesisHold,
     ThesisReviewContext,
@@ -61,9 +64,95 @@ log = get_logger(__name__)
 # Default cadence for follow-up reviews after a `hold`. Per task spec.
 HOLD_RESCHEDULE_DAYS = 7
 
+# Broker order statuses that mean the order can no longer fill — the
+# §3.3 step-5 fallback re-places protection only when the PATCH target
+# is in one of these (or gone). Anything else (accepted / new /
+# partially_filled / pending_*) means the original order is still live
+# at the broker, so the failed replace is transient: retry tomorrow.
+_DEAD_ORDER_STATUSES = frozenset(
+    {"expired", "canceled", "done_for_day", "rejected", "replaced",
+     "suspended", "stopped"}
+)
+
 
 class _JournalLike(Protocol):
     db_path: str
+
+
+# ---------------------------------------------------------------------------
+# WS1 §7.4 journal-API ports (D-079 §3.3 steps 3/5). The coordinator
+# consumes `get_live_protective_order` / `record_order_outcome` via
+# injected callables; the defaults late-import WS1's repo functions so
+# composition needs no change once the merge train lands, and degrade
+# gracefully while this branch stands alone (repo.py is WS1's file this
+# epic — delta §1).
+# ---------------------------------------------------------------------------
+
+
+def _default_get_live_protective_order(
+    db_path: str, *, execution_id: int, roles: tuple[str, ...]
+) -> OrderRow | None:
+    """Latest orders row for the execution in `roles` that is still
+    pending a terminal disposition (`final_status IS NULL` — the D-078
+    §7.4 lifecycle contract)."""
+    try:
+        # WS1 §7.4 — lands with the merge train; missing name raises
+        # ImportError until then, so the except arm below covers it.
+        from journal.repo import (  # type: ignore[attr-defined]
+            get_live_protective_order,
+        )
+    except ImportError:
+        placeholders = ",".join("?" for _ in roles)
+        with connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT * FROM orders "
+                f"WHERE execution_id = ? AND role IN ({placeholders}) "
+                "AND final_status IS NULL "
+                "ORDER BY id DESC LIMIT 1",
+                (execution_id, *roles),
+            ).fetchone()
+        return OrderRow(**dict(row)) if row is not None else None
+    return get_live_protective_order(db_path, execution_id, roles=roles)
+
+
+def _default_record_order_outcome(
+    db_path: str,
+    order_id: int,
+    final_status: str,
+    *,
+    fill_price: float | None,
+    fill_qty: int | None,
+    fill_at: dt.datetime | None,
+) -> None:
+    """One-time NULL→value completion of the fill-outcome columns
+    (NFR-16a) — `record_order_outcome` is WS1's sole-UPDATE write path,
+    so there is deliberately NO local SQL fallback here. In the window
+    before WS1 merges, the old row simply keeps `final_status` NULL;
+    the latest-row-wins live lookup stays correct."""
+    try:
+        # WS1 §7.4 — lands with the merge train; missing name raises
+        # ImportError until then, so the except arm below covers it.
+        from journal.repo import (  # type: ignore[attr-defined]
+            record_order_outcome,
+        )
+    except ImportError:
+        log.warning(
+            "thesis_coordinator.record_order_outcome_unavailable",
+            extra={
+                "event": "thesis_coordinator.record_order_outcome_unavailable",
+                "order_id": order_id,
+                "final_status": final_status,
+            },
+        )
+        return
+    record_order_outcome(
+        db_path,
+        order_id,
+        final_status,
+        fill_price=fill_price,
+        fill_qty=fill_qty,
+        fill_at=fill_at,
+    )
 
 
 class _FilingsLookup(Protocol):
@@ -89,6 +178,14 @@ class ThesisReviewCoordinator:
         filings_lookup: _FilingsLookup,
         now_fn: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
         default_horizon_days: int = 14,
+        # D-079 §3.4 belt-and-suspenders: a raised TP must not drop the
+        # position's R:R below the §3.2 floor against the current stop.
+        min_reward_risk: float = 1.5,
+        # WS1 §7.4 ports — see the module-level defaults above.
+        get_live_protective_order: (
+            Callable[..., OrderRow | None] | None
+        ) = None,
+        record_order_outcome: Callable[..., None] | None = None,
     ) -> None:
         self._journal = journal
         self._broker = broker
@@ -96,6 +193,23 @@ class ThesisReviewCoordinator:
         self._filings_lookup = filings_lookup
         self._now_fn = now_fn
         self._default_horizon_days = default_horizon_days
+        self._min_reward_risk = min_reward_risk
+        self._get_live_protective_order = get_live_protective_order or (
+            lambda *, execution_id, roles: _default_get_live_protective_order(
+                self._journal.db_path, execution_id=execution_id, roles=roles
+            )
+        )
+        self._record_order_outcome = record_order_outcome or (
+            lambda order_id, final_status, *, fill_price, fill_qty, fill_at:
+            _default_record_order_outcome(
+                self._journal.db_path,
+                order_id,
+                final_status,
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                fill_at=fill_at,
+            )
+        )
 
     async def run_tick(self) -> None:
         """One coordinator tick. Picks up all schedules whose `due_at <=
@@ -223,6 +337,18 @@ class ThesisReviewCoordinator:
                 symbol=proposal.symbol,
                 new_stop_price=result.new_stop_price,
                 now=now,
+                schedule_id=schedule.id or 0,
+                current_price=ctx.current_price,
+            )
+            return
+        if isinstance(result, ThesisAdjustTakeProfit):
+            self._apply_adjust_take_profit(
+                execution_id=execution.id,
+                symbol=proposal.symbol,
+                new_tp_price=result.new_tp_price,
+                now=now,
+                schedule_id=schedule.id or 0,
+                ctx=ctx,
             )
             return
         # Malformed → leave the position alone, schedule a retry for tomorrow
@@ -342,30 +468,38 @@ class ThesisReviewCoordinator:
         symbol: str,
         new_stop_price: float,
         now: dt.datetime,
+        schedule_id: int,
+        current_price: float,
     ) -> None:
-        """SAFETY-CRITICAL: atomic stop-price replacement via the
-        broker adapter's `replace_stop_order` (Alpaca's PATCH
+        """SAFETY-CRITICAL (D-079 §3.3): atomic stop-price replacement
+        via the broker adapter's `replace_stop_order` (Alpaca PATCH
         /v2/orders/{id}). The broker either accepts the replacement
         atomically (new order id, position never uncovered) or rejects
         and the original stop remains live.
 
-        Order:
-          1. Look up the current "live" stop (most recent stop row
-             written for this execution).
-          2. Call `broker.replace_stop_order(broker_order_id,
-             new_stop_price=...)`. On failure: original stop is still
-             live, position is protected; reschedule at +1 day to retry.
-          3. Journal the new stop row (broker returned a new id).
+          1. Live stop = newest `orders` row, role IN
+             ('stop','trailing_stop'), final_status IS NULL (§7.4 port).
+          2. Atomic replace. Success → journal a replacement row (role
+             preserved, final_status NULL), record the old row
+             `replaced` (§7.4), rotate the trailing ratchet's pointer
+             (§3.5 step 4), reschedule +7d.
+          3. Failure → §3.3 step-5 fallback: branch on what actually
+             happened to the PATCH target (`_adjust_stop_fallback`).
 
-        Reschedule the next thesis review at +`HOLD_RESCHEDULE_DAYS`.
+        Direction: the stop may move either way (tighten a loser or
+        widen within validator-equivalent geometry) but never to/above
+        the current price for a long — that is a `close` wearing an
+        adjust_stop costume, and it would fire on the next tick.
         """
         orders = get_orders_for_execution(self._journal.db_path, execution_id)
         entry = next((o for o in orders if o.role == "entry"), None)
-        # Use the most recent stop row as the "current" stop. If a prior
-        # adjust_stop already replaced the original, that newer row wins.
-        stop_orders = [o for o in orders if o.role in ("stop", "thesis_stop")]
-        old_stop = max(stop_orders, key=lambda o: o.id or 0) if stop_orders else None
+        old_stop = self._get_live_protective_order(
+            execution_id=execution_id, roles=("stop", "trailing_stop")
+        )
         if entry is None or old_stop is None or entry.qty <= 0:
+            # No journaled live stop (e.g. PDT-era position before the
+            # WS3 conversion). The scanner still protects those; the
+            # window is one merge step (§3.3 item 6).
             log.warning(
                 "thesis_coordinator.adjust_stop_skipped",
                 extra={
@@ -376,11 +510,23 @@ class ThesisReviewCoordinator:
             )
             return
 
-        # Atomic replace. On failure, old stop remains live; we never
-        # leave the position uncovered.
-        client_order_id = (
-            f"thesis-stop-exec-{execution_id}-{now.timestamp():.0f}"
-        )
+        if new_stop_price <= 0 or new_stop_price >= current_price:
+            log.warning(
+                "thesis_coordinator.adjust_stop_rejected",
+                extra={
+                    "event": "thesis_coordinator.adjust_stop_rejected",
+                    "execution_id": execution_id,
+                    "new_stop_price": new_stop_price,
+                    "current_price": current_price,
+                    "reason": "stop_not_below_current_price",
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="adjust_stop"
+            )
+            return
+
+        client_order_id = f"thesis-adjstop-{schedule_id}"
         try:
             replaced = self._broker.replace_stop_order(
                 old_stop.broker_order_id,
@@ -388,31 +534,26 @@ class ThesisReviewCoordinator:
                 client_order_id=client_order_id,
             )
         except Exception as e:  # noqa: BLE001
-            log.error(
-                "thesis_coordinator.stop_replace_failed",
-                extra={
-                    "event": "thesis_coordinator.stop_replace_failed",
-                    "execution_id": execution_id,
-                    "old_broker_order_id": old_stop.broker_order_id,
-                    "error": str(e),
-                },
-            )
-            # Original stop still alive at broker — position is protected.
-            # Retry tomorrow.
-            self._reschedule(
-                execution_id,
-                when=now + dt.timedelta(days=1),
-                reason="adjust_stop",
+            self._adjust_stop_fallback(
+                execution_id=execution_id,
+                symbol=symbol,
+                qty=entry.qty,
+                old_stop=old_stop,
+                new_stop_price=new_stop_price,
+                now=now,
+                schedule_id=schedule_id,
+                replace_error=e,
             )
             return
 
-        # Journal the new stop. Alpaca's PATCH returns a new order id,
-        # so we add a fresh row rather than mutating the old one.
-        insert_order(
+        # Journal the replacement chain (§3.3 step 3): new row first
+        # (role preserved, live = final_status NULL), then complete the
+        # old row as 'replaced' via the §7.4 single-writer.
+        new_row_id = insert_order(
             self._journal.db_path,
             OrderRow(
                 execution_id=execution_id,
-                role="thesis_stop",
+                role=old_stop.role,
                 symbol=symbol,
                 side="sell",
                 order_type="stop",
@@ -421,12 +562,22 @@ class ThesisReviewCoordinator:
                 stop_price=new_stop_price,
                 broker_order_id=replaced.broker_order_id,
                 submitted_at=replaced.submitted_at,
-                final_status=replaced.status,
+                final_status=None,
                 notes=(
                     f"thesis_review:adjust_stop atomic-replaced "
                     f"{old_stop.broker_order_id}"
                 ),
             ),
+        )
+        self._record_order_outcome(
+            old_stop.id, "replaced", fill_price=None, fill_qty=None, fill_at=None
+        )
+        # §3.3 step 4: keep the trailing ratchet pointed at the live
+        # stop row. No-op when trailing isn't engaged for the execution.
+        set_stop_order_journal_id(
+            self._journal.db_path,
+            execution_id=execution_id,
+            order_journal_id=new_row_id,
         )
 
         log.info(
@@ -442,11 +593,435 @@ class ThesisReviewCoordinator:
             },
         )
 
-        # Reschedule the next review.
         self._reschedule(
             execution_id,
             when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
             reason="adjust_stop",
+        )
+
+    def _adjust_stop_fallback(
+        self,
+        *,
+        execution_id: int,
+        symbol: str,
+        qty: int,
+        old_stop: OrderRow,
+        new_stop_price: float,
+        now: dt.datetime,
+        schedule_id: int,
+        replace_error: Exception,
+    ) -> None:
+        """§3.3 step 5 — re-place protection when the PATCH target is
+        dead. Kills the bracket-mode reschedule-forever loop
+        (exit-policy §5a) and covers the day-2+ book whose DAY legs
+        expired together, until the WS3 conversion lands.
+
+        Branches on `broker.get_order_by_id(old)` + broker position
+        state:
+          - old order filled            → lost race; fill ingestion owns
+                                          the exit. Not an error, no
+                                          reschedule (position closing).
+          - position gone at broker     → no-op; the §2.2 tombstone path
+                                          owns it.
+          - old order still live        → transient PATCH failure; the
+                                          original stop protects, retry
+                                          tomorrow.
+          - old dead + position open    → re-place fresh GTC protection,
+                                          shape matching what died:
+                                          surviving TP leg → cancel it
+                                          and submit one OCO (two
+                                          independent full-qty sells are
+                                          impossible — §4.2 qty
+                                          constraint); both legs dead →
+                                          fresh OCO when the position
+                                          has a TP on record, plain GTC
+                                          stop otherwise.
+        """
+        get_order_by_id = getattr(self._broker, "get_order_by_id", None)
+        if get_order_by_id is None:
+            # Pre-WS1 adapter: cannot interrogate the PATCH target.
+            # Conservative: assume the original stop survives (Alpaca's
+            # PATCH contract) and retry tomorrow.
+            log.error(
+                "thesis_coordinator.stop_replace_failed",
+                extra={
+                    "event": "thesis_coordinator.stop_replace_failed",
+                    "execution_id": execution_id,
+                    "old_broker_order_id": old_stop.broker_order_id,
+                    "error": str(replace_error),
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="adjust_stop"
+            )
+            return
+
+        try:
+            current = get_order_by_id(old_stop.broker_order_id)
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "thesis_coordinator.stop_replace_failed",
+                extra={
+                    "event": "thesis_coordinator.stop_replace_failed",
+                    "execution_id": execution_id,
+                    "old_broker_order_id": old_stop.broker_order_id,
+                    "error": f"{replace_error}; order lookup also failed: {e}",
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="adjust_stop"
+            )
+            return
+
+        if current is not None and current.status == "filled":
+            log.info(
+                "thesis_coordinator.adjust_stop_lost_race",
+                extra={
+                    "event": "thesis_coordinator.adjust_stop_lost_race",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "old_broker_order_id": old_stop.broker_order_id,
+                },
+            )
+            return
+
+        if current is not None and current.status not in _DEAD_ORDER_STATUSES:
+            # Original stop is still live at the broker — the PATCH
+            # failure was transient. Position protected; retry tomorrow.
+            log.error(
+                "thesis_coordinator.stop_replace_failed",
+                extra={
+                    "event": "thesis_coordinator.stop_replace_failed",
+                    "execution_id": execution_id,
+                    "old_broker_order_id": old_stop.broker_order_id,
+                    "broker_status": current.status,
+                    "error": str(replace_error),
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="adjust_stop"
+            )
+            return
+
+        position_open = any(
+            p.symbol == symbol and p.qty > 0 for p in self._broker.get_positions()
+        )
+        if not position_open:
+            log.info(
+                "thesis_coordinator.adjust_stop_position_gone",
+                extra={
+                    "event": "thesis_coordinator.adjust_stop_position_gone",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                },
+            )
+            return
+
+        # Old stop dead (expired/canceled/gone) + position open at the
+        # broker → re-place fresh GTC protection.
+        tp_row = self._get_live_protective_order(
+            execution_id=execution_id, roles=("take_profit",)
+        )
+        tp_price: float | None = tp_row.limit_price if tp_row is not None else None
+        tp_was_live = False
+        if tp_row is not None:
+            try:
+                tp_current = get_order_by_id(tp_row.broker_order_id)
+            except Exception:  # noqa: BLE001
+                tp_current = None
+            tp_was_live = (
+                tp_current is not None
+                and tp_current.status not in _DEAD_ORDER_STATUSES
+                and tp_current.status != "filled"
+            )
+            if tp_was_live:
+                # A second full-qty sell beside the surviving TP is
+                # impossible (the TP holds the position's available
+                # qty) — cancel it and rebuild the pair as one OCO.
+                try:
+                    self._broker.cancel_order(tp_row.broker_order_id)
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "thesis_coordinator.adjust_stop_tp_cancel_failed",
+                        extra={
+                            "event": (
+                                "thesis_coordinator.adjust_stop_tp_cancel_failed"
+                            ),
+                            "execution_id": execution_id,
+                            "tp_broker_order_id": tp_row.broker_order_id,
+                            "error": str(e),
+                        },
+                    )
+                    # TP still holds the qty — an OCO would be rejected.
+                    # The TP leg is live protection upside; retry the
+                    # full rebuild tomorrow.
+                    self._reschedule(
+                        execution_id,
+                        when=now + dt.timedelta(days=1),
+                        reason="adjust_stop",
+                    )
+                    return
+
+        try:
+            stop_resp, tp_resp = self._broker.submit_oco_sell(
+                symbol=symbol,
+                qty=qty,
+                stop_price=new_stop_price,
+                limit_price=tp_price,
+                client_order_id=f"thesis-adjstop-replace-{schedule_id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "thesis_coordinator.adjust_stop_replace_dead_failed",
+                extra={
+                    "event": "thesis_coordinator.adjust_stop_replace_dead_failed",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "error": str(e),
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="adjust_stop"
+            )
+            return
+
+        old_status = (
+            current.status if current is not None
+            and current.status in _DEAD_ORDER_STATUSES
+            else "canceled"
+        )
+        new_stop_row_id = insert_order(
+            self._journal.db_path,
+            OrderRow(
+                execution_id=execution_id,
+                role="stop",
+                symbol=symbol,
+                side="sell",
+                order_type="stop",
+                qty=qty,
+                tif="gtc",
+                stop_price=new_stop_price,
+                broker_order_id=stop_resp.broker_order_id,
+                submitted_at=stop_resp.submitted_at,
+                final_status=None,
+                notes=(
+                    "thesis_review:adjust_stop re-placed dead stop "
+                    f"{old_stop.broker_order_id} ({old_status})"
+                ),
+            ),
+        )
+        self._record_order_outcome(
+            old_stop.id, old_status, fill_price=None, fill_qty=None, fill_at=None
+        )
+        if tp_row is not None and tp_resp is not None:
+            insert_order(
+                self._journal.db_path,
+                OrderRow(
+                    execution_id=execution_id,
+                    role="take_profit",
+                    symbol=symbol,
+                    side="sell",
+                    order_type="limit",
+                    qty=qty,
+                    tif="gtc",
+                    limit_price=tp_price,
+                    broker_order_id=tp_resp.broker_order_id,
+                    submitted_at=tp_resp.submitted_at,
+                    final_status=None,
+                    notes=(
+                        "thesis_review:adjust_stop re-placed TP leg "
+                        f"{tp_row.broker_order_id} as OCO"
+                    ),
+                ),
+            )
+            self._record_order_outcome(
+                tp_row.id,
+                "canceled" if tp_was_live else "expired",
+                fill_price=None,
+                fill_qty=None,
+                fill_at=None,
+            )
+        set_stop_order_journal_id(
+            self._journal.db_path,
+            execution_id=execution_id,
+            order_journal_id=new_stop_row_id,
+        )
+
+        log.info(
+            "thesis_coordinator.adjust_stop_replaced_dead_protection",
+            extra={
+                "event": "thesis_coordinator.adjust_stop_replaced_dead_protection",
+                "execution_id": execution_id,
+                "symbol": symbol,
+                "new_stop_price": new_stop_price,
+                "tp_price": tp_price,
+                "oco": tp_price is not None,
+            },
+        )
+        self._reschedule(
+            execution_id,
+            when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
+            reason="adjust_stop",
+        )
+
+    def _apply_adjust_take_profit(
+        self,
+        *,
+        execution_id: int,
+        symbol: str,
+        new_tp_price: float,
+        now: dt.datetime,
+        schedule_id: int,
+        ctx: ThesisReviewContext,
+    ) -> None:
+        """D-079 §3.4 — raise-only TP actuator (let-winners-run),
+        mirroring §3.3 via the atomic `replace_limit_order` PATCH.
+
+        Validator-on-apply: `new_tp_price` must clear the current quote
+        (raise-only — lowering a TP is expressible as `close`), and the
+        resulting R:R against the *current* stop must not fall below
+        the §3.2 floor (belt-and-suspenders: raising a TP can only
+        improve R:R).
+        """
+        orders = get_orders_for_execution(self._journal.db_path, execution_id)
+        entry = next((o for o in orders if o.role == "entry"), None)
+        tp_row = self._get_live_protective_order(
+            execution_id=execution_id, roles=("take_profit",)
+        )
+        if entry is None or tp_row is None or entry.qty <= 0:
+            # No live TP leg to raise (no-TP proposal, or pre-conversion
+            # PDT-era position). Nothing actionable — treat as hold.
+            log.warning(
+                "thesis_coordinator.adjust_tp_skipped",
+                extra={
+                    "event": "thesis_coordinator.adjust_tp_skipped",
+                    "execution_id": execution_id,
+                    "reason": "missing_entry_or_live_tp",
+                },
+            )
+            self._reschedule(
+                execution_id,
+                when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
+                reason="adjust_take_profit",
+            )
+            return
+
+        if new_tp_price <= ctx.current_price:
+            log.warning(
+                "thesis_coordinator.adjust_tp_rejected",
+                extra={
+                    "event": "thesis_coordinator.adjust_tp_rejected",
+                    "execution_id": execution_id,
+                    "new_tp_price": new_tp_price,
+                    "current_price": ctx.current_price,
+                    "reason": "raise_only_tp_not_above_current_price",
+                },
+            )
+            self._reschedule(
+                execution_id,
+                when=now + dt.timedelta(days=1),
+                reason="adjust_take_profit",
+            )
+            return
+
+        stop_row = self._get_live_protective_order(
+            execution_id=execution_id, roles=("stop", "trailing_stop")
+        )
+        entry_price = ctx.realized_fill_price or entry.pre_submission_last
+        if (
+            stop_row is not None
+            and stop_row.stop_price is not None
+            and entry_price is not None
+        ):
+            risk = entry_price - stop_row.stop_price
+            # A ratcheted stop at/above entry means the position is
+            # risk-free — any raise passes. Otherwise hold the floor.
+            if risk > 0 and (new_tp_price - entry_price) / risk < self._min_reward_risk:
+                log.warning(
+                    "thesis_coordinator.adjust_tp_rejected",
+                    extra={
+                        "event": "thesis_coordinator.adjust_tp_rejected",
+                        "execution_id": execution_id,
+                        "new_tp_price": new_tp_price,
+                        "entry_price": entry_price,
+                        "current_stop_price": stop_row.stop_price,
+                        "min_reward_risk": self._min_reward_risk,
+                        "reason": "exit_geometry_below_floor",
+                    },
+                )
+                self._reschedule(
+                    execution_id,
+                    when=now + dt.timedelta(days=1),
+                    reason="adjust_take_profit",
+                )
+                return
+
+        try:
+            replaced = self._broker.replace_limit_order(
+                tp_row.broker_order_id,
+                new_limit_price=new_tp_price,
+                client_order_id=f"thesis-adjtp-{schedule_id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            # Atomic PATCH contract: original TP still live at the
+            # broker. Retry tomorrow.
+            log.error(
+                "thesis_coordinator.tp_replace_failed",
+                extra={
+                    "event": "thesis_coordinator.tp_replace_failed",
+                    "execution_id": execution_id,
+                    "old_broker_order_id": tp_row.broker_order_id,
+                    "error": str(e),
+                },
+            )
+            self._reschedule(
+                execution_id,
+                when=now + dt.timedelta(days=1),
+                reason="adjust_take_profit",
+            )
+            return
+
+        insert_order(
+            self._journal.db_path,
+            OrderRow(
+                execution_id=execution_id,
+                role="take_profit",
+                symbol=symbol,
+                side="sell",
+                order_type="limit",
+                qty=entry.qty,
+                tif="gtc",
+                limit_price=new_tp_price,
+                broker_order_id=replaced.broker_order_id,
+                submitted_at=replaced.submitted_at,
+                final_status=None,
+                notes=(
+                    f"thesis_review:adjust_take_profit atomic-replaced "
+                    f"{tp_row.broker_order_id}"
+                ),
+            ),
+        )
+        self._record_order_outcome(
+            tp_row.id, "replaced", fill_price=None, fill_qty=None, fill_at=None
+        )
+
+        log.info(
+            "thesis_coordinator.tp_adjusted",
+            extra={
+                "event": "thesis_coordinator.tp_adjusted",
+                "execution_id": execution_id,
+                "symbol": symbol,
+                "old_tp_price": tp_row.limit_price,
+                "new_tp_price": new_tp_price,
+                "old_broker_order_id": tp_row.broker_order_id,
+                "new_broker_order_id": replaced.broker_order_id,
+            },
+        )
+
+        self._reschedule(
+            execution_id,
+            when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
+            reason="adjust_take_profit",
         )
 
     # ------------------------------------------------------------------
@@ -552,6 +1127,8 @@ def _decision_string(result: Any) -> str:
         return "close"
     if isinstance(result, ThesisAdjustStop):
         return "adjust_stop"
+    if isinstance(result, ThesisAdjustTakeProfit):
+        return "adjust_take_profit"
     return "malformed"
 
 

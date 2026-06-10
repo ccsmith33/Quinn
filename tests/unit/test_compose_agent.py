@@ -473,3 +473,56 @@ def test_compose_agent_wires_halt_repage_minutes_into_killswitch(
 
     ks = loop.components.killswitch
     assert ks._repage_minutes == 90  # type: ignore[attr-defined]
+
+
+def test_compose_agent_wires_exit_policy_ticker_into_reconciler_seam(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """D-079 §3.5: compose_agent passes a config-threaded
+    ExitPolicyTicker through the reconciler's `exit_policy_ticker`
+    ctor seam. A capturing subclass intercepts the kwarg so the test
+    asserts on exactly what composition handed the ctor."""
+    from typing import Any
+
+    from app.composition import compose_agent
+    from execution.exit_policy import ExitPolicyTicker
+    from reconciler.reconciler import Reconciler
+
+    captured: dict[str, Any] = {}
+
+    class _SeamReconciler(Reconciler):
+        def __init__(
+            self,
+            *args: Any,
+            exit_policy_ticker: Any | None = None,
+            **kwargs: Any,
+        ) -> None:
+            captured["ticker"] = exit_policy_ticker
+            super().__init__(*args, **kwargs)
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    # Non-default values prove config threading, not ctor defaults.
+    cfg.execution = cfg.execution.model_copy(
+        update={"trail_activation_r": 2.0, "min_ratchet_step_pct": 0.75}
+    )
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+        patch("app.composition.Reconciler", _SeamReconciler),
+    ):
+        loop = compose_agent(
+            cfg,
+            secrets=secrets,
+            journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    ticker = captured["ticker"]
+    assert isinstance(ticker, ExitPolicyTicker)
+    assert ticker._activation_r == 2.0  # noqa: SLF001
+    assert ticker._min_step_pct == 0.75  # noqa: SLF001
+    assert ticker._journal is journal  # noqa: SLF001
+    assert ticker._broker is loop.components.broker  # noqa: SLF001

@@ -87,6 +87,13 @@ class AnalyzerContext:
 # Top-level prompt → list of (kind, ref) for ordered composition.
 # kind="fragment" → fragments/{ref}.txt
 # kind="schema"   → schemas/{ref}.json
+#
+# D-079 prompt v2s (ADR-005: new files, never in-place edits — the v1
+# files stay byte-identical for replay): symmetric widen-or-tighten exit
+# guidance, the §3.2 R:R floor stated to the analyzer, the
+# adjust_take_profit decision, and the optional trail_distance_pct
+# field. v2s compose against v2-suffixed schema files for the same
+# reason — editing a shared schema would roll the v1 composed hashes.
 _PROMPT_DEFS: dict[str, list[tuple[str, str]]] = {
     "sonnet_filing_analysis_v1": [
         ("fragment", "role"),
@@ -98,7 +105,19 @@ _PROMPT_DEFS: dict[str, list[tuple[str, str]]] = {
         # editing it must roll the prompt-version hash per ADR-005.
         ("schema", "no_trade_record"),
     ],
+    "sonnet_filing_analysis_v2": [
+        ("fragment", "role"),
+        ("fragment", "rules_invariant"),
+        ("fragment", "output_schema"),
+        ("schema", "trade_proposal_v2"),
+        ("schema", "no_trade_record"),
+    ],
     "opus_proposal_review_v1": [
+        ("fragment", "role"),
+        ("fragment", "rules_invariant"),
+        ("schema", "opus_proposal_review"),
+    ],
+    "opus_proposal_review_v2": [
         ("fragment", "role"),
         ("fragment", "rules_invariant"),
         ("schema", "opus_proposal_review"),
@@ -109,7 +128,25 @@ _PROMPT_DEFS: dict[str, list[tuple[str, str]]] = {
         ("fragment", "rules_invariant"),
         ("schema", "thesis_review"),
     ],
+    "opus_thesis_review_v2": [
+        ("fragment", "role"),
+        ("fragment", "rules_invariant"),
+        ("schema", "thesis_review_v2"),
+    ],
 }
+
+# Active prompt per pipeline stage. The Opus stages run v2 (D-079).
+#
+# The SONNET stage stays on v1 until integration: `loop.py:946` (WS3's
+# file this epic) mirrors the analyzer's decision-id derivation with a
+# hardcoded "sonnet_filing_analysis_v1" literal — flipping this constant
+# without that line is a silent decision-id mismatch (the loop would
+# never find the proposal it just analyzed). Escalated to team-lead;
+# the integration pass flips this constant and the loop literal
+# together (or points the loop at this constant).
+ACTIVE_SONNET_ANALYSIS_PROMPT = "sonnet_filing_analysis_v1"
+ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT = "opus_proposal_review_v2"
+ACTIVE_OPUS_THESIS_REVIEW_PROMPT = "opus_thesis_review_v2"
 
 
 class PromptBuilder:
@@ -141,7 +178,7 @@ class PromptBuilder:
         self, filing: FilingRow, raw_text: str, ctx: AnalyzerContext
     ) -> ApiRequest:
         return self._build(
-            name="sonnet_filing_analysis_v1",
+            name=ACTIVE_SONNET_ANALYSIS_PROMPT,
             block2_text=self._block2_text(ctx),
             block3_text=self._filing_payload(filing, raw_text),
         )
@@ -155,7 +192,7 @@ class PromptBuilder:
             f"original_prompt_version={proposal.prompt_version}\n"
         )
         return self._build(
-            name="opus_proposal_review_v1",
+            name=ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT,
             block2_text=ctx_summary,
             block3_text=self._proposal_payload(proposal, source_text_summary),
         )
@@ -213,7 +250,7 @@ class PromptBuilder:
             f"{filings_since_entry_summary}\n"
         )
         return self._build(
-            name="opus_thesis_review_v1",
+            name=ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
             block2_text=ctx_summary,
             block3_text=block3,
         )

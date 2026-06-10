@@ -200,6 +200,37 @@ class OrderSubmitter:
                 reason="submission_failed", execution_id=execution_id
             )
 
+        # D-079 §3.2 executor backstop: TP ≤ entry on a long is the same
+        # AORT-class inversion on the take-profit side — the limit sell
+        # would fill immediately at entry for zero reward. The proposal
+        # validator is the primary gate (journaled `exit_geometry`
+        # rejection); this guard is defense-in-depth for surfaces the
+        # validator never sees (replays, thesis-driven TP changes).
+        if self._is_inverted_take_profit(proposal, entry_price=nbbo.last):
+            log.error(
+                "executor.invalid_tp_rejected",
+                extra={
+                    "event": "executor.invalid_tp_rejected",
+                    "proposal_id": accepted_proposal.proposal_id,
+                    "symbol": proposal.symbol,
+                    "direction": proposal.direction,
+                    "entry_price": nbbo.last,
+                    "take_profit_price": proposal.take_profit_price,
+                },
+            )
+            execution_id = journal.insert_execution(
+                ExecutionRow(
+                    proposal_id=accepted_proposal.proposal_id,
+                    decision="submission_failed",
+                    realized_size_pct=accepted_proposal.realized_pct,
+                    realized_dollar_size=accepted_proposal.realized_dollar_size,
+                    submitted_orders_json=json.dumps([]),
+                )
+            )
+            return SubmissionFailed(
+                reason="submission_failed", execution_id=execution_id
+            )
+
         # PDT-SUNSET-2026-06-04: ADR-009 §"Order construction branch".
         # Under PDT mode, submit ONLY the entry (a plain market/limit
         # buy) and record stop/TP as `virtual_exits` rows. Bracket /
@@ -354,6 +385,26 @@ class OrderSubmitter:
         # direction == 'short' (forward-compat scaffolding):
         return sp <= entry_price
 
+    @staticmethod
+    def _is_inverted_take_profit(
+        proposal: TradeProposal, *, entry_price: float
+    ) -> bool:
+        """Return True when the optional take-profit is wrong-side of
+        `entry_price` (D-079 §3.2 backstop).
+
+        Long: TP must sit strictly above entry, else the limit sell
+        fills immediately for zero (or negative) reward. A no-TP
+        proposal never trips this — TP stays optional (D-009).
+        Short: scaffolded mirror, like `_is_inverted_stop`.
+        """
+        tp = proposal.take_profit_price
+        if tp is None:
+            return False
+        if proposal.direction == "long":
+            return tp <= entry_price
+        # direction == 'short' (forward-compat scaffolding):
+        return tp >= entry_price
+
     # ------------------------------------------------------------------
     # Bracket / OTO order builder
     # ------------------------------------------------------------------
@@ -386,7 +437,14 @@ class OrderSubmitter:
             entry_side="buy",
             entry_qty=ap.qty,
             entry_order_type=entry_order_type,
-            entry_tif="day",
+            # D-079 §3.1 (kills O-6): Alpaca applies ONE time_in_force to
+            # the whole bracket group; children inherit it. The prior
+            # "day" value silently expired the protective stop and TP at
+            # end of entry day — from day 2 the position was unmanaged
+            # while the journal claimed GTC coverage. The now-possible
+            # stale GTC *entry* is cancelled after entry day by
+            # ExitPolicyTicker hygiene (§3.6).
+            entry_tif="gtc",
             entry_client_order_id=f"prop-{ap.proposal_id}-entry",
             entry_limit_price=entry_limit_price,
             stop_loss_price=p.stop_loss_price,
@@ -422,7 +480,12 @@ class OrderSubmitter:
             pre_submission_ask=nbbo.ask,
             pre_submission_last=nbbo.last,
             pre_submission_quote_at=nbbo.ts,
-            final_status=resp.status,
+            # D-078 §7.4: final_status is a deferred-completion field —
+            # NULL until the FillIngestor records a terminal disposition.
+            # The broker ack (resp.status: 'accepted'/'new') is not
+            # terminal and would hide the order from
+            # get_orders_pending_fill (final_status IS NULL).
+            final_status=None,
             notes=notes,
         )
 
@@ -442,10 +505,12 @@ class OrderSubmitter:
             qty=req.entry_qty,
             limit_price=None,
             stop_price=req.stop_loss_price,
-            tif="gtc",
+            # D-079 §3.1 honesty: record the TIF actually sent (children
+            # inherit the group TIF), never a hardcoded value.
+            tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
-            final_status=resp.status,
+            final_status=None,  # deferred completion (D-078 §7.4)
         )
 
     @staticmethod
@@ -465,10 +530,11 @@ class OrderSubmitter:
             qty=req.entry_qty,
             limit_price=req.take_profit_price,
             stop_price=None,
-            tif="gtc",
+            # D-079 §3.1 honesty: TIF actually sent, never hardcoded.
+            tif=req.entry_tif,
             broker_order_id=resp.broker_order_id,
             submitted_at=resp.submitted_at,
-            final_status=resp.status,
+            final_status=None,  # deferred completion (D-078 §7.4)
         )
 
 

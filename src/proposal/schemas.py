@@ -51,6 +51,10 @@ class TradeProposal(BaseModel):
     entry_limit_price: Annotated[float, Field(gt=0.0)] | None = None
     stop_loss_price: Annotated[float, Field(gt=0.0)]
     take_profit_price: Annotated[float, Field(gt=0.0)] | None = None
+    # D-079 §3.5 / ADR-011 — analyzer-proposed trailing-stop distance as a
+    # percent of price. Optional: when absent, the trailing ratchet defaults
+    # to the proposal's own initial risk distance clamped to [1, 15].
+    trail_distance_pct: Annotated[float, Field(ge=0.5, le=20.0)] | None = None
     time_horizon_days: Annotated[int, Field(ge=1, le=60)]
     conviction: Annotated[int, Field(ge=1, le=10)]
     thesis: Annotated[str, Field(min_length=50, max_length=4000)]

@@ -99,13 +99,15 @@ def _proposal(
     size_pct: float = 0.05,
     entry_style: str = "market_open",
     entry_limit_price: float | None = None,
+    stop_loss_price: float = 4.50,
+    take_profit_price: float | None = None,
 ) -> TradeProposal:
     payload: dict[str, Any] = {
         "symbol": symbol,
         "direction": direction,
         "size_pct_of_capital": size_pct,
         "entry_style": entry_style,
-        "stop_loss_price": 4.50,
+        "stop_loss_price": stop_loss_price,
         "time_horizon_days": 10,
         "conviction": 8,
         "thesis": (
@@ -118,6 +120,8 @@ def _proposal(
     }
     if entry_limit_price is not None:
         payload["entry_limit_price"] = entry_limit_price
+    if take_profit_price is not None:
+        payload["take_profit_price"] = take_profit_price
     return TradeProposal.model_validate(payload)
 
 
@@ -334,4 +338,112 @@ def test_check_order_short_circuits_on_price_floor() -> None:
 
     # get_quote is called for the price floor check; get_account should NOT be.
     assert "get_quote" in broker.calls
+    assert "get_account" not in broker.calls
+
+
+# ---------------------------------------------------------------------------
+# D-079 §3.2 — exit-geometry floor (kills S-4's unconstrained half).
+# Deterministic, runs after the price floor (the quote is already in hand)
+# and before the capital check. Longs only in v1.
+# Entry reference: entry_limit_price for limit entries, quote.last otherwise
+# (the same pre-submission reference the executor's inverted-stop guard uses).
+# ---------------------------------------------------------------------------
+
+
+def test_exit_geometry_rejects_tp_at_or_below_entry() -> None:
+    """The AORT-class inversion on the TP side: tp <= entry can only
+    harvest an instant loss-or-zero. quote.last=10.02; tp=9.00."""
+    p = _proposal(stop_loss_price=9.00, take_profit_price=9.00)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Rejected)
+    assert result.reason == "exit_geometry"
+
+
+def test_exit_geometry_rejects_reward_risk_below_floor() -> None:
+    """entry=10.02 (quote.last), stop=9.02 → risk 1.00; tp=10.52 →
+    reward 0.50; R:R 0.5 < default floor 1.5 → reject."""
+    p = _proposal(stop_loss_price=9.02, take_profit_price=10.52)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Rejected)
+    assert result.reason == "exit_geometry"
+
+
+def test_exit_geometry_accepts_reward_risk_at_floor() -> None:
+    """R:R exactly at the floor passes (>= contract): entry=10.02,
+    stop=9.02 (risk 1.00), tp=11.52 (reward 1.50) → 1.5 >= 1.5."""
+    p = _proposal(stop_loss_price=9.02, take_profit_price=11.52)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Accepted)
+
+
+def test_exit_geometry_skipped_when_no_take_profit() -> None:
+    """TP remains optional (D-009 discretion preserved): a no-TP proposal
+    relies on stop + trailing + thesis review and passes the floor."""
+    p = _proposal(stop_loss_price=9.02, take_profit_price=None)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Accepted)
+
+
+def test_exit_geometry_rejects_inverted_stop_when_tp_present() -> None:
+    """stop >= entry makes the risk denominator non-positive — geometry
+    is meaningless. Reject here (defense in depth; the executor's
+    inverted-stop guard would also catch it at submission time)."""
+    p = _proposal(stop_loss_price=10.50, take_profit_price=14.00)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Rejected)
+    assert result.reason == "exit_geometry"
+
+
+def test_exit_geometry_uses_limit_price_as_entry_reference() -> None:
+    """For entry_style=limit the intended fill is the limit price:
+    entry=9.00, stop=8.00 (risk 1.00), tp=10.60 (reward 1.60) → passes
+    even though quote.last=10.02 would make the reward only 0.58."""
+    p = _proposal(
+        entry_style="limit",
+        entry_limit_price=9.00,
+        stop_loss_price=8.00,
+        take_profit_price=10.60,
+    )
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Accepted)
+
+
+def test_exit_geometry_floor_is_configurable() -> None:
+    """`min_reward_risk` is a ctor param wired from config (tunable when
+    H3 prod data lands, D-080). R:R=0.5 passes a 0.4 floor."""
+    p = _proposal(stop_loss_price=9.02, take_profit_price=10.52)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator(min_reward_risk=0.4).validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Accepted)
+
+
+def test_exit_geometry_short_circuits_before_capital_check() -> None:
+    """Check order: geometry runs before the capital check — a geometry
+    reject must not call get_account."""
+    p = _proposal(stop_loss_price=9.02, take_profit_price=10.52)
+    broker = _RecordingBroker(quote=_quote(bid=10.00), account=_account())
+    result = ProposalValidator().validate(
+        p, broker, _FakeUniverse({"ACME"}), _FakeKillSwitch(), _FakeJournal()
+    )
+    assert isinstance(result, Rejected)
     assert "get_account" not in broker.calls
