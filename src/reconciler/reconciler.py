@@ -17,6 +17,17 @@ broker counts as a deferred reconcile (no halt, no diff). After 3
 consecutive transient failures we log WARN — but we still do not halt
 on broker outage alone, because the kill-switch is the *application*'s
 view of safety, not the broker's connectivity status.
+
+WS1 (D-078, architecture-option-b-2026-06-09.md §2.2): the reconciler is
+verification-only. Fill truth arrives via the FillIngestor invoked at the
+top of every tick (ADR-010); diff classification is keyed to order
+LIFECYCLE — a sell explains a decrease while it is pending fill, or for 2
+ticks after its recorded fill — instead of a sliding submitted_at window
+(kills RC-2), accepts every sell role incl. thesis_close (kills RC-3),
+treats avg-entry drift on matching qty as informational (kills RC-5), and
+absorbs externally-closed positions with a tombstone plus a single alert
+instead of a permanent halt loop (kills RC-4). Halts carry a diff-set
+fingerprint so the kill-switch dedupes the O-5 pager amplifier.
 """
 
 from __future__ import annotations
@@ -44,6 +55,17 @@ log = get_logger(__name__)
 # Threshold above which transient broker failures are surfaced as a WARN
 # log line (still no halt — broker outage ≠ position discrepancy).
 _PERSISTENT_FAILURE_THRESHOLD = 3
+
+# WS1 delta §2.2 external-close absorption: a journal-open symbol absent
+# from the broker book with no explaining sell order is tombstoned after
+# this many CONSECUTIVE ticks of confirmed absence (mirrors the scanner's
+# _POSITION_MISS_THRESHOLD pattern from the 2026-05-11 hotfix). In-memory
+# counter — a restart re-counts, which only delays absorption by ≤3 ticks.
+_EXTERNAL_CLOSE_MISS_THRESHOLD = 3
+
+# A recorded fill keeps explaining its position diff for this many
+# reconcile ticks after realized_fill_at (delta §2.2).
+_FILLED_EXPLANATION_TICKS = 2
 
 
 @dataclass(frozen=True)
@@ -78,19 +100,40 @@ class ReconcileReport:
     # `matched` is True and `diffs` is empty whenever every diff is
     # explained; the explained list is preserved here for the operator.
     explained_diffs: list[ExplainedDiff] = field(default_factory=list)
+    # WS1 delta §2.2 external-close absorption (RC-4): journal-open symbols
+    # absent at the broker with no explaining sell. `external_closes` =
+    # symbols tombstoned this tick (absence confirmed 3 consecutive ticks);
+    # `external_close_pending` = diffs still inside the grace window.
+    # Neither halts — an absent position is zero exposure.
+    external_closes: list[str] = field(default_factory=list)
+    external_close_pending: list[PositionDiff] = field(default_factory=list)
 
 
 class _JournalLike(Protocol):
     def get_open_positions(self) -> list: ...
     def insert_position(self, row: PositionRow) -> int: ...
     def insert_account_snapshot(self, row: AccountSnapshotRow) -> int: ...
-    def get_orders_since(
-        self, symbol: str, since: dt.datetime
+    def get_lifecycle_orders_for_symbol(
+        self, symbol: str, filled_since: dt.datetime
     ) -> list[OrderRow]: ...
+    def insert_position_tombstone(
+        self,
+        symbol: str,
+        source: str,
+        notes: str,
+        *,
+        snapshot_at: dt.datetime | None = None,
+    ) -> int: ...
 
 
 class _KillSwitchLike(Protocol):
-    def halt(self, reason: str, set_by: str, notes: str = "") -> None: ...
+    def halt(
+        self,
+        reason: str,
+        set_by: str,
+        notes: str = "",
+        fingerprint: str | None = None,
+    ) -> bool: ...
 
 
 class _AlerterLike(Protocol):
@@ -133,6 +176,17 @@ class Reconciler:
         # after retro/thesis on every successful, non-suppressed,
         # non-deferred tick. None disables the hook.
         virtual_exits_scanner: Any | None = None,
+        # WS1 (D-078, ADR-010): FillIngestor invoked at the TOP of every
+        # reconcile body, before snapshotting and classification, so the
+        # tick that detects a fill also explains it. None disables
+        # (legacy test paths).
+        fill_ingestor: Any | None = None,
+        # WS1 seam for WS2 (delta §3.5): ExitPolicyTicker hook — invoked
+        # AFTER the thesis hook on every successful, non-suppressed,
+        # non-deferred tick (the slot the PDT scanner vacates in P2), so
+        # a thesis-driven stop replacement lands before the ratchet reads
+        # the live stop. None disables; WS2 wires the real ticker.
+        exit_policy_ticker: Any | None = None,
     ) -> None:
         self._broker = broker
         self._journal = journal
@@ -154,6 +208,10 @@ class Reconciler:
         self._pdt_state = pdt_state
         self._pdt_enabled = pdt_enabled
         self._virtual_exits_scanner = virtual_exits_scanner
+        # WS1 wiring + external-close consecutive-miss counters (§2.2).
+        self._fill_ingestor = fill_ingestor
+        self._exit_policy_ticker = exit_policy_ticker
+        self._external_miss: dict[str, int] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -241,6 +299,29 @@ class Reconciler:
                         },
                     )
 
+            # WS1 seam for WS2 (delta §3.5) — exit-policy ticker runs
+            # right after the thesis hook so a thesis-driven stop
+            # replacement is already journaled when the ratchet looks up
+            # the live stop. Same protective shape as the other hooks:
+            # errors logged, never propagated; sync like the scanner.
+            if (
+                self._exit_policy_ticker is not None
+                and report is not None
+                and not report.suppressed
+                and not report.deferred
+            ):
+                try:
+                    self._exit_policy_ticker.run_tick()
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "reconciler.exit_policy_tick_error",
+                        extra={
+                            "event": "reconciler.exit_policy_tick_error",
+                            "error": str(e),
+                            "error_class": type(e).__name__,
+                        },
+                    )
+
             # PDT-SUNSET-2026-06-04: ADR-009 §"Scanner hook" — virtual
             # exit scanner runs once per successful, non-suppressed,
             # non-deferred tick. Same protective shape as retro/thesis:
@@ -293,6 +374,23 @@ class Reconciler:
         now = self._now_fn()
         if respect_market_hours and not is_market_hours(now):
             return ReconcileReport(matched=True, diffs=[], suppressed=True)
+
+        # WS1 (ADR-010): ingest fill outcomes FIRST so the journal view
+        # the diff pass reads already reflects recorded fills and their
+        # tombstones. Errors must never abort the reconcile body — the
+        # ingestor is bookkeeping; the reconcile is the safety net.
+        if self._fill_ingestor is not None:
+            try:
+                self._fill_ingestor.run_tick()
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "reconciler.fill_ingest_error",
+                    extra={
+                        "event": "reconciler.fill_ingest_error",
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
 
         try:
             broker_positions = self._broker.get_positions()
@@ -374,6 +472,11 @@ class Reconciler:
                 )
 
         if not diffs:
+            # All journal-open symbols matched at the broker — any
+            # external-close grace counters are stale (symbol reappeared
+            # or got tombstoned); clear them so absence must be
+            # CONSECUTIVE to absorb.
+            self._external_miss.clear()
             log.info(
                 "reconciler.match",
                 extra={
@@ -383,34 +486,87 @@ class Reconciler:
             )
             return ReconcileReport(matched=True, diffs=[])
 
-        # Hotfix 2026-05-07 — classify each diff against the journal's
-        # recent `orders` rows. Diffs whose qty delta is fully accounted
-        # for by a recent bracket-leg submission (entry-buy fill increases
-        # broker qty; stop/TP-sell fill decreases it) are "expected" and
-        # do not halt. Avg_entry mismatches are always unexpected.
-        # HOTFIX-2026-05-11: default window widened to 7 days so the
-        # weekend-spanning Friday-PM-submitted / Monday-open-filled case
-        # classifies as expected.
-        window_minutes = self._cfg.expected_fill_window_minutes
-        since = now - dt.timedelta(minutes=window_minutes)
+        # WS1 (delta §2.2) — lifecycle classification. A diff is explained
+        # by orders that are pending fill (any age — kills the RC-2
+        # submitted_at time bomb) or filled within the last 2 ticks.
+        # Sell-side: ALL roles qualify (kills RC-3). Avg-entry drift on
+        # matching qty is informational (kills RC-5). Journal-open symbols
+        # absent at the broker with no explaining sell are absorbed as
+        # external closes after 3 consecutive ticks (kills RC-4) — an
+        # absent position is zero exposure; halting gates entries only
+        # and protects nothing there.
+        filled_since = now - dt.timedelta(
+            seconds=_FILLED_EXPLANATION_TICKS * self._cfg.interval_seconds_market
+        )
         expected: list[ExplainedDiff] = []
         unexpected: list[PositionDiff] = []
-        # Per-diff explanation (always populated for unexpected diffs too,
-        # so the structured-log payload can show "no orders explained
-        # this divergence" alongside the raw qty numbers).
+        ext_pending: list[PositionDiff] = []
+        ext_closed: list[str] = []
+        classifications: dict[str, str] = {}
         per_diff_orders: dict[str, list[int]] = {}
         for d in diffs:
-            recent = self._journal.get_orders_since(d.symbol, since)
-            classification, order_ids = self._classify_diff(d, recent)
+            lifecycle = self._journal.get_lifecycle_orders_for_symbol(
+                d.symbol, filled_since
+            )
+            classification, order_ids = self._classify_diff(d, lifecycle)
             per_diff_orders[d.symbol] = list(order_ids)
-            if classification == "expected":
+            if classification == "drift":
+                # Qty agrees; price-only drift (add-on weighted avg,
+                # partial-fill drift, splits). Fill truth arrives via the
+                # ingestor — this is informational, never halt-worthy.
+                log.info(
+                    "reconciler.avg_entry_drift",
+                    extra={
+                        "event": "reconciler.avg_entry_drift",
+                        "symbol": d.symbol,
+                        "broker_avg_entry": d.broker_avg_entry,
+                        "journal_avg_entry": d.journal_avg_entry,
+                        "qty": d.broker_qty,
+                    },
+                )
+                classifications[d.symbol] = "expected"
                 expected.append(
                     ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
                 )
+            elif classification == "expected":
+                classifications[d.symbol] = "expected"
+                expected.append(
+                    ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
+                )
+            elif d.broker_qty == 0 and d.journal_qty > 0:
+                # External-close absorption: confirmed-absent for N
+                # consecutive ticks → tombstone + ONE alert, no halt.
+                misses = self._external_miss.get(d.symbol, 0) + 1
+                if misses >= _EXTERNAL_CLOSE_MISS_THRESHOLD:
+                    self._absorb_external_close(d, now)
+                    ext_closed.append(d.symbol)
+                    classifications[d.symbol] = "external_close"
+                else:
+                    self._external_miss[d.symbol] = misses
+                    ext_pending.append(d)
+                    classifications[d.symbol] = "external_close_pending"
+                    log.info(
+                        "reconciler.external_close_pending",
+                        extra={
+                            "event": "reconciler.external_close_pending",
+                            "symbol": d.symbol,
+                            "journal_qty": d.journal_qty,
+                            "consecutive_misses": misses,
+                            "threshold": _EXTERNAL_CLOSE_MISS_THRESHOLD,
+                        },
+                    )
             else:
+                classifications[d.symbol] = "unexpected"
                 unexpected.append(d)
 
-        # All diffs explained → no halt. Log the pending-fill match event.
+        # Counters survive only for symbols still inside the grace window
+        # this tick — anything explained, reappeared, or tombstoned resets.
+        pending_symbols = {d.symbol for d in ext_pending}
+        self._external_miss = {
+            sym: n for sym, n in self._external_miss.items()
+            if sym in pending_symbols
+        }
+
         if not unexpected:
             log.info(
                 "reconciler.match_with_pending_fills",
@@ -428,16 +584,23 @@ class Reconciler:
                         }
                         for ed in expected
                     ]),
+                    "external_closes": json.dumps(ext_closed),
+                    "external_close_pending": json.dumps(
+                        sorted(pending_symbols)
+                    ),
                 },
             )
             return ReconcileReport(
-                matched=True, diffs=[], explained_diffs=expected
+                matched=True,
+                diffs=[],
+                explained_diffs=expected,
+                external_closes=ext_closed,
+                external_close_pending=ext_pending,
             )
 
         # At least one unexpected diff → halt. Enrich the diff_summary
         # payload so each row carries its classification (and which order
         # ids explained it, when any).
-        expected_symbols = {ed.diff.symbol for ed in expected}
         notes = json.dumps([
             {
                 "symbol": d.symbol,
@@ -445,9 +608,7 @@ class Reconciler:
                 "journal_qty": d.journal_qty,
                 "broker_avg_entry": d.broker_avg_entry,
                 "journal_avg_entry": d.journal_avg_entry,
-                "classification": (
-                    "expected" if d.symbol in expected_symbols else "unexpected"
-                ),
+                "classification": classifications[d.symbol],
                 "explained_by_order_ids": per_diff_orders.get(d.symbol, []),
             }
             for d in diffs
@@ -462,12 +623,20 @@ class Reconciler:
                 "diff_summary": notes,
             },
         )
-        self._ks.halt(
+        # WS1 delta §2.3 — deterministic fingerprint over the unexpected
+        # diff set; the kill-switch dedupes repeat halts and throttles
+        # re-pages while the identical diff set persists.
+        fingerprint = "|".join(
+            f"{d.symbol}:{d.broker_qty - d.journal_qty}"
+            for d in sorted(unexpected, key=lambda d: d.symbol)
+        )
+        fired = self._ks.halt(
             reason="reconciler:discrepancy",
             set_by="system",
             notes=notes,
+            fingerprint=fingerprint,
         )
-        if self._alerter is not None:
+        if fired and self._alerter is not None:
             self._alerter.notify(
                 f"Reconciler: {len(unexpected)} unexpected position "
                 f"discrepancy(ies) (of {len(diffs)} total); kill-switch "
@@ -476,64 +645,87 @@ class Reconciler:
         # `diffs` carries only the unexpected (halt-triggering) rows;
         # explained ones move to `explained_diffs`.
         return ReconcileReport(
-            matched=False, diffs=unexpected, explained_diffs=expected
+            matched=False,
+            diffs=unexpected,
+            explained_diffs=expected,
+            external_closes=ext_closed,
+            external_close_pending=ext_pending,
         )
+
+    def _absorb_external_close(self, d: PositionDiff, now: dt.datetime) -> None:
+        """Delta §2.2 RC-4 absorption: tombstone + single alert, no halt.
+        Broker liquidations and operator manual flattens both land here,
+        visibly, once."""
+        self._journal.insert_position_tombstone(
+            d.symbol,
+            "reconciler_external_close",
+            f"externally closed at broker (journal qty {d.journal_qty}, "
+            f"no journaled sell explains it); confirmed absent "
+            f"{_EXTERNAL_CLOSE_MISS_THRESHOLD} consecutive ticks; D-078",
+            snapshot_at=now,
+        )
+        log.warning(
+            "position.closed_externally",
+            extra={
+                "event": "position.closed_externally",
+                "symbol": d.symbol,
+                "journal_qty": d.journal_qty,
+            },
+        )
+        if self._alerter is not None:
+            self._alerter.notify(
+                f"Position closed externally at broker: {d.symbol} "
+                f"(journal qty {d.journal_qty}, no journaled sell). "
+                f"Tombstoned; no halt — zero exposure. Verify at broker "
+                f"if this wasn't you."
+            )
 
     @staticmethod
     def _classify_diff(
-        diff: PositionDiff, recent_orders: list[OrderRow]
+        diff: PositionDiff, lifecycle_orders: list[OrderRow]
     ) -> tuple[str, tuple[int, ...]]:
-        """Classify a `PositionDiff` against recent `orders` rows for the
-        same symbol. Returns ('expected'|'unexpected', explaining_order_ids).
+        """Classify a `PositionDiff` against the symbol's LIFECYCLE orders
+        (pending fill, or filled within the caller's 2-tick window).
+        Returns ('expected'|'unexpected'|'drift', explaining_order_ids).
 
-        Rules (hotfix 2026-05-07):
-          - broker_qty > journal_qty: an "expected" increase requires
-            recent role='entry', side='buy' orders whose summed qty covers
-            the delta.
-          - broker_qty < journal_qty: an "expected" decrease requires
-            recent role IN ('stop','take_profit'), side='sell' orders
-            whose summed qty covers the delta.
-          - qtys equal but avg_entry differs: ALWAYS unexpected — recent
-            orders cannot explain a price drift on the same share count.
-          - mixed qty diff AND avg_entry diff: ALWAYS unexpected — the
-            avg_entry mismatch is the giveaway, even if the qty delta
-            would otherwise be expected.
+        Rules (WS1, D-078 delta §2.2 — replaces the hotfix-2026-05-07
+        role whitelist + submitted_at window):
+          - qtys equal, avg_entry drifted → 'drift' (informational; the
+            caller logs and treats as expected — kills RC-5).
+          - broker_qty > journal_qty: explained by role='entry', side='buy'
+            rows whose qty covers the delta.
+          - broker_qty < journal_qty: explained by side='sell' rows of ANY
+            role — stop, take_profit, thesis_close, trailing_stop, future
+            roles — whose qty covers the delta (kills RC-3; §7.5 closes
+            the vocabulary so a new role can never reintroduce it).
+          - a filled row contributes its realized_fill_qty (ground truth);
+            a pending row contributes its submitted qty.
+          - partial coverage stays 'unexpected' — never silently accept a
+            partial explanation as full.
 
-        `recent_orders` should already be filtered to the time window
-        (caller-side) and to this diff's symbol; we only filter by
-        role/side here.
+        `lifecycle_orders` is already filtered to this symbol and the
+        lifecycle window (journal query); we only filter side/role here.
         """
-        # Avg_entry mismatch alone (or in combination) → always unexpected.
-        # The reconciler computes `avg_mismatch` only when both sides have
-        # a position; if either side is None, b_avg/j_avg might be None.
-        if (
-            diff.broker_avg_entry is not None
-            and diff.journal_avg_entry is not None
-            and abs(diff.broker_avg_entry - diff.journal_avg_entry) > 1e-6
-        ):
-            return ("unexpected", ())
-
         delta = diff.broker_qty - diff.journal_qty
         if delta == 0:
-            # No qty diff and we already cleared the avg_entry path above
-            # (either both sides agree or one side is missing avg). This
-            # branch should be unreachable — _compute_diffs only emits a
-            # PositionDiff when qty OR avg differs — but be defensive.
-            return ("unexpected", ())
+            # _compute_diffs only emits equal-qty diffs for avg mismatch.
+            return ("drift", ())
 
-        if delta > 0:
-            wanted_roles = {"entry"}
-            wanted_side = "buy"
-        else:
-            wanted_roles = {"stop", "take_profit"}
-            wanted_side = "sell"
-
+        wanted_side = "buy" if delta > 0 else "sell"
         explaining_qty = 0
         explaining_ids: list[int] = []
-        for o in recent_orders:
-            if o.role not in wanted_roles or o.side != wanted_side:
+        for o in lifecycle_orders:
+            if o.side != wanted_side:
                 continue
-            explaining_qty += o.qty
+            if delta > 0 and o.role != "entry":
+                continue
+            if (
+                o.final_status in ("filled", "partially_filled_closed")
+                and o.realized_fill_qty is not None
+            ):
+                explaining_qty += o.realized_fill_qty
+            else:
+                explaining_qty += o.qty
             if o.id is not None:
                 explaining_ids.append(o.id)
 

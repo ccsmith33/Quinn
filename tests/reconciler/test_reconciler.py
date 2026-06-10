@@ -84,13 +84,19 @@ class _FakeJournal:
         self._orders: list[OrderRow] = list(recent_orders or [])
         self.position_inserts: list[dict] = []
         self.account_inserts: list[dict] = []
-        self.get_orders_since_calls: list[tuple[str, dt.datetime]] = []
+        self.tombstones: list[dict] = []
+        self.lifecycle_calls: list[tuple[str, dt.datetime]] = []
 
     def get_open_positions(self) -> list:
         # Return as the same Position-like shape the reconciler expects from
-        # the journal (we mirror only the comparison fields used).
+        # the journal (we mirror only the comparison fields used). A
+        # tombstoned symbol drops out of the open view, mirroring the real
+        # repo's latest-row-per-symbol qty!=0 semantics.
+        tombstoned = {t["symbol"] for t in self.tombstones}
         out = []
         for p in self._expected:
+            if p.symbol in tombstoned:
+                continue
             class _Row:
                 pass
             r = _Row()
@@ -108,20 +114,60 @@ class _FakeJournal:
         self.account_inserts.append(row.model_dump())
         return len(self.account_inserts)
 
-    def get_orders_since(self, symbol: str, since: dt.datetime) -> list[OrderRow]:
-        self.get_orders_since_calls.append((symbol, since))
-        return [
-            o for o in self._orders
-            if o.symbol == symbol and o.submitted_at >= since
-        ]
+    # WS1 (D-078): lifecycle classifier query — pending fill (any age) OR
+    # filled within the caller's window. Mirrors repo SQL.
+    def get_lifecycle_orders_for_symbol(
+        self, symbol: str, filled_since: dt.datetime
+    ) -> list[OrderRow]:
+        self.lifecycle_calls.append((symbol, filled_since))
+        out = []
+        for o in self._orders:
+            if o.symbol != symbol:
+                continue
+            if o.final_status is None:
+                out.append(o)
+            elif (
+                o.final_status in ("filled", "partially_filled_closed")
+                and o.realized_fill_at is not None
+                and o.realized_fill_at >= filled_since
+            ):
+                out.append(o)
+        return out
+
+    def insert_position_tombstone(
+        self,
+        symbol: str,
+        source: str,
+        notes: str,
+        *,
+        snapshot_at: dt.datetime | None = None,
+    ) -> int:
+        self.tombstones.append(
+            {
+                "symbol": symbol,
+                "source": source,
+                "notes": notes,
+                "snapshot_at": snapshot_at,
+            }
+        )
+        return len(self.tombstones)
 
 
 class _FakeKillSwitch:
     def __init__(self) -> None:
         self.halts: list[tuple[str, str, str]] = []
+        self.fingerprints: list[str | None] = []
 
-    def halt(self, reason: str, set_by: str, notes: str = "") -> None:
+    def halt(
+        self,
+        reason: str,
+        set_by: str,
+        notes: str = "",
+        fingerprint: str | None = None,
+    ) -> bool:
         self.halts.append((reason, set_by, notes))
+        self.fingerprints.append(fingerprint)
+        return True
 
 
 class _FakeAlerter:
@@ -224,18 +270,77 @@ def test_divergence_halts_kill_switch() -> None:
     assert len(journal.position_inserts) == 1
 
 
-def test_divergence_when_journal_has_position_broker_does_not() -> None:
-    """Asymmetric divergence: journal believes ACME held; broker says no."""
+def test_journal_open_broker_absent_absorbed_as_external_close() -> None:
+    """WS1 (delta §2.2, kills RC-4): journal believes ACME held; broker says
+    no; no journaled sell explains it. NOT a halt — an absent position is
+    zero exposure. After 3 consecutive ticks of confirmed absence the
+    reconciler tombstones the symbol and alerts ONCE; the journal's open
+    view self-heals and tick 4 reports a clean match."""
     broker = _FakeBroker(positions=[])
     journal = _FakeJournal(expected_positions=[_position("ACME", 25)])
     ks = _FakeKillSwitch()
-    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
+    alerter = _FakeAlerter()
+    rec = Reconciler(broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market)
 
+    # Ticks 1-2: grace window — pending, no halt, no tombstone, no alert.
+    for expected_misses in (1, 2):
+        report = rec.reconcile_now()
+        assert report.matched is True
+        assert report.diffs == []
+        assert [d.symbol for d in report.external_close_pending] == ["ACME"]
+        assert report.external_closes == []
+        assert ks.halts == []
+        assert journal.tombstones == []
+        del expected_misses
+
+    # Tick 3: absence confirmed — tombstone + single alert, still no halt.
     report = rec.reconcile_now()
+    assert report.matched is True
+    assert report.external_closes == ["ACME"]
+    assert report.external_close_pending == []
+    assert ks.halts == []
+    assert len(journal.tombstones) == 1
+    assert journal.tombstones[0]["symbol"] == "ACME"
+    assert journal.tombstones[0]["source"] == "reconciler_external_close"
+    assert len(alerter.calls) == 1
+    assert "ACME" in alerter.calls[0]
 
-    assert report.matched is False
-    # Halt fired.
-    assert len(ks.halts) == 1
+    # Tick 4: journal open view no longer contains ACME — clean match,
+    # no second alert (the RC-4 permanent-halt loop is dead).
+    report = rec.reconcile_now()
+    assert report.matched is True
+    assert report.external_closes == []
+    assert len(alerter.calls) == 1
+    assert ks.halts == []
+
+
+def test_external_close_counter_resets_when_symbol_reappears() -> None:
+    """Absence must be CONSECUTIVE: if the symbol reappears at the broker
+    mid-grace (transient API weirdness), the counter resets and a later
+    absence starts over."""
+    journal = _FakeJournal(expected_positions=[_position("ACME", 25)])
+    ks = _FakeKillSwitch()
+
+    # Two absent ticks.
+    broker = _FakeBroker(positions=[])
+    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
+    rec.reconcile_now()
+    rec.reconcile_now()
+    assert journal.tombstones == []
+
+    # Symbol reappears (match tick) → counter must clear.
+    broker._positions = [_position("ACME", 25)]
+    report = rec.reconcile_now()
+    assert report.matched is True
+
+    # Absent again: needs the FULL 3 ticks before absorption.
+    broker._positions = []
+    rec.reconcile_now()
+    rec.reconcile_now()
+    assert journal.tombstones == []
+    rec.reconcile_now()
+    assert len(journal.tombstones) == 1
+    assert ks.halts == []
 
 
 def test_post_submission_trigger() -> None:
@@ -532,25 +637,38 @@ def test_diff_classified_unexpected_when_no_orders_explain_increase() -> None:
     assert len(alerter.calls) == 1
 
 
-def test_diff_classified_unexpected_when_avg_entry_differs() -> None:
-    """Broker has 46 of CXW at $20, journal has 46 at $21 → halt regardless
-    of recent orders. avg_entry mismatch on equal qty is always unexpected.
-    """
+def test_avg_entry_drift_with_matching_qty_is_expected_log_only() -> None:
+    """WS1 (delta §2.2, kills RC-5/O-4): broker has 46 of CXW at $20,
+    journal has 46 at $21 — qty agrees, price-only drift (add-on buy
+    weighted avg, partial-fill drift, splits). Informational: no halt; the
+    broker-truth snapshot self-heals the journal on this same tick."""
     broker = _FakeBroker(positions=[_position("CXW", 46, avg_entry=20.0)])
     journal = _FakeJournal(
         expected_positions=[_position("CXW", 46, avg_entry=21.0)],
-        recent_orders=[
-            # An entry buy of 46 — would explain a qty diff, but qtys are
-            # equal here so the avg_entry mismatch dominates.
-            _order(
-                symbol="CXW",
-                role="entry",
-                side="buy",
-                qty=46,
-                submitted_at=_MARKET_OPEN_TIME - dt.timedelta(seconds=30),
-                order_id=37,
-            ),
-        ],
+    )
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market)
+
+    report = rec.reconcile_now()
+
+    assert report.matched is True
+    assert report.diffs == []
+    assert len(report.explained_diffs) == 1
+    assert report.explained_diffs[0].diff.symbol == "CXW"
+    assert ks.halts == []
+    assert alerter.calls == []
+    # Broker truth still snapshotted (self-heal).
+    assert len(journal.position_inserts) == 1
+
+
+def test_qty_mismatch_both_nonzero_unexplained_still_halts() -> None:
+    """Verification-only is not rubber-stamp: a qty mismatch where both
+    sides are non-zero and no lifecycle order explains it remains
+    halt-worthy even when avg_entry also drifted (delta §2.2)."""
+    broker = _FakeBroker(positions=[_position("CXW", 46, avg_entry=20.0)])
+    journal = _FakeJournal(
+        expected_positions=[_position("CXW", 30, avg_entry=21.0)],
     )
     ks = _FakeKillSwitch()
     rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
@@ -563,91 +681,92 @@ def test_diff_classified_unexpected_when_avg_entry_differs() -> None:
     assert len(ks.halts) == 1
 
 
-def test_window_guard_excludes_stale_orders() -> None:
-    """Broker has 50 of XYZ, journal has 0, orders has entry buy 50
-    submitted 90 minutes ago, window is 30 → unexpected, halt. The
-    window cutoff is enforced in the journal query, not the classifier
-    — the classifier never sees the stale row.
-    """
-    broker = _FakeBroker(positions=[_position("XYZ", 50)])
+def test_old_pending_order_still_explains_diff_no_window_expiry() -> None:
+    """WS1 RC-2 regression guard (replaces the retired window-guard test):
+    a GTC sell submitted 30 DAYS ago but still pending fill keeps
+    explaining the position decrease forever — explanation is keyed to
+    order lifecycle, not to a sliding submitted_at window. Under the old
+    classifier this halted on day 8 (the tier-1 hotfix time bomb)."""
+    broker = _FakeBroker(positions=[])
     journal = _FakeJournal(
-        expected_positions=[],
+        expected_positions=[_position("XYZ", 50)],
         recent_orders=[
             _order(
                 symbol="XYZ",
-                role="entry",
-                side="buy",
+                role="stop",
+                side="sell",
                 qty=50,
-                submitted_at=_MARKET_OPEN_TIME - dt.timedelta(minutes=90),
+                submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=30),
                 order_id=99,
             ),
         ],
     )
     ks = _FakeKillSwitch()
-    rec = Reconciler(
-        broker, journal, ks, _cfg(expected_fill_window_minutes=30),
-        now_fn=_now_market,
-    )
-
-    report = rec.reconcile_now()
-
-    assert report.matched is False
-    assert len(ks.halts) == 1
-    # Confirm the journal was queried with a window cutoff that excludes
-    # the 90-minute-old order.
-    assert len(journal.get_orders_since_calls) == 1
-    queried_symbol, queried_since = journal.get_orders_since_calls[0]
-    assert queried_symbol == "XYZ"
-    assert queried_since == _MARKET_OPEN_TIME - dt.timedelta(minutes=30)
-
-
-# HOTFIX-2026-05-11: reconciler tolerance lookback widened to span a
-# weekend gap between Friday-PM submission and Monday open fill. Default
-# is 7 calendar days (10_080 minutes); operators may tune.
-def test_weekend_spanning_fill_explained_with_default_window() -> None:
-    """Friday-afternoon submitted entry buy fills at Monday open (~64h
-    later). The reconciler must classify the broker-position increase as
-    expected (no halt) using the default `expected_fill_window_minutes`
-    (post-hotfix: ~7 days). Real symptom on 2026-05-11 (~13:31 ET): 8
-    Friday-PM-submitted orders filled at Monday open, the prior 30-minute
-    lookback couldn't span the weekend and the reconciler halted.
-    """
-    broker = _FakeBroker(positions=[_position("ABCD", 50)])
-    journal = _FakeJournal(
-        expected_positions=[],
-        recent_orders=[
-            _order(
-                symbol="ABCD",
-                role="entry",
-                side="buy",
-                qty=50,
-                # 65 hours back — Friday-PM submission, Monday-AM fill.
-                submitted_at=_MARKET_OPEN_TIME - dt.timedelta(hours=65),
-                order_id=101,
-            ),
-        ],
-    )
-    ks = _FakeKillSwitch()
-    # Use the production default (no explicit override) so the test
-    # locks in the widened lookback. If default narrows again, this
-    # test fires.
-    rec = Reconciler(
-        broker, journal, ks,
-        ReconcilerConfig(interval_seconds_market=300),
-        now_fn=_now_market,
-    )
+    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
 
     report = rec.reconcile_now()
 
     assert report.matched is True
     assert report.diffs == []
     assert len(report.explained_diffs) == 1
+    assert 99 in report.explained_diffs[0].explained_by_order_ids
     assert ks.halts == []
-    # Lookback cutoff must be ≥ 65 hours behind `now` to span the
-    # weekend; locks the hotfix-widened default in place.
-    assert len(journal.get_orders_since_calls) == 1
-    _sym, queried_since = journal.get_orders_since_calls[0]
-    assert _MARKET_OPEN_TIME - queried_since >= dt.timedelta(hours=65)
+
+
+def test_recorded_fill_explains_only_within_two_ticks() -> None:
+    """A FILLED sell explains its diff for 2 reconcile ticks after
+    realized_fill_at; beyond that the fill has been consumed (the
+    snapshot/tombstone already happened on the tick that recorded it) and
+    cannot explain a fresh decrease. Locks the §2.2 lifecycle window."""
+    fill_row = _order(
+        symbol="XYZ",
+        role="thesis_close",
+        side="sell",
+        qty=50,
+        submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=2),
+        order_id=77,
+    )
+    recent_fill = fill_row.model_copy(
+        update={
+            "final_status": "filled",
+            "realized_fill_qty": 50,
+            "realized_fill_price": 9.5,
+            # interval 300 s → window is 600 s; 500 s ago is inside.
+            "realized_fill_at": _MARKET_OPEN_TIME - dt.timedelta(seconds=500),
+        }
+    )
+    broker = _FakeBroker(positions=[])
+    journal = _FakeJournal(
+        expected_positions=[_position("XYZ", 50)],
+        recent_orders=[recent_fill],
+    )
+    ks = _FakeKillSwitch()
+    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
+
+    report = rec.reconcile_now()
+    assert report.matched is True
+    assert len(report.explained_diffs) == 1
+    assert ks.halts == []
+
+    # Same fill 20 minutes old (beyond 2×300 s) → no longer explains; the
+    # diff enters the external-close grace path instead (no halt either —
+    # broker absence is zero exposure).
+    stale_fill = recent_fill.model_copy(
+        update={
+            "realized_fill_at": _MARKET_OPEN_TIME - dt.timedelta(minutes=20),
+        }
+    )
+    journal2 = _FakeJournal(
+        expected_positions=[_position("XYZ", 50)],
+        recent_orders=[stale_fill],
+    )
+    ks2 = _FakeKillSwitch()
+    rec2 = Reconciler(broker, journal2, ks2, _cfg(), now_fn=_now_market)
+
+    report2 = rec2.reconcile_now()
+    assert report2.explained_diffs == []
+    assert [d.symbol for d in report2.external_close_pending] == ["XYZ"]
+    assert ks2.halts == []
 
 
 def test_mixed_diffs_halt_if_any_unexpected() -> None:
@@ -714,7 +833,7 @@ def test_post_submission_trigger_path_still_silent_on_zero_diff() -> None:
     assert report.explained_diffs == []
     assert ks.halts == []
     # No journal query for orders when there are no diffs.
-    assert journal.get_orders_since_calls == []
+    assert journal.lifecycle_calls == []
 
 
 def test_classify_diff_partial_explanation_is_unexpected() -> None:
@@ -1012,3 +1131,124 @@ def test_reconcile_pdt_refresh_error_does_not_abort_tick(
         if getattr(r, "event", None) == "reconciler.pdt_refresh_error"
     ]
     assert len(errors) == 1
+
+
+# ---------------------------------------------------------------------------
+# WS1 (D-078, delta §3.5 hook slot): exit-policy ticker hook — additive
+# optional param; WS2's ExitPolicyTicker plugs in here. Invoked AFTER the
+# thesis hook on every successful, non-suppressed, non-deferred tick.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingTicker:
+    def __init__(
+        self,
+        *,
+        raises: Exception | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        self.calls: int = 0
+        self._raises = raises
+        self._events = events
+
+    def run_tick(self) -> None:
+        self.calls += 1
+        if self._events is not None:
+            self._events.append("exit_policy")
+        if self._raises is not None:
+            raise self._raises
+
+
+class _RecordingThesis:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def run_tick(self) -> None:
+        self._events.append("thesis")
+
+
+@pytest.mark.asyncio
+async def test_run_loop_invokes_exit_policy_ticker_after_thesis_hook() -> None:
+    """The ticker runs once per successful, non-suppressed, non-deferred
+    tick, in the hook slot after the thesis coordinator (delta §3.5:
+    composition order is after the thesis hook so a thesis-driven stop
+    replacement lands before the ratchet reads the live stop)."""
+    events: list[str] = []
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    ticker = _RecordingTicker(events=events)
+    cfg = ReconcilerConfig(interval_seconds_market=1)
+    rec = Reconciler(
+        broker, journal, ks, cfg, now_fn=_now_market,
+        thesis_coordinator=_RecordingThesis(events),
+        exit_policy_ticker=ticker,
+    )
+    await rec.start()
+    await asyncio.sleep(0.05)
+    await rec.stop()
+    assert ticker.calls >= 1
+    # Every exit_policy invocation follows a thesis invocation.
+    first_pair = events[:2]
+    assert first_pair == ["thesis", "exit_policy"]
+
+
+@pytest.mark.asyncio
+async def test_run_loop_skips_exit_policy_ticker_on_suppressed_tick() -> None:
+    """Off-hours tick → suppressed=True → ticker skipped (same gating as
+    retro/thesis/scanner hooks)."""
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    ticker = _RecordingTicker()
+    cfg = ReconcilerConfig(interval_seconds_market=1)
+    rec = Reconciler(
+        broker, journal, ks, cfg, now_fn=_now_off,
+        exit_policy_ticker=ticker,
+    )
+    await rec.start()
+    await asyncio.sleep(0.05)
+    await rec.stop()
+    assert ticker.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_run_loop_exit_policy_ticker_exception_does_not_crash_tick(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A ticker exception is logged at ERROR; the reconcile cadence and
+    the broker-side GTC stop (the real protection) are unaffected."""
+    import logging
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    ticker = _RecordingTicker(raises=RuntimeError("ticker boom"))
+    cfg = ReconcilerConfig(interval_seconds_market=1)
+    rec = Reconciler(
+        broker, journal, ks, cfg, now_fn=_now_market,
+        exit_policy_ticker=ticker,
+    )
+    with caplog.at_level(logging.ERROR, logger="reconciler.reconciler"):
+        await rec.start()
+        await asyncio.sleep(0.05)
+        await rec.stop()
+    assert ticker.calls >= 1
+    errors = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "reconciler.exit_policy_tick_error"
+    ]
+    assert len(errors) >= 1
+
+
+def test_exit_policy_ticker_default_none_disables_hook() -> None:
+    """Additive param: existing constructions (no ticker) are untouched."""
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
+    report = rec.reconcile_now()
+    assert report.matched is True
