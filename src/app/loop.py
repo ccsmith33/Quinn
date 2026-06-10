@@ -309,6 +309,27 @@ class AgentLoop:
         if recon_start is not None:
             await recon_start()
         await self._crash_recovery_scan()
+        # PDT-TRANSITION-D-077 (ADR-012 §4.2): one-shot conversion of
+        # active virtual exits to real GTC broker orders. MUST run
+        # before the deferred replayer below — the converter's drain
+        # invalidates `deferred_sells` rows the replayer would otherwise
+        # double-sell against freshly-converted GTC orders. Runs every
+        # boot regardless of `pdt_enabled` until the active set drains;
+        # idempotent via `pdt-convert-{id}` client ids. Survives the P2
+        # tag-removal PR (stale-prod-DB self-heal); removed post-soak.
+        converter = self._components.pdt_transition_converter
+        if converter is not None:
+            try:
+                converter.run()
+            except Exception as e:  # noqa: BLE001 — defensive only.
+                log.error(
+                    "agent.pdt_transition_error",
+                    extra={
+                        "event": "agent.pdt_transition_error",
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
         # PDT-SUNSET-2026-06-04: ADR-009 §"Pre-market deferred replay"
         # / S-PDT-5 AC-5 — one-shot drain of `deferred_sells` rows
         # whose `deferred_at` is from a prior ET trading day. Boot is
