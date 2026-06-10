@@ -387,3 +387,71 @@ def test_recorded_fills_make_realized_pnl_computable(rig) -> None:
     closed_eid, pnl, _closed_at = closes[0]
     assert closed_eid == eid
     assert pnl == pytest.approx(-10.0)  # 10 × (24 − 25)
+
+
+def test_manual_flatten_with_live_gtc_stop_absorbed(rig) -> None:
+    """W1-M1 end-to-end (the soak's own RC-4 scenario): operator flattens
+    RGR in the Alpaca UI while its GTC stop is live — DELETE /v2/positions
+    does not cancel open orders. The FillIngestor polls the stop every
+    tick and finds it still pending, so 3 consecutive absent ticks cannot
+    be fill latency: tombstone + ONE alert naming the live stop for
+    operator cancellation; never a halt; phantom thesis reviews stop."""
+    repo, broker, ks, alerter, rec, clock = rig
+    eid = _seed_execution(repo.db_path, "RGR")
+    oid = _journal_order(
+        repo, eid, symbol="RGR", role="stop", side="sell", qty=6,
+        broker_order_id="b-stop-rgr", submitted_at=_T0 - dt.timedelta(days=5),
+    )
+    repo.insert_position(
+        PositionRow(
+            snapshot_at=_T0 - dt.timedelta(minutes=5),
+            source="reconciler",
+            symbol="RGR",
+            qty=6,
+            avg_entry_price=39.29,
+            market_value=235.74,
+            unrealized_pnl=0.0,
+        )
+    )
+    # Manual flatten: position gone; the stop stays live (non-terminal)
+    # at the order endpoint, tick after tick.
+    broker.positions = []
+    broker.orders_by_id["b-stop-rgr"] = _broker_fill(
+        "b-stop-rgr", symbol="RGR", side="sell", qty=6, price=39.0,
+        filled_at=clock.now, status="accepted",
+    )
+
+    # Ticks 1-2: grace — explained, quiet.
+    for _ in range(2):
+        clock.advance(minutes=5)
+        report = rec.reconcile_now()
+        assert report.matched is True
+        assert report.external_closes == []
+        assert alerter.calls == []
+        assert ks.is_halted() is False
+
+    # Tick 3: masked absence confirmed — tombstone + single alert naming
+    # the live order, no halt.
+    clock.advance(minutes=5)
+    report = rec.reconcile_now()
+    assert report.matched is True
+    assert report.external_closes == ["RGR"]
+    assert ks.is_halted() is False
+    assert len(alerter.calls) == 1
+    assert "b-stop-rgr" in alerter.calls[0]
+    assert "cancel" in alerter.calls[0].lower()
+    assert str(oid) in alerter.calls[0]
+    # The journal self-healed: ghost gone, thesis guard sees closed.
+    assert repo.get_open_positions() == []
+    from journal.repo import has_open_position
+    assert has_open_position(repo.db_path, "RGR") is False
+    # The stop row stays PENDING (we never invent an outcome) — the
+    # operator cancels it; fill ingestion will record 'canceled' then.
+    assert [r.id for r in repo.get_orders_pending_fill()] == [oid]
+
+    # Tick 4: clean match, no repeat alert, still no halt.
+    clock.advance(minutes=5)
+    report = rec.reconcile_now()
+    assert report.matched is True
+    assert len(alerter.calls) == 1
+    assert ks.is_halted() is False

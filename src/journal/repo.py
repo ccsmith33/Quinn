@@ -737,33 +737,46 @@ def record_order_outcome(
     re-call with different values or an unknown `order_id`. Rows are never
     deleted or re-edited — this is state-machine completion, not history
     mutation (delta §2.1 item 3).
+
+    W1-L2: the NULL→value transition is a single guarded UPDATE
+    (`WHERE final_status IS NULL`, inside _exec_write's BEGIN IMMEDIATE),
+    so a racing second writer can never overwrite — at most one call wins
+    the guard; the loser is classified below from the committed row.
     """
     with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "UPDATE orders SET final_status = ?, realized_fill_price = ?, "
+            "realized_fill_qty = ?, realized_fill_at = ? "
+            "WHERE id = ? AND final_status IS NULL",
+            (final_status, fill_price, fill_qty, fill_at, order_id),
+        )
+        if cur.rowcount == 1:
+            return
+        # Guard missed: unknown id, idempotent identical re-call, or a
+        # genuine conflict — classify from the committed row.
         row = conn.execute(
-            "SELECT final_status, realized_fill_price, realized_fill_qty, "
-            "realized_fill_at FROM orders WHERE id = ?",
+            "SELECT final_status, realized_fill_price, realized_fill_qty "
+            "FROM orders WHERE id = ?",
             (order_id,),
         ).fetchone()
         if row is None:
             raise OrderOutcomeConflict(f"no orders row with id={order_id}")
-        if row["final_status"] is not None:
-            same = (
-                row["final_status"] == final_status
-                and row["realized_fill_price"] == fill_price
-                and row["realized_fill_qty"] == fill_qty
-            )
-            if same:
-                return  # idempotent no-op
-            raise OrderOutcomeConflict(
-                f"order {order_id} outcome already recorded as "
-                f"{row['final_status']!r}; refusing to overwrite with "
-                f"{final_status!r}"
-            )
-        _exec_write(
-            conn,
-            "UPDATE orders SET final_status = ?, realized_fill_price = ?, "
-            "realized_fill_qty = ?, realized_fill_at = ? WHERE id = ?",
-            (final_status, fill_price, fill_qty, fill_at, order_id),
+        # W1-L1: realized_fill_at is deliberately OMITTED from the identity
+        # comparison — it round-trips through SQLite as text and a broker
+        # timestamp re-read on a later tick is not byte-stable; the
+        # (status, price, qty) triple is the outcome's economic identity.
+        same = (
+            row["final_status"] == final_status
+            and row["realized_fill_price"] == fill_price
+            and row["realized_fill_qty"] == fill_qty
+        )
+        if same:
+            return  # idempotent no-op
+        raise OrderOutcomeConflict(
+            f"order {order_id} outcome already recorded as "
+            f"{row['final_status']!r}; refusing to overwrite with "
+            f"{final_status!r}"
         )
 
 

@@ -684,9 +684,11 @@ def test_qty_mismatch_both_nonzero_unexplained_still_halts() -> None:
 def test_old_pending_order_still_explains_diff_no_window_expiry() -> None:
     """WS1 RC-2 regression guard (replaces the retired window-guard test):
     a GTC sell submitted 30 DAYS ago but still pending fill keeps
-    explaining the position decrease forever — explanation is keyed to
-    order lifecycle, not to a sliding submitted_at window. Under the old
-    classifier this halted on day 8 (the tier-1 hotfix time bomb)."""
+    explaining the position decrease with NO submitted_at expiry — under
+    the old classifier this halted on day 8 (the tier-1 hotfix time
+    bomb). Explanation never turns into a halt; for a broker-ABSENT
+    symbol the W1-M1 masked counter quietly absorbs the ghost after 3
+    consecutive ticks instead (see the masked-external-close tests)."""
     broker = _FakeBroker(positions=[])
     journal = _FakeJournal(
         expected_positions=[_position("XYZ", 50)],
@@ -1252,3 +1254,200 @@ def test_exit_policy_ticker_default_none_disables_hook() -> None:
     rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
     report = rec.reconcile_now()
     assert report.matched is True
+
+
+# ---------------------------------------------------------------------------
+# W1-M1 (review-option-b-ws1-2026-06-10): a never-filling pending sell must
+# not mask an external close forever. Broker-absent + pending-sell-covered
+# runs the same 3-tick absence counter; only RECORDED fills (within the
+# 2-tick window) suppress it.
+# ---------------------------------------------------------------------------
+
+
+def test_pending_sell_masked_external_close_absorbed_after_grace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """W1-M1: operator manually flattens at the broker while a GTC stop is
+    live (Alpaca's DELETE /v2/positions does not cancel open orders).
+    Broker 0, journal 25, pending stop covers the qty — but a sell still
+    PENDING while the position is absent 3 consecutive ticks cannot be
+    fill latency (the FillIngestor polls those same orders every tick).
+    Tombstone + ONE alert naming the live order needing cancellation;
+    never a halt."""
+    import logging
+    broker = _FakeBroker(positions=[])
+    pending_stop = _order(
+        symbol="ACME",
+        role="stop",
+        side="sell",
+        qty=25,
+        submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=2),
+        order_id=7,
+    )
+    journal = _FakeJournal(
+        expected_positions=[_position("ACME", 25)],
+        recent_orders=[pending_stop],
+    )
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market)
+
+    # Ticks 1-2: grace — still explained by the pending stop (the
+    # INSG-style fill-visibility race must stay halt-free and quiet).
+    for _ in range(2):
+        report = rec.reconcile_now()
+        assert report.matched is True
+        assert [ed.diff.symbol for ed in report.explained_diffs] == ["ACME"]
+        assert report.external_closes == []
+        assert journal.tombstones == []
+        assert alerter.calls == []
+        assert ks.halts == []
+
+    # Tick 3: absence confirmed while the sell is STILL pending →
+    # tombstone + single alert listing the live order, no halt.
+    import logging as _logging
+    with caplog.at_level(_logging.WARNING, logger="reconciler.reconciler"):
+        report = rec.reconcile_now()
+    assert report.matched is True
+    assert report.external_closes == ["ACME"]
+    assert ks.halts == []
+    assert len(journal.tombstones) == 1
+    assert journal.tombstones[0]["symbol"] == "ACME"
+    assert journal.tombstones[0]["source"] == "reconciler_external_close"
+    assert len(alerter.calls) == 1
+    # The operator must learn WHICH live orders need manual cancellation.
+    assert "ord-ACME-stop-7" in alerter.calls[0]
+    assert "cancel" in alerter.calls[0].lower()
+    events = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "position.closed_externally_live_orders"
+    ]
+    assert len(events) == 1
+    del logging
+
+    # Tick 4: journal open view self-healed — clean match, no second alert.
+    report = rec.reconcile_now()
+    assert report.matched is True
+    assert len(alerter.calls) == 1
+    assert ks.halts == []
+
+
+def test_masked_absence_counter_resets_when_symbol_reappears() -> None:
+    """Two masked-absent ticks, then the position reappears at the broker
+    (transient positions-endpoint weirdness): counter must reset; a later
+    absence needs the FULL 3 ticks again."""
+    pending_stop = _order(
+        symbol="ACME",
+        role="stop",
+        side="sell",
+        qty=25,
+        submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=2),
+        order_id=7,
+    )
+    journal = _FakeJournal(
+        expected_positions=[_position("ACME", 25)],
+        recent_orders=[pending_stop],
+    )
+    ks = _FakeKillSwitch()
+    broker = _FakeBroker(positions=[])
+    rec = Reconciler(broker, journal, ks, _cfg(), now_fn=_now_market)
+
+    rec.reconcile_now()
+    rec.reconcile_now()
+    assert journal.tombstones == []
+
+    broker._positions = [_position("ACME", 25)]
+    report = rec.reconcile_now()
+    assert report.matched is True
+
+    broker._positions = []
+    rec.reconcile_now()
+    rec.reconcile_now()
+    assert journal.tombstones == []
+    rec.reconcile_now()
+    assert len(journal.tombstones) == 1
+    assert ks.halts == []
+
+
+def test_fill_explained_absence_never_trips_masked_counter() -> None:
+    """A RECORDED fill (within the 2-tick window) covering the decrease is
+    genuine fill latency, not a masked close — the absence counter must
+    not run, no matter how many ticks it persists."""
+    filled_stop = _order(
+        symbol="XYZ",
+        role="stop",
+        side="sell",
+        qty=50,
+        submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=1),
+        order_id=11,
+    ).model_copy(
+        update={
+            "final_status": "filled",
+            "realized_fill_qty": 50,
+            "realized_fill_price": 9.5,
+            "realized_fill_at": _MARKET_OPEN_TIME - dt.timedelta(seconds=100),
+        }
+    )
+    broker = _FakeBroker(positions=[])
+    journal = _FakeJournal(
+        expected_positions=[_position("XYZ", 50)],
+        recent_orders=[filled_stop],
+    )
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market)
+
+    for _ in range(4):
+        report = rec.reconcile_now()
+        assert report.matched is True
+        assert report.external_closes == []
+    assert journal.tombstones == []
+    assert alerter.calls == []
+    assert ks.halts == []
+
+
+def test_partially_pending_explained_absence_also_counted() -> None:
+    """W1-M1 'same logic for partially-pending-explained absence': a
+    recorded fill covers part of the decrease, a pending sell the rest —
+    still masked, still absorbed after 3 ticks, alert names the pending
+    order only."""
+    filled_part = _order(
+        symbol="ACME",
+        role="stop",
+        side="sell",
+        qty=10,
+        submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=1),
+        order_id=21,
+    ).model_copy(
+        update={
+            "final_status": "filled",
+            "realized_fill_qty": 10,
+            "realized_fill_price": 9.5,
+            "realized_fill_at": _MARKET_OPEN_TIME - dt.timedelta(seconds=100),
+        }
+    )
+    pending_rest = _order(
+        symbol="ACME",
+        role="thesis_close",
+        side="sell",
+        qty=15,
+        submitted_at=_MARKET_OPEN_TIME - dt.timedelta(days=1),
+        order_id=22,
+    )
+    broker = _FakeBroker(positions=[])
+    journal = _FakeJournal(
+        expected_positions=[_position("ACME", 25)],
+        recent_orders=[filled_part, pending_rest],
+    )
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market)
+
+    rec.reconcile_now()
+    rec.reconcile_now()
+    assert journal.tombstones == []
+    rec.reconcile_now()
+    assert len(journal.tombstones) == 1
+    assert len(alerter.calls) == 1
+    assert "ord-ACME-thesis_close-22" in alerter.calls[0]
+    assert ks.halts == []

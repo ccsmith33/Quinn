@@ -111,6 +111,12 @@ class FillIngestor:
         pending = self._journal.get_orders_pending_fill()
         recorded = 0
         tombstoned: list[str] = []
+        # W1-L3: per-symbol sum of sell qty recorded THIS tick. Two sells
+        # each partial against the (stale-within-the-tick) latest snapshot
+        # can together close the position; the tombstone must come from
+        # here, not from a later external-close absorption with wrong
+        # provenance and a spurious operator alert.
+        sold_this_tick: dict[str, int] = {}
         for row in pending:
             try:
                 sub = self._broker.get_order_by_id(row.broker_order_id)
@@ -180,7 +186,15 @@ class FillIngestor:
                     "fill_price": sub.filled_avg_price,
                 },
             )
-            if self._closes_position(row, sub, final):
+            if (
+                row.side == "sell"
+                and final in ("filled", "partially_filled_closed")
+                and sub.filled_qty > 0
+            ):
+                sold_this_tick[row.symbol] = (
+                    sold_this_tick.get(row.symbol, 0) + sub.filled_qty
+                )
+            if self._closes_position(row, final, sold_this_tick):
                 self._journal.insert_position_tombstone(
                     row.symbol,
                     "fill_ingest",
@@ -202,19 +216,24 @@ class FillIngestor:
         )
 
     def _closes_position(
-        self, row: OrderRow, sub: SubmittedOrder, final: str
+        self, row: OrderRow, final: str, sold_this_tick: dict[str, int]
     ) -> bool:
-        """A recorded sell fill closes the position when its fill qty
-        covers the journal's open qty (latest snapshot). Partial closes
-        leave the snapshot to the reconciler's next broker-truth write."""
+        """Recorded sell fills close the position when the qty sold THIS
+        tick (W1-L3: summed across same-tick fills, since the latest
+        snapshot is stale within the tick) covers the journal's open qty.
+        Partial closes leave the snapshot to the reconciler's next
+        broker-truth write. Fires at most once per symbol per tick: the
+        first crossing tombstones, after which the latest row is the
+        qty-0 tombstone and the open-qty guard is False."""
         if row.side != "sell" or final not in ("filled", "partially_filled_closed"):
             return False
-        if sub.filled_qty <= 0:
+        sold = sold_this_tick.get(row.symbol, 0)
+        if sold <= 0:
             return False
         open_pos = self._journal.get_latest_position_for_symbol(row.symbol)
         if open_pos is None or open_pos.qty <= 0:
             return False
-        return sub.filled_qty >= open_pos.qty
+        return sold >= open_pos.qty
 
 
 __all__ = ["FillIngestReport", "FillIngestor"]

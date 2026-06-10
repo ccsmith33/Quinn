@@ -325,3 +325,35 @@ def test_second_tick_is_noop_after_recording(repo: JournalRepo) -> None:
             "SELECT COUNT(*) FROM positions WHERE symbol='AAPL' AND qty=0"
         ).fetchone()
     assert count == 1
+
+
+def test_same_tick_multi_order_full_close_tombstones_once(repo: JournalRepo) -> None:
+    """W1-L3: two sells (5 + 5) against an open 10 both fill in the SAME
+    tick. Each fill alone is partial against the (stale) latest snapshot,
+    but together they close the position — the tick must sum its own
+    recorded sell fills and tombstone exactly once, with fill_ingest
+    provenance (not a later external-close absorption + spurious alert)."""
+    eid = _seed_execution(repo.db_path)
+    _insert_order(repo, eid, qty=5, broker_order_id="b-a")
+    _insert_order(
+        repo, eid, role="thesis_close", qty=5, broker_order_id="b-b"
+    )
+    _snapshot_position(repo, "AAPL", 10)
+    broker = _FakeBroker()
+    broker.orders["b-a"] = _broker_order("b-a", qty=5, filled_qty=5)
+    broker.orders["b-b"] = _broker_order("b-b", qty=5, filled_qty=5)
+
+    report = _ingestor(broker, repo).run_tick()
+
+    assert report.recorded == 2
+    assert report.tombstoned == ["AAPL"]
+    assert repo.get_open_positions() == []
+    with sqlite3.connect(repo.db_path) as conn:
+        count, = conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE symbol='AAPL' AND qty=0"
+        ).fetchone()
+        src, = conn.execute(
+            "SELECT source FROM positions WHERE symbol='AAPL' AND qty=0"
+        ).fetchone()
+    assert count == 1
+    assert src == "fill_ingest"

@@ -502,6 +502,10 @@ class Reconciler:
         unexpected: list[PositionDiff] = []
         ext_pending: list[PositionDiff] = []
         ext_closed: list[str] = []
+        # Symbols whose absence counter is live this tick (reported
+        # pending OR masked-but-counted, see W1-M1 below) — counters for
+        # anything else are cleared after the loop.
+        grace_symbols: set[str] = set()
         classifications: dict[str, str] = {}
         per_diff_orders: dict[str, list[int]] = {}
         for d in diffs:
@@ -528,23 +532,45 @@ class Reconciler:
                 expected.append(
                     ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
                 )
-            elif classification == "expected":
-                classifications[d.symbol] = "expected"
-                expected.append(
-                    ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
-                )
-            elif d.broker_qty == 0 and d.journal_qty > 0:
+            elif (
+                d.broker_qty == 0
+                and d.journal_qty > 0
+                and not self._fills_cover_absence(d, lifecycle)
+            ):
                 # External-close absorption: confirmed-absent for N
                 # consecutive ticks → tombstone + ONE alert, no halt.
+                #
+                # W1-M1 (review-option-b-ws1-2026-06-10): the counter runs
+                # even when PENDING sells cover the qty — only a RECORDED
+                # fill suppresses it. The FillIngestor polls those same
+                # pending orders at the top of this very tick, so a sell
+                # still pending while the position is absent across the
+                # whole grace window cannot be fill latency: it is an
+                # operator/broker flatten with the protective order left
+                # live (Alpaca's position-close does not cancel open
+                # orders). During the grace window an order-covered diff
+                # stays explained (the INSG-style fill-visibility race);
+                # an uncovered one is reported external_close_pending.
                 misses = self._external_miss.get(d.symbol, 0) + 1
                 if misses >= _EXTERNAL_CLOSE_MISS_THRESHOLD:
-                    self._absorb_external_close(d, now)
+                    live_orders = [
+                        o for o in lifecycle
+                        if o.side == "sell" and o.final_status is None
+                    ]
+                    self._absorb_external_close(d, now, live_orders=live_orders)
                     ext_closed.append(d.symbol)
                     classifications[d.symbol] = "external_close"
                 else:
                     self._external_miss[d.symbol] = misses
-                    ext_pending.append(d)
-                    classifications[d.symbol] = "external_close_pending"
+                    grace_symbols.add(d.symbol)
+                    if classification == "expected":
+                        classifications[d.symbol] = "expected"
+                        expected.append(
+                            ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
+                        )
+                    else:
+                        ext_pending.append(d)
+                        classifications[d.symbol] = "external_close_pending"
                     log.info(
                         "reconciler.external_close_pending",
                         extra={
@@ -553,18 +579,25 @@ class Reconciler:
                             "journal_qty": d.journal_qty,
                             "consecutive_misses": misses,
                             "threshold": _EXTERNAL_CLOSE_MISS_THRESHOLD,
+                            "masked_by_live_orders": (
+                                classification == "expected"
+                            ),
                         },
                     )
+            elif classification == "expected":
+                classifications[d.symbol] = "expected"
+                expected.append(
+                    ExplainedDiff(diff=d, explained_by_order_ids=order_ids)
+                )
             else:
                 classifications[d.symbol] = "unexpected"
                 unexpected.append(d)
 
         # Counters survive only for symbols still inside the grace window
         # this tick — anything explained, reappeared, or tombstoned resets.
-        pending_symbols = {d.symbol for d in ext_pending}
         self._external_miss = {
             sym: n for sym, n in self._external_miss.items()
-            if sym in pending_symbols
+            if sym in grace_symbols
         }
 
         if not unexpected:
@@ -586,7 +619,7 @@ class Reconciler:
                     ]),
                     "external_closes": json.dumps(ext_closed),
                     "external_close_pending": json.dumps(
-                        sorted(pending_symbols)
+                        sorted(d.symbol for d in ext_pending)
                     ),
                 },
             )
@@ -652,33 +685,83 @@ class Reconciler:
             external_close_pending=ext_pending,
         )
 
-    def _absorb_external_close(self, d: PositionDiff, now: dt.datetime) -> None:
+    @staticmethod
+    def _fills_cover_absence(
+        d: PositionDiff, lifecycle_orders: list[OrderRow]
+    ) -> bool:
+        """True when RECORDED sell fills (already window-filtered by the
+        lifecycle query) cover the full journal qty of a broker-absent
+        symbol — genuine fill latency, never a masked external close
+        (W1-M1). Pending rows deliberately do not count here."""
+        recorded = sum(
+            o.realized_fill_qty or 0
+            for o in lifecycle_orders
+            if o.side == "sell"
+            and o.final_status in ("filled", "partially_filled_closed")
+        )
+        return recorded >= d.journal_qty
+
+    def _absorb_external_close(
+        self,
+        d: PositionDiff,
+        now: dt.datetime,
+        *,
+        live_orders: list[OrderRow] | None = None,
+    ) -> None:
         """Delta §2.2 RC-4 absorption: tombstone + single alert, no halt.
         Broker liquidations and operator manual flattens both land here,
-        visibly, once."""
+        visibly, once. W1-M1: when live (pending) sell orders still cover
+        the vanished position, the alert names them — they need operator
+        cancellation at the broker, or their eventual fill would sell
+        shares we no longer hold."""
+        live = live_orders or []
+        live_desc = ", ".join(
+            f"journal order {o.id} (broker {o.broker_order_id}, role {o.role})"
+            for o in live
+        )
+        notes = (
+            f"externally closed at broker (journal qty {d.journal_qty}); "
+            f"confirmed absent {_EXTERNAL_CLOSE_MISS_THRESHOLD} "
+            f"consecutive ticks; D-078"
+        )
+        if live:
+            notes += f"; live sell orders left open: {live_desc}"
         self._journal.insert_position_tombstone(
             d.symbol,
             "reconciler_external_close",
-            f"externally closed at broker (journal qty {d.journal_qty}, "
-            f"no journaled sell explains it); confirmed absent "
-            f"{_EXTERNAL_CLOSE_MISS_THRESHOLD} consecutive ticks; D-078",
+            notes,
             snapshot_at=now,
         )
+        event = (
+            "position.closed_externally_live_orders"
+            if live
+            else "position.closed_externally"
+        )
         log.warning(
-            "position.closed_externally",
+            event,
             extra={
-                "event": "position.closed_externally",
+                "event": event,
                 "symbol": d.symbol,
                 "journal_qty": d.journal_qty,
+                "live_order_ids": [o.id for o in live],
             },
         )
         if self._alerter is not None:
-            self._alerter.notify(
-                f"Position closed externally at broker: {d.symbol} "
-                f"(journal qty {d.journal_qty}, no journaled sell). "
-                f"Tombstoned; no halt — zero exposure. Verify at broker "
-                f"if this wasn't you."
-            )
+            if live:
+                self._alerter.notify(
+                    f"Position closed externally at broker: {d.symbol} "
+                    f"(journal qty {d.journal_qty}) while sell order(s) "
+                    f"are STILL LIVE: {live_desc}. Cancel them at the "
+                    f"broker — a later fill would sell shares we no "
+                    f"longer hold. Tombstoned; no halt — zero exposure."
+                )
+            else:
+                self._alerter.notify(
+                    f"Position closed externally at broker: {d.symbol} "
+                    f"(journal qty {d.journal_qty}, no journaled sell). "
+                    f"Tombstoned; no halt — zero exposure. Verify at broker "
+                    f"if this wasn't you."
+                )
 
     @staticmethod
     def _classify_diff(
