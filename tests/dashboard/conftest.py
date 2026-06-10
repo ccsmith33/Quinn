@@ -65,8 +65,14 @@ def client(app) -> TestClient:
 # ---------------------------------------------------------------------------
 
 
-def _utc(year: int = 2026, month: int = 4, day: int = 28, hour: int = 12) -> _dt.datetime:
-    return _dt.datetime(year, month, day, hour, 0, 0, tzinfo=_dt.UTC)
+def _utc() -> _dt.datetime:
+    """Yesterday noon UTC. Anchored to the run, not the calendar: a
+    fixed date ages out of the dashboard's 30-day windows (D-082's
+    documented date-bomb, fixed at integration). Yesterday keeps every
+    seeded timestamp in the past regardless of run time-of-day."""
+    now = _dt.datetime.now(_dt.UTC)
+    noon = now.replace(hour=12, minute=0, second=0, microsecond=0)
+    return noon - _dt.timedelta(days=1)
 
 
 def seed_filings(db_path: str, *, n: int = 3, day: _dt.datetime | None = None) -> list[int]:
