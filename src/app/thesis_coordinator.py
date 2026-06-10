@@ -96,7 +96,11 @@ def _default_get_live_protective_order(
     pending a terminal disposition (`final_status IS NULL` — the D-078
     §7.4 lifecycle contract)."""
     try:
-        from journal.repo import get_live_protective_order  # WS1 §7.4
+        # WS1 §7.4 — lands with the merge train; missing name raises
+        # ImportError until then, so the except arm below covers it.
+        from journal.repo import (  # type: ignore[attr-defined]
+            get_live_protective_order,
+        )
     except ImportError:
         placeholders = ",".join("?" for _ in roles)
         with connect(db_path) as conn:
@@ -126,7 +130,11 @@ def _default_record_order_outcome(
     before WS1 merges, the old row simply keeps `final_status` NULL;
     the latest-row-wins live lookup stays correct."""
     try:
-        from journal.repo import record_order_outcome  # WS1 §7.4
+        # WS1 §7.4 — lands with the merge train; missing name raises
+        # ImportError until then, so the except arm below covers it.
+        from journal.repo import (  # type: ignore[attr-defined]
+            record_order_outcome,
+        )
     except ImportError:
         log.warning(
             "thesis_coordinator.record_order_outcome_unavailable",

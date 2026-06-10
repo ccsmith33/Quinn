@@ -92,7 +92,11 @@ def _default_record_order_outcome(
     fill_at: dt.datetime | None,
 ) -> None:
     try:
-        from journal.repo import record_order_outcome  # WS1 §7.4
+        # WS1 §7.4 — lands with the merge train; missing name raises
+        # ImportError until then, so the except arm below covers it.
+        from journal.repo import (  # type: ignore[attr-defined]
+            record_order_outcome,
+        )
     except ImportError:
         log.warning(
             "exit_policy.record_order_outcome_unavailable",
