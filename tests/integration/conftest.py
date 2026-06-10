@@ -74,6 +74,10 @@ class _FakeBroker:
     submitted_orders: list[OrderRequest] = field(default_factory=list)
     submitted_brackets: list[BracketOrderRequest] = field(default_factory=list)
     submitted_by_client_id: dict[str, SubmittedOrder] = field(default_factory=dict)
+    # WS1 (D-078, delta §7.1): every SubmittedOrder also indexed by its
+    # broker_order_id so `get_order_by_id` (the FillIngestor poll target)
+    # works against this fake. `fill_order` flips an entry terminal.
+    submitted_by_broker_id: dict[str, SubmittedOrder] = field(default_factory=dict)
     # Pre-seeded orders simulating the broker's memory of a previous
     # process run whose journal write was lost mid-pipeline (M-4 test).
     preseeded_by_client_id: dict[str, SubmittedOrder] = field(default_factory=dict)
@@ -106,6 +110,7 @@ class _FakeBroker:
             stop_price=req.stop_price,
         )
         self.submitted_by_client_id[req.client_order_id] = resp
+        self.submitted_by_broker_id[resp.broker_order_id] = resp
         return resp
 
     def submit_bracket_order(
@@ -158,6 +163,7 @@ class _FakeBroker:
             stop_price=None,
         )
         self.submitted_by_client_id[req.entry_client_order_id] = entry
+        self.submitted_by_broker_id[entry.broker_order_id] = entry
 
         # Project stop leg.
         stop_req = OrderRequest(
@@ -183,6 +189,7 @@ class _FakeBroker:
             submitted_at=dt.datetime.now(dt.UTC),
             stop_price=req.stop_loss_price,
         )
+        self.submitted_by_broker_id[stop.broker_order_id] = stop
 
         tp: SubmittedOrder | None = None
         if req.take_profit_price is not None:
@@ -208,6 +215,7 @@ class _FakeBroker:
                 submitted_at=dt.datetime.now(dt.UTC),
                 limit_price=req.take_profit_price,
             )
+            self.submitted_by_broker_id[tp.broker_order_id] = tp
 
         return entry, stop, tp
 
@@ -220,6 +228,42 @@ class _FakeBroker:
         if client_order_id in self.submitted_by_client_id:
             return self.submitted_by_client_id[client_order_id]
         return self.preseeded_by_client_id.get(client_order_id)
+
+    def get_order_by_id(self, broker_order_id: str) -> SubmittedOrder | None:
+        """WS1 (D-078, delta §7.1): FillIngestor poll target. None on an
+        unknown id, mirroring the real adapter's 404 contract."""
+        if broker_order_id in self.submitted_by_broker_id:
+            return self.submitted_by_broker_id[broker_order_id]
+        for sub in self.preseeded_by_client_id.values():
+            if sub.broker_order_id == broker_order_id:
+                return sub
+        return None
+
+    def fill_order(
+        self,
+        broker_order_id: str,
+        *,
+        price: float,
+        filled_at: dt.datetime | None = None,
+        qty: int | None = None,
+        status: str = "filled",
+    ) -> SubmittedOrder:
+        """Test helper: flip a previously-submitted order terminal so the
+        FillIngestor's next poll observes the fill. `qty` defaults to the
+        order's full quantity; pass less + status='canceled' to model a
+        partial fill closed."""
+        sub = self.submitted_by_broker_id[broker_order_id]
+        filled = sub.model_copy(
+            update={
+                "status": status,
+                "filled_avg_price": price,
+                "filled_qty": qty if qty is not None else sub.qty,
+                "filled_at": filled_at or dt.datetime.now(dt.UTC),
+            }
+        )
+        self.submitted_by_broker_id[broker_order_id] = filled
+        self.submitted_by_client_id[filled.client_order_id] = filled
+        return filled
 
     def replace_stop_order(
         self,

@@ -70,21 +70,13 @@ class ExecutionConfig(_Section):
 
 class ReconcilerConfig(_Section):
     interval_seconds_market: int = Field(gt=0)
-    # Hotfix 2026-05-07 — when broker/journal positions diverge, look back
-    # this many minutes in the `orders` table for recent bracket-order rows
-    # that explain the divergence (entry buy that just filled, stop/TP sell
-    # that just filled). If the recent orders fully account for the diff,
-    # the reconciler treats it as expected — no halt — and snapshots the
-    # broker's truth. Genuine unexplained divergence (manual broker
-    # action, corruption) still halts.
-    #
-    # HOTFIX-2026-05-11: default widened from 30 min to 7 days (10_080 min).
-    # `tif='day'` entries submitted on a Friday afternoon can fill at the
-    # following Monday open, ~64 h later — the old 30-minute window halted
-    # every Monday-morning fill burst against a Friday submission. A 7-day
-    # window comfortably spans a weekend + a long-weekend holiday and is
-    # still bounded enough that genuinely stale broker-side state (a manual
-    # operator action a week ago) won't slip through silently.
+    # RETIRED — WS1 (D-078, delta §2.2). Diff explanation is now keyed to
+    # order lifecycle (pending fill, or filled within the last 2 ticks),
+    # never to a sliding submitted_at window, so there is nothing left for
+    # this knob to widen (the RC-2 time-bomb class is gone). The field is
+    # still parsed (ignored) so a prod quinn.toml carrying the key keeps
+    # booting; the cutover runbook removes the key, then this field can be
+    # deleted.
     expected_fill_window_minutes: int = Field(default=10_080, gt=0)
 
 
@@ -95,6 +87,10 @@ class KillSwitchConfig(_Section):
     # S7.3 — webhook fallback transport (ADR-004).
     webhook_port: int = Field(default=8443, ge=1, le=65535)
     webhook_counter_path: str = Field(default="/var/lib/quinn/state/webhook_counter")
+    # WS1 (D-078, delta §2.3): while an identical fingerprinted halt
+    # persists unresolved, re-page the operator at most once per this
+    # many minutes (the kill-switch dedupes the rest — kills O-5).
+    halt_repage_minutes: int = Field(default=240, gt=0)
 
 
 class ObservabilityConfig(_Section):
