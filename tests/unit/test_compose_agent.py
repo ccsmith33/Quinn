@@ -412,3 +412,64 @@ def test_compose_agent_paper_vs_live_only_differs_on_credentials(
         a = getattr(paper_loop.components, field)
         b = getattr(live_loop.components, field)
         assert type(a) is type(b), f"class differs for {field}: {type(a)} vs {type(b)}"
+
+
+def test_compose_agent_wires_fill_ingestor_into_reconciler(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """WS1 (D-078, delta §1/§2.1): composition must wire a FillIngestor
+    into the Reconciler ctor so fill outcomes are recorded at the top of
+    every tick. Without this wiring the whole position-truth contract is
+    dead code in prod."""
+    from app.composition import compose_agent
+    from reconciler.fill_ingest import FillIngestor
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+    ):
+        loop = compose_agent(
+            cfg,
+            secrets=secrets,
+            journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    rec = loop.components.reconciler
+    ingestor = rec._fill_ingestor  # type: ignore[attr-defined]
+    assert isinstance(ingestor, FillIngestor)
+    # The ingestor polls the SAME broker and journal the reconciler uses.
+    assert ingestor._broker is loop.components.broker  # type: ignore[attr-defined]
+    assert ingestor._journal is journal  # type: ignore[attr-defined]
+
+
+def test_compose_agent_wires_halt_repage_minutes_into_killswitch(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """WS1 (D-078, delta §2.3): `killswitch.halt_repage_minutes` from
+    config must reach the KillSwitch ctor (not silently stay at the
+    class default)."""
+    from app.composition import compose_agent
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    cfg.killswitch.halt_repage_minutes = 90  # non-default
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+    ):
+        loop = compose_agent(
+            cfg,
+            secrets=secrets,
+            journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    ks = loop.components.killswitch
+    assert ks._repage_minutes == 90  # type: ignore[attr-defined]

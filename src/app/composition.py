@@ -60,6 +60,7 @@ from prefilter.orchestrator import Prefilter
 from prefilter.similarity import SimilarityChecker
 from prompts.loader import PromptBuilder
 from proposal.store import ProposalStore
+from reconciler.fill_ingest import FillIngestor
 from reconciler.reconciler import Reconciler
 from universe.api import Universe
 
@@ -228,8 +229,11 @@ def compose_agent(
     sizer = SizingEngine()
     submitter = OrderSubmitter()
 
-    # Kill-switch read API (S7.1).
-    killswitch = KillSwitch(journal)
+    # Kill-switch read API (S7.1). WS1 (D-078, delta §2.3): re-page
+    # throttle window for fingerprinted (reconciler) halts from config.
+    killswitch = KillSwitch(
+        journal, repage_minutes=config.killswitch.halt_repage_minutes
+    )
     auto_halt = AutoHaltEvaluator()
 
     # Telegram outbound notifier. Single instance shared by reconciler
@@ -300,6 +304,11 @@ def compose_agent(
         broker=broker, journal=journal,
     )
 
+    # WS1 (D-078, ADR-010) — poll-based fill ingestion, invoked at the
+    # top of every reconcile tick (inside the Reconciler; deliberately
+    # NOT a loop.py hook — that is the WS1/WS3 seam resolution).
+    fill_ingestor = FillIngestor(broker=broker, journal=journal)
+
     # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.
     # S5.6 carry-fwd S6.5 reviewer M-3 (HIGH): wire the Telegram alerter
     # at construction so position-discrepancy notifications reach the
@@ -320,6 +329,8 @@ def compose_agent(
         pdt_state=pdt_state,
         pdt_enabled=config.execution.pdt_enabled,
         virtual_exits_scanner=virtual_exits_scanner,
+        # WS1 (D-078): fill truth first, every tick.
+        fill_ingestor=fill_ingestor,
     )
 
     # AlertWatcher (S8.2) — must be constructed AFTER migrations have
