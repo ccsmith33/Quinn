@@ -309,6 +309,15 @@ class AgentLoop:
         if recon_start is not None:
             await recon_start()
         await self._crash_recovery_scan()
+        # D-087 — idempotent thesis-review re-arm sweep. A position whose
+        # latest thesis-review schedule already fired without writing a
+        # successor (the `adjust_stop_skipped` orphaning bug, and any
+        # other gap where entry-time scheduling failed) is invisible to
+        # the reconciler-driven coordinator forever. Every boot, re-arm a
+        # due-now review for any OPEN BROKER position that lacks a pending
+        # review. Idempotent: positions that already have a pending review
+        # are skipped, so a restart loop cannot pile up schedules.
+        self._rearm_orphaned_thesis_reviews()
         # PDT-TRANSITION-D-077 (ADR-012 §4.2): one-shot conversion of
         # active virtual exits to real GTC broker orders. MUST run
         # before the deferred replayer below — the converter's drain
@@ -861,6 +870,100 @@ class AgentLoop:
             return int(self._config.analyzer.opus_review_conviction_threshold)
         except (AttributeError, TypeError, ValueError):
             return None
+
+    def _rearm_orphaned_thesis_reviews(self) -> None:
+        """D-087 — boot-time, idempotent re-arm of orphaned thesis
+        reviews.
+
+        For every OPEN broker position whose `accepted` execution has no
+        *pending* thesis review (latest schedule already fired, or none
+        ever written), insert a due-now `thesis_review_schedule` row so
+        the reconciler-driven coordinator picks it back up on its next
+        tick. Broker positions are the source of truth for "open", so a
+        closed slot can never be armed even if a stale journal `positions`
+        row lingers.
+
+        Idempotent: executions that already have a pending review are not
+        returned by the repo query, so repeated boots never stack
+        duplicate schedules. Best-effort: any failure is logged and boot
+        proceeds (a missed re-arm is recoverable next boot; a crashed
+        boot is not).
+        """
+        from journal.models import ThesisReviewScheduleRow
+        from journal.repo import (
+            find_accepted_executions_without_pending_thesis_review,
+            insert_thesis_review_schedule,
+        )
+
+        db = self._components.journal.db_path
+        try:
+            candidates = find_accepted_executions_without_pending_thesis_review(db)
+        except Exception as e:  # noqa: BLE001 — never block boot on the sweep
+            log.error(
+                "agent.thesis_rearm_query_failed",
+                extra={"event": "agent.thesis_rearm_query_failed", "error": str(e)},
+            )
+            return
+        if not candidates:
+            return
+
+        try:
+            open_symbols = {
+                p.symbol for p in self._components.broker.get_positions() if p.qty != 0
+            }
+        except Exception as e:  # noqa: BLE001 — broker glitch: skip, retry next boot
+            log.warning(
+                "agent.thesis_rearm_positions_failed",
+                extra={
+                    "event": "agent.thesis_rearm_positions_failed",
+                    "error": str(e),
+                },
+            )
+            return
+
+        now = dt.datetime.now(dt.UTC)
+        rearmed = 0
+        for execution_id, symbol in candidates:
+            if symbol not in open_symbols:
+                continue
+            try:
+                insert_thesis_review_schedule(
+                    db,
+                    ThesisReviewScheduleRow(
+                        execution_id=execution_id,
+                        due_at=now,
+                        scheduled_reason="rearm",
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "agent.thesis_rearm_insert_failed",
+                    extra={
+                        "event": "agent.thesis_rearm_insert_failed",
+                        "execution_id": execution_id,
+                        "symbol": symbol,
+                        "error": str(e),
+                    },
+                )
+                continue
+            rearmed += 1
+            log.info(
+                "agent.thesis_review_rearmed",
+                extra={
+                    "event": "agent.thesis_review_rearmed",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                },
+            )
+        if rearmed:
+            log.info(
+                "agent.thesis_rearm_sweep",
+                extra={
+                    "event": "agent.thesis_rearm_sweep",
+                    "rearmed": rearmed,
+                    "candidates": len(candidates),
+                },
+            )
 
     def _schedule_thesis_review(
         self,
