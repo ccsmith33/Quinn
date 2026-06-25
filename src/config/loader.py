@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
 class ConfigError(Exception):
@@ -53,11 +53,33 @@ class AnalyzerConfig(_Section):
     opus_max_output_tokens: int = Field(default=4096, gt=0)
 
 
+class Ks5Tier(_Section):
+    """One breakpoint of the KS-5 dynamic concurrent-position curve (D-087
+    fix #3). `max_positions` applies while equity is `<= equity_max`.
+
+    Tiers are an *opt-in* sublinear curve: small accounts trade a narrow
+    book, larger accounts widen it with diminishing returns rather than
+    linearly. The list is ordered, strictly ascending in `equity_max`, and
+    always clamped by `ExecutionConfig.ks5_max_concurrent` (the hard
+    ceiling) so the curve can never widen the book past the configured cap.
+    """
+
+    equity_max: float = Field(gt=0.0)
+    max_positions: int = Field(ge=0)
+
+
 class ExecutionConfig(_Section):
     broker_mode: Literal["paper", "live"]
     ks4_pct_cap: float = Field(ge=0.0, le=1.0)
     ks4_absolute_cap_usd: float = Field(ge=0.0)
+    # KS-5 concurrent-position cap. `ks5_max_concurrent` is the hard ceiling
+    # (and the *only* required knob — a legacy config carrying just this key
+    # keeps booting and behaving flat). D-087 fix #3 adds an opt-in tiered
+    # curve via `ks5_tiers`: when non-empty, the effective cap scales with
+    # equity along those breakpoints, clamped by the ceiling. Empty (the
+    # default) means the cap stays flat at `ks5_max_concurrent`.
     ks5_max_concurrent: int = Field(ge=0)
+    ks5_tiers: list[Ks5Tier] = Field(default_factory=list)
     ks7_cash_reserve_pct: float = Field(ge=0.0, le=1.0)
     sizing_mid_pct: float = Field(ge=0.0, le=1.0)
     sizing_high_pct: float = Field(ge=0.0, le=1.0)
@@ -75,6 +97,20 @@ class ExecutionConfig(_Section):
     # stop by `min_ratchet_step_pct` percent (bounds PATCH chatter).
     trail_activation_r: float = Field(default=1.0, gt=0.0)
     min_ratchet_step_pct: float = Field(default=0.25, ge=0.0)
+
+    @model_validator(mode="after")
+    def _check_ks5_tiers_monotonic(self) -> ExecutionConfig:
+        """Breakpoints must be strictly ascending in `equity_max` so the band
+        lookup is unambiguous. A misordered list is an operator error and is
+        rejected at load time rather than silently mis-banding in prod.
+        """
+        thresholds = [t.equity_max for t in self.ks5_tiers]
+        if any(b <= a for a, b in zip(thresholds, thresholds[1:], strict=False)):
+            raise ValueError(
+                "ks5_tiers equity_max values must be strictly ascending; "
+                f"got {thresholds}"
+            )
+        return self
 
 
 class ReconcilerConfig(_Section):
