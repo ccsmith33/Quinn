@@ -507,14 +507,34 @@ class ThesisReviewCoordinator:
             # No journaled live stop (e.g. PDT-era position before the
             # WS3 conversion). The scanner still protects those; the
             # window is one merge step (§3.3 item 6).
+            #
+            # D-087 fix: this branch previously returned WITHOUT writing
+            # a follow-up schedule, which orphaned the position from all
+            # future thesis re-review (the latest schedule row had
+            # already fired but no successor existed, so
+            # `find_due_thesis_reviews` never surfaced it again). A
+            # missing journaled stop is a *transient* journal-vs-broker
+            # gap that the WS3 conversion closes, NOT a terminal state —
+            # so re-arm a +1d retry whenever the position is STILL OPEN.
+            # If the position has since closed, stay terminal (no
+            # reschedule): there is nothing left to review.
+            position_open = has_open_position(self._journal.db_path, symbol)
             log.warning(
                 "thesis_coordinator.adjust_stop_skipped",
                 extra={
                     "event": "thesis_coordinator.adjust_stop_skipped",
                     "execution_id": execution_id,
                     "reason": "missing_entry_or_stop",
+                    "position_open": position_open,
+                    "rescheduled": position_open,
                 },
             )
+            if position_open:
+                self._reschedule(
+                    execution_id,
+                    when=now + dt.timedelta(days=1),
+                    reason="adjust_stop",
+                )
             return
 
         if new_stop_price <= 0 or new_stop_price >= current_price:

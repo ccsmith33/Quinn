@@ -1729,3 +1729,382 @@ async def test_adjust_tp_skipped_when_no_live_tp_leg(
     assert broker.submitted == []
     assert broker.canceled == []
     assert len(_pending_schedules(db_path, eid, now)) == 1
+
+
+# ---------------------------------------------------------------------------
+# D-087 — adjust_stop_skipped must NOT orphan an open position from
+# thesis re-review, and a boot sweep re-arms any already-orphaned slot.
+# ---------------------------------------------------------------------------
+
+
+def _complete_live_stop(db_path: str, execution_id: int) -> None:
+    """Mark the position's journaled stop terminal so the coordinator's
+    `_get_live_protective_order(roles=('stop','trailing_stop'))` returns
+    None — the precondition that drives the `adjust_stop_skipped`
+    branch (no journaled live stop, e.g. a pre-WS3-conversion PDT-era
+    position)."""
+    from journal.repo import record_order_outcome
+
+    stop = next(
+        o for o in _orders_for_execution(db_path, execution_id) if o.role == "stop"
+    )
+    assert stop.id is not None
+    record_order_outcome(
+        db_path, stop.id, "expired", fill_price=None, fill_qty=None, fill_at=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_adjust_stop_skipped_reschedules_when_position_still_open(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """D-087 regression: when adjust_stop can't act because no live stop
+    is journaled (PDT-era position pre-WS3 conversion) but the position
+    is STILL OPEN, the coordinator must re-arm a +1d retry instead of
+    silently returning — the prod orphaning bug. No broker mutation."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _complete_live_stop(db_path, eid)  # no journaled live stop remains
+    _due_schedule(db_path, eid, now)
+
+    # Position is still open per the latest journal snapshot (qty=100
+    # from _setup_open_position) — has_open_position() returns True.
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_stop_response(105.0), now,
+    )
+
+    await coordinator.run_tick()
+
+    # No broker action on the skipped branch.
+    assert broker.replaced == []
+    assert broker.submitted == []
+    assert broker.canceled == []
+    assert broker.submitted_oco == []
+    # The position is re-armed: exactly one +1d follow-up, reason adjust_stop.
+    follow_ups = _pending_schedules(db_path, eid, now)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["scheduled_reason"] == "adjust_stop"
+    due = follow_ups[0]["due_at"]
+    if isinstance(due, str):
+        due = dt.datetime.fromisoformat(due.replace(" ", "T"))
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=dt.UTC)
+    assert abs((due - (now + dt.timedelta(days=1))).total_seconds()) < 1.0
+
+
+@pytest.mark.asyncio
+async def test_adjust_stop_skipped_stays_terminal_when_position_closed(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """D-087: the skipped re-arm fires ONLY for still-open positions. If
+    the slot has since closed (latest snapshot qty=0), there is nothing
+    left to review — stay terminal, write no follow-up schedule."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _complete_live_stop(db_path, eid)
+    _due_schedule(db_path, eid, now)
+    # Slot closed AFTER entry: latest positions snapshot is qty=0. Note
+    # this also clears the run_tick open-position guard, so the review
+    # never runs — but the unit-level branch is still pinned because
+    # has_open_position() is the same predicate either way.
+    insert_position(
+        db_path,
+        PositionRow(
+            snapshot_at=now - dt.timedelta(hours=1),
+            source="reconciler",
+            symbol="ACME",
+            qty=0,
+            avg_entry_price=100.0,
+            market_value=0.0,
+            unrealized_pnl=0.0,
+        ),
+    )
+
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_stop_response(105.0), now,
+    )
+
+    await coordinator.run_tick()
+
+    assert broker.replaced == []
+    assert broker.submitted == []
+    # No follow-up schedule: a closed slot must not be re-armed.
+    assert _pending_schedules(db_path, eid, now) == []
+
+
+@pytest.mark.asyncio
+async def test_adjust_stop_lost_race_and_position_gone_stay_terminal(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """D-087 guard: the §3.3 step-5 fallback's terminal branches must
+    NOT acquire a reschedule from the skipped-branch fix. A filled old
+    stop (fill ingestion owns the exit) and an absent broker position
+    (the tombstone path owns it) both stay terminal — no follow-up."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+
+    # Branch 1 — lost race: PATCH failed because the stop FILLED.
+    _, eid_race = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _due_schedule(db_path, eid_race, now)
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    broker.fail_next_replace()
+    broker.seed_order(
+        _live_order("orig-stop-ACME", status="filled", stop_price=90.0)
+    )
+    broker.positions = [_broker_position("ACME")]
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_stop_response(105.0), now,
+    )
+    await coordinator.run_tick()
+    assert _pending_schedules(db_path, eid_race, now) == []
+
+    # Branch 3 — position gone at the broker. Use a distinct symbol so
+    # the journal open-position guard (latest positions snapshot) and the
+    # broker truth agree the slot is gone for THIS execution.
+    fid = insert_filing(
+        db_path,
+        FilingRow(
+            accession_number="gone-acc-X",
+            cik=789019,
+            form_type="8-K",
+            filed_at=now - dt.timedelta(days=15, hours=2),
+            fetched_at=now - dt.timedelta(days=15, hours=1),
+            raw_text_path="/tmp/gone.txt",
+            content_hash="hash-gone",
+            item_codes='["1.01"]',
+            issuer_ticker="WIDG",
+        ),
+    )
+    payload = {
+        "symbol": "WIDG", "direction": "long", "size_pct_of_capital": 0.10,
+        "entry_style": "market_open", "stop_loss_price": 90.0,
+        "take_profit_price": 150.0, "time_horizon_days": 14, "conviction": 8,
+        "thesis": "WIDG catalyst.", "signals": ["Item 1.01"],
+        "exit_conditions": ["x"], "risk_factors": ["y"],
+    }
+    pid = insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fid, decision_id="gone-d-X", model_id="claude-sonnet-4-6",
+            prompt_version=sonnet_pv, raw_response=json.dumps(payload),
+            kind="trade_proposal", symbol="WIDG", direction="long",
+            size_pct_requested=0.10, conviction=8, thesis="WIDG catalyst.",
+            input_tokens=10, output_tokens=10, latency_ms=10, cost_usd=0.001,
+        ),
+    )
+    eid_gone = insert_execution(
+        db_path,
+        ExecutionRow(
+            proposal_id=pid, decision="accepted", realized_size_pct=0.10,
+            realized_dollar_size=10000.0, submitted_orders_json="[]",
+        ),
+    )
+    insert_order(
+        db_path,
+        OrderRow(
+            execution_id=eid_gone, role="entry", symbol="WIDG", side="buy",
+            order_type="market", qty=100, tif="day",
+            broker_order_id="orig-entry-WIDG", submitted_at=now - dt.timedelta(days=15),
+            realized_fill_price=100.0, realized_fill_qty=100,
+            realized_fill_at=now - dt.timedelta(days=15), final_status="filled",
+        ),
+    )
+    insert_order(
+        db_path,
+        OrderRow(
+            execution_id=eid_gone, role="stop", symbol="WIDG", side="sell",
+            order_type="stop", qty=100, tif="gtc", stop_price=90.0,
+            broker_order_id="orig-stop-WIDG",
+            submitted_at=now - dt.timedelta(days=15), final_status=None,
+        ),
+    )
+    # Open per journal so run_tick proceeds to the review.
+    insert_position(
+        db_path,
+        PositionRow(
+            snapshot_at=now - dt.timedelta(days=15), source="reconciler",
+            symbol="WIDG", qty=100, avg_entry_price=100.0,
+            market_value=11000.0, unrealized_pnl=1000.0,
+        ),
+    )
+    _due_schedule(db_path, eid_gone, now)
+
+    broker2 = _FakeBrokerWithCancelTracking(last_price=110.0)
+    broker2.fail_next_replace()
+    broker2.seed_order(
+        _live_order("orig-stop-WIDG", status="canceled", stop_price=90.0, symbol="WIDG")
+    )
+    broker2.positions = []  # gone at broker
+    coordinator2 = _make_coordinator(
+        db_path, journal, prompt_builder, broker2,
+        _adjust_stop_response(105.0), now,
+    )
+    await coordinator2.run_tick()
+    assert _pending_schedules(db_path, eid_gone, now) == []
+
+
+@pytest.mark.asyncio
+async def test_boot_rearm_sweep_arms_orphaned_open_position_idempotently(
+    db_path: str,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    prompt_builder,
+) -> None:
+    """D-087: the boot sweep re-arms a due-now thesis review for any open
+    BROKER position whose latest schedule already fired without a
+    successor (the orphaned state), and is idempotent across boots."""
+    import asyncio
+
+    from app.loop import AgentLoop
+    from journal.models import ThesisReviewRow
+    from journal.repo import insert_thesis_review
+
+    sonnet_pv, thesis_pv = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=20), sonnet_pv=sonnet_pv
+    )
+    # Orphan it: the entry schedule fired (a thesis_reviews row exists)
+    # but no successor schedule was written — exactly the adjust_stop_
+    # skipped early-return outcome.
+    sched_id = insert_thesis_review_schedule(
+        db_path,
+        ThesisReviewScheduleRow(
+            execution_id=eid,
+            due_at=now - dt.timedelta(days=6),
+            scheduled_reason="entry",
+        ),
+    )
+    insert_thesis_review(
+        db_path,
+        ThesisReviewRow(
+            execution_id=eid,
+            schedule_id=sched_id,
+            model_id="claude-opus-4-7",
+            prompt_version=thesis_pv,
+            decision="adjust_stop",
+            raw_response="{}",
+            rationale="fired but orphaned",
+            input_tokens=1, output_tokens=1, latency_ms=1, cost_usd=0.0,
+        ),
+    )
+    # Sanity: no PENDING schedule remains for this execution.
+    assert _pending_schedules(db_path, eid, now - dt.timedelta(days=30)) != []
+    from journal.repo import (
+        find_accepted_executions_without_pending_thesis_review,
+    )
+    assert (eid, "ACME") in find_accepted_executions_without_pending_thesis_review(
+        db_path
+    )
+
+    # The broker reports the position open (source of truth for the sweep).
+    fake_broker.positions = [_broker_position("ACME", qty=100)]
+
+    queue: asyncio.Queue = asyncio.Queue()
+    components = build_components(queue=queue)
+    loop = AgentLoop(components=components)
+
+    def _open_schedule_count() -> int:
+        with connect(db_path) as conn:
+            return conn.execute(
+                "SELECT COUNT(*) FROM thesis_review_schedule s "
+                "WHERE s.execution_id = ? AND NOT EXISTS ("
+                "  SELECT 1 FROM thesis_reviews tr WHERE tr.schedule_id = s.id)",
+                (eid,),
+            ).fetchone()[0]
+
+    assert _open_schedule_count() == 0  # orphaned: zero pending
+
+    await loop._boot()  # noqa: SLF001 — boot seam under test
+
+    # Exactly one fresh, due-now schedule was armed.
+    assert _open_schedule_count() == 1
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT scheduled_reason FROM thesis_review_schedule s "
+            "WHERE s.execution_id = ? AND NOT EXISTS ("
+            "  SELECT 1 FROM thesis_reviews tr WHERE tr.schedule_id = s.id) "
+            "ORDER BY s.id DESC LIMIT 1",
+            (eid,),
+        ).fetchone()
+    assert row["scheduled_reason"] == "rearm"
+
+    # Idempotent: a second boot does NOT stack another schedule (the
+    # execution now has a pending review, so the query excludes it).
+    await loop._boot()  # noqa: SLF001
+    assert _open_schedule_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_boot_rearm_sweep_skips_closed_positions(
+    db_path: str,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    prompt_builder,
+) -> None:
+    """D-087: the sweep is driven by BROKER truth — an orphaned
+    execution whose position is NOT open at the broker is left alone, so
+    a closed slot is never re-armed even if a stale journal row lingers."""
+    import asyncio
+
+    from app.loop import AgentLoop
+    from journal.models import ThesisReviewRow
+    from journal.repo import insert_thesis_review
+
+    sonnet_pv, thesis_pv = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=20), sonnet_pv=sonnet_pv
+    )
+    sched_id = insert_thesis_review_schedule(
+        db_path,
+        ThesisReviewScheduleRow(
+            execution_id=eid,
+            due_at=now - dt.timedelta(days=6),
+            scheduled_reason="entry",
+        ),
+    )
+    insert_thesis_review(
+        db_path,
+        ThesisReviewRow(
+            execution_id=eid, schedule_id=sched_id, model_id="claude-opus-4-7",
+            prompt_version=thesis_pv, decision="hold", raw_response="{}",
+            rationale="fired", input_tokens=1, output_tokens=1,
+            latency_ms=1, cost_usd=0.0,
+        ),
+    )
+
+    # Broker has NO open position for ACME → must not be re-armed.
+    fake_broker.positions = []
+
+    queue: asyncio.Queue = asyncio.Queue()
+    components = build_components(queue=queue)
+    loop = AgentLoop(components=components)
+
+    await loop._boot()  # noqa: SLF001
+
+    with connect(db_path) as conn:
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM thesis_review_schedule s "
+            "WHERE s.execution_id = ? AND NOT EXISTS ("
+            "  SELECT 1 FROM thesis_reviews tr WHERE tr.schedule_id = s.id)",
+            (eid,),
+        ).fetchone()[0]
+    assert pending == 0

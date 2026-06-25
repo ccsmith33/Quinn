@@ -540,6 +540,53 @@ def find_due_thesis_reviews(
     return [ThesisReviewScheduleRow(**dict(r)) for r in rows]
 
 
+def find_accepted_executions_without_pending_thesis_review(
+    db_path: str,
+) -> list[tuple[int, str]]:
+    """D-087 boot re-arm support — return `(execution_id, symbol)` for
+    every `accepted` execution that currently has NO *pending* thesis
+    review.
+
+    A review is *pending* when the execution's LATEST
+    `thesis_review_schedule` row has not yet produced a `thesis_reviews`
+    row (i.e. it is still queued and `find_due_thesis_reviews` will
+    surface it once due). An execution is therefore returned here when:
+
+      - it has NO schedule row at all (entry-time scheduling failed); or
+      - its latest schedule row has ALREADY fired (a `thesis_reviews`
+        row exists for it) and no successor schedule was written — the
+        exact orphaning the `adjust_stop_skipped` early-return caused.
+
+    Position-still-open is NOT filtered here: the caller (the boot
+    sweep) intersects these against live BROKER positions so broker
+    truth drives the re-arm and stale journal `positions` rows can't
+    arm a review on a closed slot.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT e.id AS execution_id, p.symbol AS symbol
+            FROM executions e
+            JOIN proposals p ON p.id = e.proposal_id
+            WHERE e.decision = 'accepted'
+              AND p.symbol IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM thesis_review_schedule s
+                  WHERE s.execution_id = e.id
+                    AND s.id = (
+                        SELECT MAX(s2.id) FROM thesis_review_schedule s2
+                        WHERE s2.execution_id = e.id
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM thesis_reviews tr
+                        WHERE tr.schedule_id = s.id
+                    )
+              )
+            """
+        ).fetchall()
+    return [(int(r["execution_id"]), str(r["symbol"])) for r in rows]
+
+
 def insert_thesis_review(db_path: str, row: ThesisReviewRow) -> int:
     with connect(db_path) as conn:
         cur = _exec_write(
