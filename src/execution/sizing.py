@@ -43,6 +43,29 @@ _TIER_MID_THRESHOLD = 7  # cv in [7, 8] → mid tier (5% default)
 # loop, so a stray low-cv proposal is recoverable in production.
 _CONVICTION_FLOOR = 5
 
+
+def ks5_effective_cap(equity: float, cfg: ExecutionConfig) -> int:
+    """Effective KS-5 concurrent-position cap for the current equity.
+
+    D-087 fix #3 — the cap is an opt-in *sublinear* curve. When
+    `cfg.ks5_tiers` is empty (the default and the legacy prod shape), the
+    cap is flat at `cfg.ks5_max_concurrent` — exactly the prior behavior.
+
+    When tiers are configured, the cap is the `max_positions` of the first
+    (lowest) band whose `equity_max >= equity`; equity above every band uses
+    `cfg.ks5_max_concurrent` (the curve flattens at the ceiling rather than
+    blowing up). The result is always clamped to `cfg.ks5_max_concurrent`,
+    so the configured ceiling is authoritative and the curve can never widen
+    the book past it. Tiers are validated strictly-ascending at config load,
+    so a simple first-match scan is unambiguous.
+    """
+    cap = cfg.ks5_max_concurrent
+    for tier in cfg.ks5_tiers:
+        if equity <= tier.equity_max:
+            cap = tier.max_positions
+            break
+    return min(cap, cfg.ks5_max_concurrent)
+
 # Sizing rejection vocabulary, written to `executions.reject_reason` by
 # S5.6's agent loop (carry-fwd S6.4 reviewer M-1; S6.4's OrderSubmitter
 # only persists the ACCEPTED branch).
@@ -112,8 +135,10 @@ class SizingEngine:
         held_symbols = {p.symbol for p in open_positions}
         effective_symbols = held_symbols | pending_symbols
 
-        # KS-5: concurrent-position cap (PRD §5.2).
-        if len(effective_symbols) >= cfg.ks5_max_concurrent:
+        # KS-5: concurrent-position cap (PRD §5.2). The cap is dynamic per
+        # D-087 fix #3 — it scales with equity along the configured tier
+        # curve (flat at ks5_max_concurrent when no tiers are set).
+        if len(effective_symbols) >= ks5_effective_cap(account.equity, cfg):
             return self._reject("ks5_concurrent_limit", proposal)
 
         # KS-6: single-name re-entry block (PRD §5.2 + tactical clarification
@@ -199,4 +224,5 @@ __all__ = [
     "SizingRejectReason",
     "SizingRejected",
     "SizingResult",
+    "ks5_effective_cap",
 ]

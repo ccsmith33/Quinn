@@ -117,6 +117,7 @@ def _cfg(
     ks4_pct_cap: float = 0.20,
     ks4_absolute_cap_usd: float = 1000.0,
     ks5_max_concurrent: int = 5,
+    ks5_tiers: list[dict[str, float]] | None = None,
     ks7_cash_reserve_pct: float = 0.05,
     sizing_mid_pct: float = 0.05,
     sizing_high_pct: float = 0.10,
@@ -126,10 +127,21 @@ def _cfg(
         ks4_pct_cap=ks4_pct_cap,
         ks4_absolute_cap_usd=ks4_absolute_cap_usd,
         ks5_max_concurrent=ks5_max_concurrent,
+        ks5_tiers=ks5_tiers or [],  # type: ignore[arg-type]
         ks7_cash_reserve_pct=ks7_cash_reserve_pct,
         sizing_mid_pct=sizing_mid_pct,
         sizing_high_pct=sizing_high_pct,
     )
+
+
+# Default tier curve the operator opts into (D-087 fix #3). Mirrors the
+# breakpoints documented in the completion report / example config.
+_DEFAULT_TIERS: list[dict[str, float]] = [
+    {"equity_max": 5_000.0, "max_positions": 10},
+    {"equity_max": 15_000.0, "max_positions": 15},
+    {"equity_max": 35_000.0, "max_positions": 20},
+    {"equity_max": 75_000.0, "max_positions": 25},
+]
 
 
 # ---------------------------------------------------------------------------
@@ -455,3 +467,101 @@ def test_at_floor_conviction_proceeds_through_sizing() -> None:
     assert isinstance(result, SizingAccepted)
     # mid-tier rate is 5% per ExecutionConfig default → realized_pct ~ 0.05.
     assert result.realized_pct == pytest.approx(0.05)
+
+
+# ---------------------------------------------------------------------------
+# KS-5 dynamic (tiered) cap (D-087 fix #3).
+#
+# The effective concurrent cap scales with equity along a tunable, *sublinear*
+# breakpoint curve. We exercise it through `engine.size()`: with N positions
+# already open at a given equity, the (N+1)-th proposal is accepted iff
+# N < effective_cap. We drive the boundary by setting N = cap-1 (accept) and
+# N = cap (reject). Equity is always supplied with ample cash so KS-7 / KS-4
+# never interfere with the KS-5 assertion.
+# ---------------------------------------------------------------------------
+
+def _size_with_n_open(*, equity: float, n_open: int, cfg: ExecutionConfig) -> object:
+    """Run sizing for a fresh symbol with `n_open` distinct held positions.
+
+    Cash == equity so KS-7 never trips; price low + tier small so KS-4 and
+    the one-share floor never trip. Isolates the KS-5 decision.
+    """
+    p = _proposal(symbol="NEWCO", conviction=8)
+    account = _account(equity=equity, cash=equity)
+    open_positions = [_position(f"HELD{i}") for i in range(n_open)]
+    return SizingEngine().size(
+        p, account, open_positions=open_positions, quote=_quote(last=1.0), cfg=cfg
+    )
+
+
+def test_ks5_flat_when_tiers_unset_preserves_legacy_behavior() -> None:
+    """With no tier curve, the cap is exactly `ks5_max_concurrent` at any
+    equity — the legacy flat behavior prod relies on today.
+    """
+    cfg = _cfg(ks5_max_concurrent=10)  # no tiers
+    # 10 held at $100k still rejects the 11th (flat, equity-independent).
+    rej = _size_with_n_open(equity=100_000.0, n_open=10, cfg=cfg)
+    assert isinstance(rej, SizingRejected)
+    assert rej.reason == "ks5_concurrent_limit"
+    # 9 held → 10th accepted.
+    acc = _size_with_n_open(equity=100_000.0, n_open=9, cfg=cfg)
+    assert isinstance(acc, SizingAccepted)
+
+
+@pytest.mark.parametrize(
+    ("equity", "expected_cap"),
+    [
+        (3_500.0, 10),    # anchor: ~10 positions at $3.5k (band <= $5k)
+        (5_000.0, 10),    # exact lower-band edge → still 10
+        (5_000.01, 15),   # just over $5k → next band
+        (10_000.0, 15),   # anchor: ~15 positions at $10k (band <= $15k)
+        (15_000.0, 15),   # exact band edge → still 15
+        (15_000.01, 20),  # just over $15k → next band
+        (35_000.0, 20),   # band edge
+        (75_000.0, 25),   # band edge
+        (100_000.0, 30),  # anchor: flattens to the hard ceiling, no blow-up
+    ],
+)
+def test_ks5_tiered_cap_band_boundaries(equity: float, expected_cap: int) -> None:
+    """The effective cap equals the documented band value at each anchor and
+    boundary. ks5_max_concurrent=30 is the hard ceiling for the top band.
+    """
+    cfg = _cfg(ks5_max_concurrent=30, ks5_tiers=_DEFAULT_TIERS)
+
+    # cap-1 held → accepted; cap held → rejected. This pins the exact cap.
+    acc = _size_with_n_open(equity=equity, n_open=expected_cap - 1, cfg=cfg)
+    assert isinstance(acc, SizingAccepted), (
+        f"equity={equity}: expected accept at {expected_cap - 1} held"
+    )
+    rej = _size_with_n_open(equity=equity, n_open=expected_cap, cfg=cfg)
+    assert isinstance(rej, SizingRejected), (
+        f"equity={equity}: expected reject at {expected_cap} held"
+    )
+    assert rej.reason == "ks5_concurrent_limit"
+
+
+def test_ks5_tiered_cap_never_exceeds_hard_ceiling() -> None:
+    """Even if a tier's max_positions is above ks5_max_concurrent, the
+    ceiling is authoritative — the curve can never widen the book past it.
+    """
+    cfg = _cfg(
+        ks5_max_concurrent=12,
+        ks5_tiers=[{"equity_max": 5_000.0, "max_positions": 100}],
+    )
+    rej = _size_with_n_open(equity=1_000.0, n_open=12, cfg=cfg)
+    assert isinstance(rej, SizingRejected)
+    assert rej.reason == "ks5_concurrent_limit"
+    acc = _size_with_n_open(equity=1_000.0, n_open=11, cfg=cfg)
+    assert isinstance(acc, SizingAccepted)
+
+
+def test_ks5_tiered_cap_above_all_tiers_uses_ceiling() -> None:
+    """Equity beyond the last breakpoint uses ks5_max_concurrent as the
+    final (flat) hard cap — the curve flattens, it does not blow up.
+    """
+    cfg = _cfg(ks5_max_concurrent=30, ks5_tiers=_DEFAULT_TIERS)
+    # $1M: deep above $75k → ceiling 30, identical to the $100k anchor.
+    rej = _size_with_n_open(equity=1_000_000.0, n_open=30, cfg=cfg)
+    assert isinstance(rej, SizingRejected)
+    acc = _size_with_n_open(equity=1_000_000.0, n_open=29, cfg=cfg)
+    assert isinstance(acc, SizingAccepted)
