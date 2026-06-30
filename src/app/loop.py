@@ -983,7 +983,17 @@ class AgentLoop:
         horizon = getattr(proposal, "time_horizon_days", None)
         if not isinstance(horizon, int) or horizon <= 0:
             horizon = 14  # Feature A default per task spec
-        due = dt.datetime.now(dt.UTC) + dt.timedelta(days=horizon)
+        # Cap the FIRST review so a fresh position is re-evaluated at least
+        # as often as the configured ceiling (default weekly), even when the
+        # analyzer declared a long catalyst horizon. Subsequent reviews
+        # already recur weekly via HOLD_RESCHEDULE_DAYS, so this only bounds
+        # the entry-time interval. When no config is wired (legacy/test
+        # construction) the declared horizon is used uncapped.
+        review_days = horizon
+        cap = self._max_initial_review_days()
+        if cap is not None:
+            review_days = min(horizon, cap)
+        due = dt.datetime.now(dt.UTC) + dt.timedelta(days=review_days)
         insert_thesis_review_schedule(
             self._components.journal.db_path,
             ThesisReviewScheduleRow(
@@ -998,9 +1008,27 @@ class AgentLoop:
                 "event": "agent.thesis_review_scheduled",
                 "execution_id": execution_id,
                 "horizon_days": horizon,
+                "review_days": review_days,
                 "due_at": due.isoformat(),
             },
         )
+
+    def _max_initial_review_days(self) -> int | None:
+        """First-review cap (Feature A): the configured ceiling on the
+        entry-time thesis-review interval, or `None` when no config is wired.
+
+        Returns `None` for legacy/test construction (`config=None` or a stub
+        lacking the field) so the declared horizon is used uncapped, which
+        preserves prior behavior. In production `compose_agent` always passes
+        the `AppConfig`, so the `ExecutionConfig.max_initial_review_days`
+        default (7) applies unless the operator overrides it.
+        """
+        cfg = self._config
+        if cfg is None:
+            return None
+        execution = getattr(cfg, "execution", None)
+        cap = getattr(execution, "max_initial_review_days", None)
+        return cap if isinstance(cap, int) and cap > 0 else None
 
     def _read_raw(self, filing: FilingRow) -> str:
         try:

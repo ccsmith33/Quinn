@@ -526,3 +526,33 @@ def test_compose_agent_wires_exit_policy_ticker_into_reconciler_seam(
     assert ticker._min_step_pct == 0.75  # noqa: SLF001
     assert ticker._journal is journal  # noqa: SLF001
     assert ticker._broker is loop.components.broker  # noqa: SLF001
+
+
+def test_compose_agent_threads_max_initial_review_days_into_loop(
+    db_path: str, prompts_dir: Path, tmp_path: Path
+) -> None:
+    """Feature A: compose_agent passes the AppConfig to the AgentLoop, so the
+    operator-tunable first-review cap reaches `_schedule_thesis_review`. A
+    non-default value proves config threading, not a ctor default.
+    """
+    from app.composition import compose_agent
+
+    cfg = _config(broker_mode="paper", tmp_path=tmp_path)
+    cfg.execution = cfg.execution.model_copy(update={"max_initial_review_days": 3})
+    secrets = _secrets(paper=True)
+    journal = JournalRepo(db_path)
+    with (
+        patch("broker.alpaca.TradingClient"),
+        patch("broker.alpaca.StockHistoricalDataClient"),
+    ):
+        loop = compose_agent(
+            cfg,
+            secrets=secrets,
+            journal=journal,
+            prompts_dir=prompts_dir,
+            similarity_artifact_dir=str(tmp_path / "sim"),
+        )
+
+    assert loop._config.execution.max_initial_review_days == 3  # noqa: SLF001
+    # The cap-resolution helper the scheduler consults sees the threaded value.
+    assert loop._max_initial_review_days() == 3  # noqa: SLF001

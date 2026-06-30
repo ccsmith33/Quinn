@@ -140,3 +140,32 @@ def test_example_toml_disables_scaling_by_default() -> None:
     cfg = load_config(str(EXAMPLE_TOML))
     assert cfg.execution.ks5_tiers == []
     assert cfg.execution.ks5_max_concurrent == 10
+
+
+def test_max_initial_review_days_defaults_to_weekly() -> None:
+    """Feature A — a config omitting the key (the legacy prod shape, and the
+    shipped example) defaults the first-review cap to 7 days so fresh
+    positions get a weekly re-look without operator action.
+    """
+    cfg = ExecutionConfig(**_execution_kwargs())  # type: ignore[arg-type]
+    assert cfg.max_initial_review_days == 7
+    example = load_config(str(EXAMPLE_TOML))
+    assert example.execution.max_initial_review_days == 7
+
+
+def test_max_initial_review_days_override_parses() -> None:
+    """An operator may tune the first-review cap; a positive override parses
+    and supersedes the default."""
+    cfg = ExecutionConfig(
+        **_execution_kwargs(max_initial_review_days=3)  # type: ignore[arg-type]
+    )
+    assert cfg.max_initial_review_days == 3
+
+
+def test_max_initial_review_days_rejects_non_positive() -> None:
+    """Zero or negative makes no sense as a review interval and is an
+    operator error rejected at load time (Field gt=0)."""
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(max_initial_review_days=0)  # type: ignore[arg-type]
+        )

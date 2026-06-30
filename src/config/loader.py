@@ -97,6 +97,14 @@ class ExecutionConfig(_Section):
     # stop by `min_ratchet_step_pct` percent (bounds PATCH chatter).
     trail_activation_r: float = Field(default=1.0, gt=0.0)
     min_ratchet_step_pct: float = Field(default=0.25, ge=0.0)
+    # Feature A — cap the FIRST thesis-review interval. The analyzer's
+    # declared catalyst horizon can run ~30d, which leaves a fresh position
+    # un-re-evaluated for a month. This bounds the entry-time review so a
+    # position is looked at again at least this often; the first review
+    # fires at min(declared horizon, this cap). Subsequent reviews already
+    # recur weekly via thesis_coordinator.HOLD_RESCHEDULE_DAYS. Default 7
+    # = weekly first look.
+    max_initial_review_days: int = Field(default=7, gt=0)
 
     @model_validator(mode="after")
     def _check_ks5_tiers_monotonic(self) -> ExecutionConfig:
