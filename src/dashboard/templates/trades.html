@@ -1,42 +1,56 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2>Trades</h2>
-<p>most-recent {{ rows | length }} executions.</p>
+<div class="page-head">
+  <h1>Trades</h1>
+  <span class="sub">most-recent {{ rows | length }} execution{{ '' if rows | length == 1 else 's' }} · fills &amp; rejects</span>
+</div>
 
 {% if rows | length == 0 %}
-  <p>no executions yet.</p>
+  <div class="empty">No executions yet.</div>
 {% else %}
-<table role="grid">
+<div class="table-wrap">
+<table class="data">
   <thead>
     <tr>
-      <th>decided_at</th>
-      <th>symbol</th>
-      <th>side</th>
-      <th>qty</th>
-      <th>fill price</th>
-      <th>slippage vs NBBO mid</th>
-      <th>decision</th>
-      <th>source proposal</th>
+      <th>Decided</th>
+      <th>Symbol</th>
+      <th>Side</th>
+      <th class="num">Qty</th>
+      <th class="num">Fill price</th>
+      <th class="num">Slippage</th>
+      <th>Decision</th>
+      <th>Proposal</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
-    <tr>
-      <td>{{ row.decided_at }}</td>
-      <td>{{ row.symbol }}</td>
-      <td>{{ row.side }}</td>
-      <td>{{ row.qty }}</td>
-      <td>{% if row.fill_price is not none %}{{ '{:.4f}'.format(row.fill_price) }}{% else %}—{% endif %}</td>
-      <td>{% if row.slippage is not none %}{{ '{:+.4f}'.format(row.slippage) }}{% else %}—{% endif %}</td>
-      <td>{{ row.decision }}{% if row.reject_reason %} ({{ row.reject_reason }}){% endif %}</td>
+    {% set rejected = row.decision != 'accepted' %}
+    <tr class="{{ 'is-reject' if rejected }}">
+      <td class="num faint">{{ row.decided_at.replace('T', ' ')[:19] if row.decided_at else '—' }}</td>
+      <td class="sym">{{ row.symbol }}</td>
+      <td><span class="pill {{ row.side }}">{{ row.side }}</span></td>
+      <td class="num">{{ row.qty }}</td>
+      <td class="num money">{% if row.fill_price is not none %}${{ '{:,.4f}'.format(row.fill_price) }}{% else %}<span class="faint">—</span>{% endif %}</td>
+      <td class="num money">
+        {% if row.slippage is not none %}<span class="{{ 'neg' if row.slippage > 0 else ('pos' if row.slippage < 0 else 'muted') }}">{{ '{:+.4f}'.format(row.slippage) }}</span>{% else %}<span class="faint">—</span>{% endif %}
+      </td>
+      <td>
+        {% if rejected %}
+          <span class="pill reject">{{ row.decision }}</span>
+          {% if row.reject_reason %}<div class="meta neg">{{ row.reject_reason }}</div>{% endif %}
+        {% else %}
+          <span class="pill accepted">{{ row.decision }}</span>
+        {% endif %}
+      </td>
       <td>
         {% if row.proposal_decision_id %}
           <a href="/proposals?symbol={{ row.symbol }}">{{ row.proposal_decision_id }}</a>
-        {% else %}—{% endif %}
+        {% else %}<span class="faint">—</span>{% endif %}
       </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% endif %}
 {% endblock %}

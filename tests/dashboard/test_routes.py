@@ -49,11 +49,11 @@ def test_route_pages_include_meta_refresh(client: TestClient, path: str) -> None
 
 
 @pytest.mark.parametrize("path", ROUTES)
-def test_route_pages_include_pico_css(client: TestClient, path: str) -> None:
-    """AC-8: Pico.css from CDN, no JS framework."""
+def test_route_pages_include_stylesheet(client: TestClient, path: str) -> None:
+    """AC-8: server-rendered with the bespoke static stylesheet, no JS framework."""
     resp = client.get(path, headers=auth_headers())
     body = resp.text
-    assert "pico" in body.lower()
+    assert "/static/dashboard.css" in body
     # No <script src=...> framework imports — inline SVG only.
     assert "<script src=" not in body, "no JS framework imports allowed (AC-8)"
 

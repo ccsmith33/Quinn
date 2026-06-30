@@ -28,6 +28,7 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from broker.protocol import BrokerAdapter
@@ -41,6 +42,7 @@ from .auth import make_basic_auth_dependency
 log = get_logger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+_STATIC_DIR = Path(__file__).resolve().parent / "static"
 _VALID_DECISION_STATUSES = {"accepted", "rejected"}
 
 
@@ -97,6 +99,46 @@ def _sparkline_points(snaps: list[Any], *, width: int = 600, height: int = 80) -
     return " ".join(pts)
 
 
+def _position_row(
+    journal: JournalRepo,
+    *,
+    symbol: str,
+    qty: int,
+    avg_entry_price: float,
+    current_quote: float | None,
+    unrealized_pnl: float,
+    market_value: float,
+) -> dict[str, Any]:
+    """Assemble a single /positions row: live price-derived movement/PnL%
+    plus the entry thesis and current stop/take-profit levels joined from
+    the executions/orders/proposals tables via `get_position_entry_context`.
+    """
+    cost_basis = abs(avg_entry_price * qty)
+    movement_pct: float | None = None
+    if current_quote is not None and avg_entry_price:
+        movement_pct = (current_quote / avg_entry_price - 1.0) * 100.0
+    unrealized_pct: float | None = None
+    if cost_basis > 0:
+        unrealized_pct = (unrealized_pnl / cost_basis) * 100.0
+    ctx = journal.get_position_entry_context(symbol)
+    return {
+        "symbol": symbol,
+        "qty": qty,
+        "avg_entry_price": avg_entry_price,
+        "current_quote": current_quote,
+        "unrealized_pnl": unrealized_pnl,
+        "unrealized_pct": unrealized_pct,
+        "movement_pct": movement_pct,
+        "market_value": market_value,
+        "thesis": ctx.get("thesis") if ctx else None,
+        "conviction": ctx.get("conviction") if ctx else None,
+        "direction": ctx.get("direction") if ctx else None,
+        "decision_id": ctx.get("decision_id") if ctx else None,
+        "stop_price": ctx.get("stop_price") if ctx else None,
+        "take_profit_price": ctx.get("take_profit_price") if ctx else None,
+    }
+
+
 def build_app(
     *,
     journal: JournalRepo,
@@ -115,6 +157,7 @@ def build_app(
     quote_cache = _QuoteCache(ttl_seconds=5.0)
 
     app = FastAPI(title="quinn-dashboard", docs_url=None, redoc_url=None)
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
     ks = KillSwitch(journal)
 
     def _ctx(**extra: Any) -> dict[str, Any]:
@@ -326,25 +369,29 @@ def build_app(
             for bp in broker_positions:
                 cur = quote_cache.get(bp.symbol, broker, now_ts)
                 rows.append(
-                    {
-                        "symbol": bp.symbol,
-                        "qty": int(bp.qty),
-                        "avg_entry_price": float(bp.avg_entry_price),
-                        "current_quote": cur,
-                        "unrealized_pnl": float(bp.unrealized_pnl),
-                    }
+                    _position_row(
+                        journal,
+                        symbol=bp.symbol,
+                        qty=int(bp.qty),
+                        avg_entry_price=float(bp.avg_entry_price),
+                        current_quote=cur,
+                        unrealized_pnl=float(bp.unrealized_pnl),
+                        market_value=float(bp.market_value),
+                    )
                 )
                 total_market_value += float(bp.market_value)
         else:
             for pr in journal.get_open_position_rows():
                 rows.append(
-                    {
-                        "symbol": pr.symbol,
-                        "qty": int(pr.qty),
-                        "avg_entry_price": float(pr.avg_entry_price),
-                        "current_quote": None,
-                        "unrealized_pnl": float(pr.unrealized_pnl),
-                    }
+                    _position_row(
+                        journal,
+                        symbol=pr.symbol,
+                        qty=int(pr.qty),
+                        avg_entry_price=float(pr.avg_entry_price),
+                        current_quote=None,
+                        unrealized_pnl=float(pr.unrealized_pnl),
+                        market_value=float(pr.market_value),
+                    )
                 )
                 total_market_value += float(pr.market_value)
         exposure_pct: float | None = None

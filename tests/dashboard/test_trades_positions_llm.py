@@ -185,6 +185,51 @@ def test_positions_quote_cache_5s(journal) -> None:
     assert second == first, "second hit within 5s should use cached quote"
 
 
+def test_positions_renders_thesis_and_stop_levels(
+    client: TestClient, journal, db_path: str
+) -> None:
+    """The /positions page joins entry thesis + stop/take-profit via
+    get_position_entry_context (D-063 follow-up)."""
+    from journal.models import OrderRow
+
+    seed_prompt(db_path)
+    fids = seed_filings(db_path, n=1)
+    pids = seed_proposals(journal, filing_ids=fids)
+    eid = seed_execution_with_orders(journal, pids[0], symbol="AB0", qty=100, fill_price=10.0)
+    journal.insert_order(
+        OrderRow(
+            execution_id=eid,
+            role="stop",
+            symbol="AB0",
+            side="sell",
+            order_type="stop",
+            qty=100,
+            stop_price=9.25,
+            tif="day",
+            broker_order_id="alpaca-stop",
+            submitted_at=_dt.datetime.now(_dt.UTC),
+            final_status=None,
+        )
+    )
+    journal.insert_position(
+        PositionRow(
+            snapshot_at=_dt.datetime.now(_dt.UTC),
+            source="broker",
+            symbol="AB0",
+            qty=100,
+            avg_entry_price=10.0,
+            market_value=1100.0,
+            unrealized_pnl=100.0,
+            notes=None,
+        )
+    )
+    resp = client.get("/positions", headers=auth_headers())
+    assert resp.status_code == 200
+    body = resp.text
+    assert "9.25" in body  # stop level rendered
+    assert "alpha thesis" in body  # entry thesis joined from the proposal
+
+
 def test_positions_without_broker_renders_journal_only(
     client: TestClient, journal
 ) -> None:

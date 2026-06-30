@@ -1,59 +1,72 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2>Overview</h2>
+<div class="page-head">
+  <h1>Overview</h1>
+  <span class="sub">at-a-glance cockpit</span>
+</div>
 
-<section>
-  <span class="tile">
-    <span class="label">Kill switch</span>
-    <span class="value {{ 'halted' if ks_state == 'halted' else 'active' }}">
-      {{ ks_state }}
+<div class="ks {{ 'halted' if ks_state == 'halted' else 'ok' }}">
+  {% if ks_state == 'halted' %}
+    <span class="badge">HALTED</span>
+    <span class="ks-body">
+      <span class="ks-title">Trading is halted</span>
+      <span class="ks-reason">reason: {{ ks_reason }} · since {{ ks_set_at }}</span>
     </span>
-    {% if ks_state == 'halted' %}
-      <div>reason: {{ ks_reason }}</div>
-      <div>set at: {{ ks_set_at }}</div>
-    {% endif %}
-  </span>
-
-  <span class="tile">
-    <span class="label">Equity</span>
-    <span class="value">{% if equity is not none %}${{ '{:,.2f}'.format(equity) }}{% else %}—{% endif %}</span>
-  </span>
-
-  <span class="tile">
-    <span class="label">Day P&amp;L</span>
-    <span class="value">{% if daypl is not none %}{{ '{:+.2f}'.format(daypl) }}{% else %}—{% endif %}</span>
-  </span>
-
-  <span class="tile">
-    <span class="label">Auto-halt</span>
-    <span class="value">{{ auto_halt_status }}</span>
-  </span>
-</section>
-
-<section>
-  <h3>Today</h3>
-  <span class="tile">
-    <span class="label">Filings ingested</span>
-    <span class="value">{{ filings_today }}</span>
-  </span>
-  <span class="tile">
-    <span class="label">Proposals emitted</span>
-    <span class="value">{{ proposals_today }}</span>
-  </span>
-  <span class="tile">
-    <span class="label">Trades submitted</span>
-    <span class="value">{{ trades_today }}</span>
-  </span>
-</section>
-
-<section>
-  <h3>30d equity</h3>
-  {% if sparkline_points %}
-    <svg class="sparkline" width="600" height="80" viewBox="0 0 600 80" xmlns="http://www.w3.org/2000/svg">
-      <polyline fill="none" stroke="currentColor" stroke-width="1.5" points="{{ sparkline_points }}" />
-    </svg>
   {% else %}
-    <p>no equity history yet</p>
+    <span class="badge">OK</span>
+    <span class="ks-body">
+      <span class="ks-title">Kill switch {{ ks_state }}</span>
+      <span class="ks-reason">auto-halt monitor: {{ auto_halt_status }}</span>
+    </span>
   {% endif %}
-</section>
+</div>
+
+<div class="grid cards" style="margin-top:1rem;">
+  <div class="card">
+    <div class="k">Account equity</div>
+    <div class="v money">{% if equity is not none %}${{ '{:,.2f}'.format(equity) }}{% else %}<span class="muted">—</span>{% endif %}</div>
+  </div>
+  <div class="card">
+    <div class="k">Day P&amp;L</div>
+    {% if daypl is not none %}
+      <div class="v money {{ 'pos' if daypl >= 0 else 'neg' }}">{{ '{:+,.2f}'.format(daypl) }}</div>
+      {% if equity %}<div class="meta">{{ '{:+.2f}'.format(daypl / equity * 100) }}% of equity</div>{% endif %}
+    {% else %}
+      <div class="v muted">—</div>
+    {% endif %}
+  </div>
+  <div class="card">
+    <div class="k">Auto-halt monitor</div>
+    <div class="v sm {{ 'neg' if auto_halt_status != 'ok' else 'pos' }}">{{ auto_halt_status }}</div>
+  </div>
+</div>
+
+<h2 class="section">Today's funnel</h2>
+<div class="card">
+  <div class="funnel">
+    <div class="step"><div class="n">{{ filings_today }}</div><div class="l">Filings</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">{{ proposals_today }}</div><div class="l">Proposals</div></div>
+    <div class="arrow">→</div>
+    <div class="step"><div class="n">{{ trades_today }}</div><div class="l">Trades</div></div>
+  </div>
+</div>
+
+<h2 class="section">30-day equity</h2>
+{% if sparkline_points %}
+  <div class="spark-wrap">
+    <svg viewBox="0 0 600 80" preserveAspectRatio="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="30-day equity curve">
+      <defs>
+        <linearGradient id="sparkfill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="{{ '#2fcf8f' if (daypl is none or daypl >= 0) else '#ff5d6c' }}" stop-opacity="0.28"/>
+          <stop offset="100%" stop-color="{{ '#2fcf8f' if (daypl is none or daypl >= 0) else '#ff5d6c' }}" stop-opacity="0"/>
+        </linearGradient>
+      </defs>
+      <polygon fill="url(#sparkfill)" points="{{ sparkline_points }} 600,80 0,80" />
+      <polyline fill="none" stroke="{{ '#2fcf8f' if (daypl is none or daypl >= 0) else '#ff5d6c' }}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" points="{{ sparkline_points }}" />
+    </svg>
+  </div>
+{% else %}
+  <div class="empty">no equity history yet</div>
+{% endif %}
 {% endblock %}

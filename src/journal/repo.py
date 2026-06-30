@@ -1784,6 +1784,80 @@ class JournalRepo:
                 )
         return out
 
+    def get_position_entry_context(self, symbol: str) -> dict[str, Any] | None:
+        """Join an open position's `symbol` to its entry thesis and current
+        protective exit levels (stop / take-profit). Read-only.
+
+        Returns a dict with keys ``decision_id``, ``thesis``, ``conviction``,
+        ``direction``, ``stop_price``, ``take_profit_price`` — or ``None`` when
+        no entry order exists for the symbol. Powers the ``/positions``
+        "why we traded it" / stop-loss surface (D-063 follow-up).
+
+        Semantics:
+        - thesis/conviction/direction/decision_id come from the proposal that
+          sourced the MOST-RECENT entry order for the symbol (highest order id).
+        - stop_price is the live stop: newest (MAX id) order with role in
+          ('stop', 'trailing_stop') whose final_status is not a terminal
+          dead state. Exit adjustments insert a fresh row and mark the prior
+          one 'replaced', so the highest non-dead id is the active level.
+        - take_profit_price is the live take-profit (role='take_profit',
+          stored in limit_price), chosen the same way.
+        """
+        _dead = ("canceled", "cancelled", "expired", "replaced")
+        _dead_ph = ",".join("?" for _ in _dead)
+        with connect(self.db_path) as conn:
+            entry = conn.execute(
+                """
+                SELECT p.decision_id AS decision_id,
+                       p.thesis      AS thesis,
+                       p.conviction  AS conviction,
+                       p.direction   AS direction
+                FROM orders o
+                JOIN executions e ON e.id = o.execution_id
+                JOIN proposals  p ON p.id = e.proposal_id
+                WHERE o.symbol = ? AND o.role = 'entry'
+                ORDER BY o.id DESC
+                LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+            if entry is None:
+                return None
+            stop = conn.execute(
+                f"""
+                SELECT stop_price FROM orders
+                WHERE symbol = ? AND role IN ('stop', 'trailing_stop')
+                  AND stop_price IS NOT NULL
+                  AND (final_status IS NULL OR final_status NOT IN ({_dead_ph}))
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (symbol, *_dead),
+            ).fetchone()
+            tp = conn.execute(
+                f"""
+                SELECT limit_price FROM orders
+                WHERE symbol = ? AND role = 'take_profit'
+                  AND limit_price IS NOT NULL
+                  AND (final_status IS NULL OR final_status NOT IN ({_dead_ph}))
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (symbol, *_dead),
+            ).fetchone()
+        return {
+            "decision_id": entry["decision_id"],
+            "thesis": entry["thesis"],
+            "conviction": entry["conviction"],
+            "direction": entry["direction"],
+            "stop_price": (
+                float(stop["stop_price"]) if stop is not None else None
+            ),
+            "take_profit_price": (
+                float(tp["limit_price"]) if tp is not None else None
+            ),
+        }
+
     # ------------------------------------------------------------------
     # End S9.1 dashboard helpers
     # ------------------------------------------------------------------

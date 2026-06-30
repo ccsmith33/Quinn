@@ -1,32 +1,74 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2>Open positions</h2>
+<div class="page-head">
+  <h1>Open positions</h1>
+  <span class="sub">
+    {{ rows | length }} position{{ '' if rows | length == 1 else 's' }} ·
+    exposure {% if exposure_pct is not none %}<strong>{{ '{:.1f}'.format(exposure_pct) }}%</strong> of equity{% else %}—{% endif %}
+  </span>
+</div>
 
 {% if rows | length == 0 %}
-  <p>no open positions.</p>
+  <div class="empty">No open positions.</div>
 {% else %}
-<p>total open exposure: {% if exposure_pct is not none %}{{ '{:.2f}'.format(exposure_pct) }}% of equity{% else %}—{% endif %}</p>
-<table role="grid">
+<div class="table-wrap">
+<table class="data">
   <thead>
     <tr>
-      <th>symbol</th>
-      <th>qty</th>
-      <th>avg entry</th>
-      <th>current quote</th>
-      <th>unrealized P&amp;L</th>
+      <th>Symbol</th>
+      <th class="num">Qty</th>
+      <th class="num">Avg entry</th>
+      <th class="num">Current</th>
+      <th class="num">Movement</th>
+      <th class="num">Unrealized P&amp;L</th>
+      <th>Exits &amp; thesis</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
+    {% set up = row.unrealized_pnl >= 0 %}
     <tr>
-      <td>{{ row.symbol }}</td>
-      <td>{{ row.qty }}</td>
-      <td>{{ '{:.4f}'.format(row.avg_entry_price) }}</td>
-      <td>{% if row.current_quote is not none %}{{ '{:.4f}'.format(row.current_quote) }}{% else %}—{% endif %}</td>
-      <td>{{ '{:+.2f}'.format(row.unrealized_pnl) }}</td>
+      <td class="sym">
+        {{ row.symbol }}
+        {% if row.conviction is not none %}
+          {% set c = row.conviction %}
+          <span class="conv" title="conviction {{ c }}/10">
+            {% for n in range(1, 11) %}<i class="{{ 'on hot' if (n <= c and c >= 7) else ('on' if n <= c else '') }}"></i>{% endfor %}
+          </span>
+        {% endif %}
+      </td>
+      <td class="num">{{ row.qty }}</td>
+      <td class="num money">${{ '{:,.2f}'.format(row.avg_entry_price) }}</td>
+      <td class="num money">{% if row.current_quote is not none %}${{ '{:,.2f}'.format(row.current_quote) }}{% else %}<span class="faint">—</span>{% endif %}</td>
+      <td class="num">
+        {% if row.movement_pct is not none %}
+          {% set m = row.movement_pct %}
+          {% set w = (m | abs / 25.0 * 50.0) %}{% if w > 50 %}{% set w = 50 %}{% endif %}
+          <span class="{{ 'pos' if m >= 0 else 'neg' }}">{{ '{:+.2f}'.format(m) }}%</span>
+          <div class="movebar">
+            {% if m >= 0 %}
+              <i class="pos" style="width:{{ '{:.1f}'.format(w) }}%"></i>
+            {% else %}
+              <i class="neg" style="left:{{ '{:.1f}'.format(50 - w) }}%;width:{{ '{:.1f}'.format(w) }}%"></i>
+            {% endif %}
+          </div>
+        {% else %}<span class="faint">—</span>{% endif %}
+      </td>
+      <td class="num money {{ 'pos' if up else 'neg' }}">
+        {{ '{:+,.2f}'.format(row.unrealized_pnl) }}
+        {% if row.unrealized_pct is not none %}<div class="meta {{ 'pos' if up else 'neg' }}">{{ '{:+.2f}'.format(row.unrealized_pct) }}%</div>{% endif %}
+      </td>
+      <td>
+        <div class="exit-levels">
+          <span><span class="lbl">stop</span> {% if row.stop_price is not none %}<span class="stop-val">${{ '{:,.2f}'.format(row.stop_price) }}</span>{% else %}<span class="faint">none</span>{% endif %}</span>
+          <span><span class="lbl">tp</span> {% if row.take_profit_price is not none %}<span class="tp-val">${{ '{:,.2f}'.format(row.take_profit_price) }}</span>{% else %}<span class="faint">none</span>{% endif %}</span>
+        </div>
+        {% if row.thesis %}<div class="pos-thesis" title="{{ row.thesis }}">{{ row.thesis[:140] }}{% if row.thesis|length > 140 %}…{% endif %}</div>{% endif %}
+      </td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% endif %}
 {% endblock %}

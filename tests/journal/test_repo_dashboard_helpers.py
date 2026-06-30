@@ -356,3 +356,130 @@ def test_llm_spend_breakdown_mtd_and_cache_hit_pct(
 
 def test_llm_spend_breakdown_empty_returns_empty_list(journal: JournalRepo) -> None:
     assert journal.llm_spend_breakdown_mtd(_now()) == []
+
+
+def _seed_entry_with_exits(
+    db_path: str, journal: JournalRepo, *, symbol: str = "AB"
+) -> int:
+    """Seed prompt → filing → proposal → execution → entry/stop/take_profit
+    orders for `symbol`. Returns the proposal id."""
+    insert_prompt(
+        db_path,
+        PromptRow(
+            prompt_version="sonnet:v1#abc",
+            name="sonnet_filing_analysis_v1",
+            file_path="src/prompts/files/sonnet.md",
+            content_hash="abc",
+        ),
+    )
+    fid = insert_filing(
+        db_path,
+        FilingRow(
+            accession_number="0000-99-002",
+            cik=2,
+            form_type="8-K",
+            filed_at=_now(),
+            fetched_at=_now(),
+            raw_text_path="/tmp/y",
+            content_hash="hy",
+        ),
+    )
+    pid = insert_proposal(
+        db_path,
+        ProposalRow(
+            filing_id=fid,
+            decision_id="d-ctx",
+            model_id="claude-sonnet-4-6",
+            prompt_version="sonnet:v1#abc",
+            raw_response="{}",
+            kind="trade",
+            symbol=symbol,
+            direction="long",
+            size_pct_requested=0.05,
+            conviction=8,
+            thesis="beat-and-raise; guidance up",
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=0,
+            cache_creation_tokens=0,
+            latency_ms=1000,
+            cost_usd=0.01,
+        ),
+    )
+    eid = journal.insert_execution(
+        ExecutionRow(
+            proposal_id=pid,
+            decision="accepted",
+            reject_reason=None,
+            realized_size_pct=0.05,
+            realized_dollar_size=100.0,
+            submitted_orders_json=None,
+        )
+    )
+
+    def _order(role: str, side: str, otype: str, **kw: object) -> OrderRow:
+        return OrderRow(
+            execution_id=eid,
+            role=role,
+            symbol=symbol,
+            side=side,
+            order_type=otype,
+            qty=10,
+            tif="day",
+            broker_order_id=f"alpaca-{role}-{eid}",
+            submitted_at=_now(),
+            **kw,  # type: ignore[arg-type]
+        )
+
+    journal.insert_order(_order("entry", "buy", "limit", limit_price=12.0,
+                                final_status="filled", realized_fill_price=12.0))
+    journal.insert_order(_order("stop", "sell", "stop", stop_price=10.5))
+    journal.insert_order(_order("take_profit", "sell", "limit", limit_price=15.0))
+    return pid
+
+
+def test_get_position_entry_context_joins_thesis_and_exits(
+    db_path: str, journal: JournalRepo
+) -> None:
+    _seed_entry_with_exits(db_path, journal, symbol="AB")
+    ctx = journal.get_position_entry_context("AB")
+    assert ctx is not None
+    assert ctx["decision_id"] == "d-ctx"
+    assert ctx["thesis"] == "beat-and-raise; guidance up"
+    assert ctx["conviction"] == 8
+    assert ctx["direction"] == "long"
+    assert ctx["stop_price"] == 10.5
+    assert ctx["take_profit_price"] == 15.0
+
+
+def test_get_position_entry_context_newest_stop_wins(
+    db_path: str, journal: JournalRepo
+) -> None:
+    """An adjusted stop inserts a fresh row (old → 'replaced'); the live
+    level is the newest non-dead row."""
+    _seed_entry_with_exits(db_path, journal, symbol="AB")
+    # The original stop row is the only one; mark a ratcheted replacement.
+    journal.insert_order(
+        OrderRow(
+            execution_id=journal.list_recent_executions_with_orders()[0][0].id,
+            role="trailing_stop",
+            symbol="AB",
+            side="sell",
+            order_type="stop",
+            qty=10,
+            tif="gtc",
+            stop_price=11.25,
+            broker_order_id="alpaca-trail",
+            submitted_at=_now(),
+            final_status=None,
+        )
+    )
+    ctx = journal.get_position_entry_context("AB")
+    assert ctx is not None
+    assert ctx["stop_price"] == 11.25
+
+
+def test_get_position_entry_context_unknown_symbol_returns_none(
+    journal: JournalRepo,
+) -> None:
+    assert journal.get_position_entry_context("ZZZZ") is None

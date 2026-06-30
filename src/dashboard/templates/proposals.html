@@ -1,114 +1,81 @@
 {% extends "layout.html" %}
 {% block content %}
-<style>
-  /* Proposals page widens main to give the thesis column real estate. */
-  main { max-width: 1600px; }
-  table.proposals-table { table-layout: fixed; width: 100%; }
-  table.proposals-table th, table.proposals-table td {
-    vertical-align: top;
-    overflow-wrap: anywhere;
-  }
-  table.proposals-table .col-thesis {
-    /* Wide enough for 3-6 lines of typical thesis text without
-       per-character wrapping. */
-    min-width: 360px;
-    max-width: 480px;
-    white-space: normal;
-    word-break: normal;
-    overflow-wrap: break-word;
-  }
-  table.proposals-table .col-when { width: 11ch; }
-  table.proposals-table .col-decision-id { width: 18ch; }
-  table.proposals-table .col-kind { width: 7em; }
-  table.proposals-table .col-symbol { width: 6em; }
-  table.proposals-table .col-direction { width: 5em; }
-  table.proposals-table .col-conviction { width: 5em; }
-  table.proposals-table .col-execution { width: 7em; }
-  table.proposals-table .col-raw { width: 14em; }
-  /* On narrower viewports, fall back to auto layout so columns reflow. */
-  @media (max-width: 900px) {
-    table.proposals-table { table-layout: auto; }
-    table.proposals-table .col-thesis { min-width: 0; max-width: none; }
-  }
-  /* No-trade rows have NULL direction/conviction/execution. Mute those
-     cells (and the symbol fallback when shown) so the eye flows past
-     them to the thesis. CSS only — no conditional rendering. */
-  table.proposals-table tr.row-no_trade .col-direction,
-  table.proposals-table tr.row-no_trade .col-conviction,
-  table.proposals-table tr.row-no_trade .col-execution {
-    color: var(--pico-muted-color);
-    font-size: 0.85em;
-  }
-  table.proposals-table tr.row-no_trade .col-symbol .filing-ticker {
-    color: var(--pico-muted-color);
-  }
-</style>
-<h2>Proposals</h2>
+<div class="page-head">
+  <h1>Proposals</h1>
+  <span class="sub">{{ rows | length }} proposal{{ '' if rows | length == 1 else 's' }} shown · what the LLM proposed &amp; why</span>
+</div>
 
-<form method="get" action="/proposals">
-  <label>symbol <input type="text" name="symbol" value="{{ symbol or '' }}"></label>
+<form class="filters" method="get" action="/proposals">
+  <label>symbol <input type="text" name="symbol" value="{{ symbol or '' }}" placeholder="any"></label>
   <label>status
     <select name="status">
-      <option value="">(any)</option>
+      <option value="">any</option>
       <option value="accepted" {% if status_filter == 'accepted' %}selected{% endif %}>accepted</option>
       <option value="rejected" {% if status_filter == 'rejected' %}selected{% endif %}>rejected</option>
     </select>
   </label>
   <label>limit <input type="number" name="limit" min="1" max="1000" value="{{ limit }}"></label>
-  <button type="submit">filter</button>
+  <button type="submit">Filter</button>
 </form>
 
-<p>{{ rows | length }} proposal(s) shown.</p>
-
 {% if rows | length == 0 %}
-  <p>no proposals match.</p>
+  <div class="empty">No proposals match.</div>
 {% else %}
-<table role="grid" class="proposals-table">
+<div class="table-wrap">
+<table class="data">
   <thead>
     <tr>
-      <th class="col-when">created_at</th>
-      <th class="col-decision-id">decision_id</th>
-      <th class="col-kind">kind</th>
-      <th class="col-symbol">symbol</th>
-      <th class="col-direction">direction</th>
-      <th class="col-conviction">conviction</th>
-      <th class="col-thesis">thesis / reason</th>
-      <th class="col-execution">execution</th>
-      <th class="col-raw">raw + review</th>
+      <th>created_at</th>
+      <th>decision_id</th>
+      <th>kind</th>
+      <th>symbol</th>
+      <th>direction</th>
+      <th>conviction</th>
+      <th>thesis / reason</th>
+      <th>execution</th>
+      <th>raw + review</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
     <tr class="row-{{ row.kind }}">
-      <td class="col-when">{{ row.created_at }}</td>
-      <td class="col-decision-id">{{ row.decision_id }}</td>
-      <td class="col-kind"><span class="kind-badge kind-{{ row.kind }}">{{ row.kind }}</span></td>
-      <td class="col-symbol">
-        {% if row.symbol %}
-          <strong>{{ row.symbol }}</strong>
-        {% elif row.filing_ticker %}
-          <em class="filing-ticker" title="from filing issuer">{{ row.filing_ticker }}</em>
+      <td class="faint">{{ row.created_at.replace('T', ' ')[:19] if row.created_at else '' }}</td>
+      <td class="faint">{{ row.decision_id }}</td>
+      <td><span class="pill kind-{{ row.kind }}">{{ row.kind }}</span></td>
+      <td class="sym">
+        {% if row.symbol %}<strong>{{ row.symbol }}</strong>
+        {% elif row.filing_ticker %}<em class="filing-ticker muted" title="from filing issuer">{{ row.filing_ticker }}</em>
         {% endif %}
       </td>
-      <td class="col-direction">{{ row.direction or '—' }}</td>
-      <td class="col-conviction">{{ row.conviction if row.conviction is not none else '—' }}</td>
-      <td class="col-thesis">
+      <td>
+        {% if row.direction %}<span class="pill {{ 'buy' if row.direction == 'long' else 'neutral' }}">{{ row.direction }}</span>{% else %}<span class="faint">—</span>{% endif %}
+      </td>
+      <td>
+        {% if row.conviction is not none %}
+          {% set c = row.conviction %}
+          <span class="conv">
+            {% for n in range(1, 11) %}<i class="{{ 'on hot' if (n <= c and c >= 7) else ('on' if n <= c else '') }}"></i>{% endfor %}
+            <span class="cv-num">{{ c }}</span>
+          </span>
+        {% else %}<span class="faint">—</span>{% endif %}
+      </td>
+      <td class="thesis-cell">
         {% set text = row.thesis or row.display_thesis %}
         {% if text %}
           {% if text|length > 200 %}
-            <details>
-              <summary>{{ text[:200] }}…</summary>
-              <p>{{ text }}</p>
-            </details>
-          {% else %}
-            {{ text }}
-          {% endif %}
+            <details><summary>{{ text[:200] }}…</summary><p>{{ text }}</p></details>
+          {% else %}{{ text }}{% endif %}
         {% endif %}
       </td>
-      <td class="col-execution">{{ row.execution_decision or '—' }}</td>
-      <td class="col-raw">
+      <td>
+        {% if row.execution_decision == 'accepted' %}<span class="pill accepted">accepted</span>
+        {% elif row.execution_decision == 'rejected' %}<span class="pill reject">rejected</span>
+        {% elif row.execution_decision %}<span class="pill neutral">{{ row.execution_decision }}</span>
+        {% else %}<span class="faint">—</span>{% endif %}
+      </td>
+      <td>
         <details>
-          <summary>show raw_response + opus review</summary>
+          <summary>raw + opus review</summary>
           <h4>Sonnet raw_response</h4>
           <pre>{{ row.raw_response }}</pre>
           {% if row.review %}
@@ -116,7 +83,7 @@
             <pre>{{ row.review.raw_response }}</pre>
             <p><em>rationale:</em> {{ row.review.rationale }}</p>
           {% else %}
-            <p><em>no Opus review (conviction below threshold or not yet reviewed).</em></p>
+            <p class="muted"><em>no Opus review (conviction below threshold or not yet reviewed).</em></p>
           {% endif %}
         </details>
       </td>
@@ -124,5 +91,6 @@
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% endif %}
 {% endblock %}

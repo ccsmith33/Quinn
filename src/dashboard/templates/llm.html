@@ -1,48 +1,62 @@
 {% extends "layout.html" %}
 {% block content %}
-<h2>LLM spend</h2>
+<div class="page-head">
+  <h1>LLM spend</h1>
+  <span class="sub">month-to-date · by model</span>
+</div>
 
-<section>
-  <span class="tile">
-    <span class="label">MTD total</span>
-    <span class="value">${{ '{:.4f}'.format(mtd_total_usd) }}</span>
-  </span>
-</section>
+<div class="grid cards">
+  <div class="card">
+    <div class="k">MTD total</div>
+    <div class="v money">${{ '{:,.4f}'.format(mtd_total_usd) }}</div>
+  </div>
+  <div class="card">
+    <div class="k">Models</div>
+    <div class="v sm">{{ rows | length }}</div>
+  </div>
+  <div class="card">
+    <div class="k">Total calls</div>
+    <div class="v sm">{{ rows | sum(attribute='calls') }}</div>
+  </div>
+</div>
 
+<h2 class="section">Per-model breakdown</h2>
 {% if rows | length == 0 %}
-  <p>no LLM calls in the current month yet.</p>
+  <div class="empty">No LLM calls in the current month yet.</div>
 {% else %}
-<table role="grid">
+<div class="table-wrap">
+<table class="data">
   <thead>
     <tr>
-      <th>model</th>
-      <th>calls</th>
-      <th>cost (USD)</th>
-      <th>input tok</th>
-      <th>output tok</th>
-      <th>cache read</th>
-      <th>cache create</th>
-      <th>cache hit %</th>
-      <th>p50 latency (ms)</th>
-      <th>p95 latency (ms)</th>
+      <th>Model</th>
+      <th class="num">Calls</th>
+      <th class="num">Cost (USD)</th>
+      <th class="num">Input tok</th>
+      <th class="num">Output tok</th>
+      <th class="num">Cache read</th>
+      <th class="num">Cache create</th>
+      <th class="num">Cache hit %</th>
+      <th class="num">p50 ms</th>
+      <th class="num">p95 ms</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
     <tr>
-      <td>{{ row.model_id }}</td>
-      <td>{{ row.calls }}</td>
-      <td>{{ '{:.4f}'.format(row.cost_usd) }}</td>
-      <td>{{ row.input_tokens }}</td>
-      <td>{{ row.output_tokens }}</td>
-      <td>{{ row.cache_read_tokens }}</td>
-      <td>{{ row.cache_creation_tokens }}</td>
-      <td>{{ '{:.1f}'.format(row.cache_hit_pct) }}</td>
-      <td>{{ row.p50_latency_ms }}</td>
-      <td>{{ row.p95_latency_ms }}</td>
+      <td class="sym">{{ row.model_id }}</td>
+      <td class="num">{{ row.calls }}</td>
+      <td class="num money">${{ '{:,.4f}'.format(row.cost_usd) }}</td>
+      <td class="num">{{ '{:,}'.format(row.input_tokens) }}</td>
+      <td class="num">{{ '{:,}'.format(row.output_tokens) }}</td>
+      <td class="num">{{ '{:,}'.format(row.cache_read_tokens) }}</td>
+      <td class="num">{{ '{:,}'.format(row.cache_creation_tokens) }}</td>
+      <td class="num">{{ '{:.1f}'.format(row.cache_hit_pct) }}%</td>
+      <td class="num">{{ row.p50_latency_ms }}</td>
+      <td class="num">{{ row.p95_latency_ms }}</td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
+</div>
 {% endif %}
 {% endblock %}

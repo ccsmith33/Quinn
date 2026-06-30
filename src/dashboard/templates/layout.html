@@ -4,32 +4,28 @@
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="{{ auto_refresh_seconds }}">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>quinn — {{ page_title }}</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
-  <style>
-    main { padding: 1rem; max-width: 1100px; margin: auto; }
-    nav.app { display: flex; gap: 1rem; padding: 0.5rem 1rem; border-bottom: 1px solid var(--pico-muted-border-color); }
-    nav.app a { text-decoration: none; }
-    nav.app a.active { font-weight: bold; }
-    .tile { display: inline-block; padding: 0.75rem 1.25rem; margin: 0.25rem; border: 1px solid var(--pico-muted-border-color); border-radius: 6px; min-width: 140px; }
-    .tile .label { font-size: 0.85em; color: var(--pico-muted-color); }
-    .tile .value { font-size: 1.4em; font-weight: bold; }
-    .halted { color: red; }
-    .active { color: green; }
-    table { font-size: 0.92em; }
-    pre { white-space: pre-wrap; word-break: break-all; max-height: 30em; overflow: auto; }
-    .sparkline { vertical-align: middle; }
-  </style>
+  <meta name="color-scheme" content="dark">
+  <title>quinn · {{ page_title }}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+  <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
-  <nav class="app">
-    <a href="/" class="{% if active_route == 'overview' %}active{% endif %}">Overview</a>
-    <a href="/proposals" class="{% if active_route == 'proposals' %}active{% endif %}">Proposals</a>
-    <a href="/trades" class="{% if active_route == 'trades' %}active{% endif %}">Trades</a>
-    <a href="/positions" class="{% if active_route == 'positions' %}active{% endif %}">Positions</a>
-    <a href="/llm" class="{% if active_route == 'llm' %}active{% endif %}">LLM</a>
-    <span style="margin-left:auto; color: var(--pico-muted-color); font-size: 0.85em;">refresh {{ auto_refresh_seconds }}s</span>
-  </nav>
+  <header class="topbar">
+    <span class="brand">
+      <span class="dot {% if ks_state is defined and ks_state == 'halted' %}halt{% endif %}"></span>
+      quinn
+    </span>
+    <nav class="nav">
+      <a href="/" class="{% if active_route == 'overview' %}active{% endif %}">Overview</a>
+      <a href="/positions" class="{% if active_route == 'positions' %}active{% endif %}">Positions</a>
+      <a href="/trades" class="{% if active_route == 'trades' %}active{% endif %}">Trades</a>
+      <a href="/proposals" class="{% if active_route == 'proposals' %}active{% endif %}">Proposals</a>
+      <a href="/llm" class="{% if active_route == 'llm' %}active{% endif %}">LLM</a>
+    </nav>
+    <span class="refresh-note">live · {{ auto_refresh_seconds }}s</span>
+  </header>
   <main>
     {% block content %}{% endblock %}
   </main>
