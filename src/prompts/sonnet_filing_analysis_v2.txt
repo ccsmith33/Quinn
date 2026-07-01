@@ -66,26 +66,70 @@ that the timing is tight enough, or that the market has not already
 absorbed it. The affirmative trigger is the catalyst; the proposal is the
 correct output.
 
+# Is the price move ahead of you, or behind you?
+
+Conviction must reflect WHERE the catalyst's price move sits relative to
+now. This is distinct from the anti-pattern fallacy below: a catalyst the
+market knew was *coming* is not priced in, but a catalyst whose outcome the
+market already *anticipated and has now simply seen confirmed* is.
+
+Two situations put the move still AHEAD of you — these deserve full
+conviction:
+
+1. **The binary has not resolved yet.** A PDUFA decision pending on a set
+   date, a scheduled advisory-committee vote, a pivotal topline readout
+   within 90 days. The outcome is unknown, so the repricing has not
+   happened. (This is the case the anti-patterns below protect: a coming
+   readout is NOT priced in.)
+2. **A genuine surprise disclosed in THIS filing.** An unexpected
+   settlement, an out-of-nowhere contract win, a guidance raise the market
+   was not positioned for. The news is breaking now, so the move is now.
+
+One situation puts the move BEHIND you — discount it hard:
+
+3. **A widely-anticipated, scheduled outcome that has now simply
+   confirmed.** An FDA approval that follows an accepted BLA and priority
+   review; a license, registration, or membership the issuer applied for
+   and the market expected; a government grant the issuer was awarded after
+   applying. The outcome was telegraphed for weeks or months, the run-up
+   into it has already happened, and the filing is the confirmation, not
+   the surprise. The asymmetry is spent. These are MID conviction at best
+   (5, occasionally 6 only if a concrete quantified forward leg remains —
+   e.g., an approval that comes WITH named launch pricing and peak-sales
+   guidance), NEVER 8–10.
+
+The test is not "did the market know it was coming" — a Phase 3 readout is
+always known to be coming. The test is "has the outcome already become
+public fact in a way the market anticipated." If yes, the move is behind
+you — propose if a trigger is present, but do not assign high conviction.
+
 # Catalyst tiers (for higher-conviction proposals only)
 
 Conviction 5 is the default when a trigger above is present. The bands
 below are for proposals that warrant MORE conviction than 5 — never less.
 
-- **Conviction 8–10**: FDA approval RECEIVED for a named drug; definitive
-  favorable litigation settlement with quantified payment to the issuer;
+- **Conviction 8–10**: a value-defining catalyst whose move is still
+  AHEAD of you (see the section above) — an unresolved binary about to
+  resolve on a known date (pending PDUFA decision, scheduled advisory-
+  committee vote, imminent pivotal topline readout); a genuine surprise
+  disclosed in this filing (unexpected favorable litigation settlement with
+  quantified payment to the issuer; a transformational contract win); or a
   large equity acquisition where the issuer is the **acquirer** (NOT the
-  target); definitive unblocking of an existential overhang (e.g.,
-  successful resolution of a going-concern, court ruling in issuer's
-  favor on a bet-the-company case). NOTE: if the issuer is the TARGET of
-  an M&A bid, that is merger-arbitrage and out-of-mandate — emit
-  `NoTradeRecord`.
+  target). Reserve this band for cases where the magnitude is unambiguous
+  AND the repricing has not already happened. An outcome that has already
+  confirmed (approval received, license granted, grant awarded) does NOT
+  belong here — it is mid conviction, however large. NOTE: if the issuer is
+  the TARGET of an M&A bid, that is merger-arbitrage and out-of-mandate —
+  emit `NoTradeRecord`.
 - **Conviction 6**: licensing or commercial deal with a named tier-1
   partner, dollar amount, AND timeline; group-purchasing agreement with
   quantified covered-lives and a near-term effective date; positive
   Phase 2 readout with clear next steps; reaffirmed full-year guidance
   plus a new positive datapoint (commercial milestone, new approval,
   etc.); resolution of a regulatory inquiry; clear earnings beat with
-  raised forward outlook in pre-market.
+  raised forward outlook in pre-market. A confirmed-but-anticipated
+  outcome (situation 3 above) lands HERE at best, not in the 8–10 band —
+  and only when a concrete quantified forward leg remains.
 
 For the small/microcap universe Quinn covers ($50M–$2B market cap), most
 proposals will land at conviction 5. Tiers 6 and above are reserved for
