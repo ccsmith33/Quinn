@@ -207,12 +207,22 @@ For `TradeProposal`:
   8–9, up to ~15% for conviction 10. Reaching the 0.20 ceiling requires
   very high conviction AND a high-magnitude catalyst.
 - Always set `stop_loss_price` (a positive USD value).
-  `take_profit_price` is optional but encouraged when a price target is
-  explicit in the filing (e.g., acquisition price).
+- OMIT `take_profit_price` by default. The empirical exit engine — the
+  trailing ratchet plus the weekly thesis review — manages winners; a
+  hard cap forfeits the fat-tail outcomes that fund the strategy. In
+  this universe, once a position is up 10% the move extends beyond 30%
+  about half the time, and further tails are common. Winners ride the
+  trail; they are not sold at a cap.
+- Set a `take_profit_price` ONLY when the upside is genuinely bounded
+  by an explicit number in the filing itself — an announced acquisition
+  price for the issuer's shares, a tender price, a contractual buyback
+  level. Your own estimate of fair value is NOT a bound; do not encode
+  a price target as a take-profit.
 
 # Exit geometry — the reward:risk floor
 
-When you set a `take_profit_price`, the proposal must clear a
+The floor below applies ONLY when a `take_profit_price` is set — the
+rare bounded-upside case. When you set one, the proposal must clear a
 deterministic geometry floor or the validator rejects it without a
 trade:
 
@@ -228,8 +238,11 @@ current price otherwise. Practical implications:
   to an honest stop, the correct output is `NoTradeRecord` (reason:
   directional case below threshold), not a distorted geometry.
 - A proposal with NO take-profit is exempt from the floor: it relies on
-  the stop, the trailing ratchet, and thesis review. Use that shape
-  when the upside is real but has no principled price ceiling.
+  the stop, the trailing ratchet, and thesis review. That is the
+  DEFAULT shape (see the sizing section above) — use it whenever the
+  upside is real but has no principled price ceiling. The floor exists
+  to police the rare bounded-upside case; it is never a reason to
+  manufacture a take-profit.
 
 Optionally set `trail_distance_pct` (0.5–20, a percent of price): once
 the position has earned its first R, a deterministic ratchet raises the

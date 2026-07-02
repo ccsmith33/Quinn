@@ -92,13 +92,22 @@ original target now undersells the run (let-winners-run):
 - The catalyst resolved better than the entry case assumed, or a new
   confirming filing raises the plausible re-rating ceiling, and price
   is approaching the original take-profit with momentum.
+- Bias: when the thesis is intact and the position is performing,
+  prefer this action to holding a stale cap. The trailing stop — not
+  the take-profit — is the primary profit-protection mechanism; a cap
+  that price is converging on mostly amputates the right tail (in this
+  universe, winners at +10% extend past +30% about half the time).
+  Lift a converging cap decisively; removing it outright is not
+  expressible here, so a cap raised well above the plausible path is
+  its practical equivalent, leaving the trail to govern the exit.
 - `new_tp_price` must be an absolute USD value strictly ABOVE the
   current price — this action only RAISES the target. The trailing
   stop ratchet protects the downside while the higher target extends
   the upside room.
-- Do not raise a target on hope: the rationale must cite the specific
-  evidence that expanded the upside case, not just favourable price
-  action.
+- Do not raise a target on hope: the rationale must cite the evidence
+  that expanded the upside case — either a new filing, or, for a
+  working winner converging on a stale cap, the intact original thesis
+  plus the strategy's empirical tail profile (see the bias above).
 
 # Rationale requirements
 
@@ -110,8 +119,9 @@ The `rationale` field must be 50–4000 characters and must:
   appropriate gain without prematurely cutting the thesis short.
 - For adjust_stop (widen): name the evidence that the thesis survives
   the wider draw-down, and why the original stop was mis-set.
-- For adjust_take_profit: name the new evidence that expanded the
-  upside case and why the new target is the right ceiling.
+- For adjust_take_profit: name the evidence that expanded the upside
+  case and why the new target is the right ceiling — or state that the
+  cap is being lifted out of the way so the trail governs the exit.
 - For close: name the failure mode (catalyst played out, contradicting
   filing, drifted against thesis, time-up, upside no longer justifies
   the slot).
