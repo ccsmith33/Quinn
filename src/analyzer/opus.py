@@ -329,8 +329,11 @@ def _apply_overlay(proposal: ProposalRow, mods: dict[str, Any]) -> ProposalRow:
         update["size_pct_requested"] = float(mods["size_pct_of_capital"])
     # stop_loss_price / take_profit_price / exit_conditions live on the
     # execution-side trade plan, not on `proposals` row columns; they ride
-    # along on the OpusModified.modifications dict and are applied by the
-    # execution layer (S6.x). We keep them out of the working_proposal
+    # along on the OpusModified.modifications dict (journaled to
+    # `proposal_reviews.modifications_json`) and are applied to the
+    # in-memory working trade by the agent loop's reviewer overlay
+    # (`app.loop._reviewer_trade_overlay`) before validation / sizing /
+    # order construction. We keep them out of the working_proposal
     # row-copy to preserve the schema invariant.
     return proposal.model_copy(update=update)
 

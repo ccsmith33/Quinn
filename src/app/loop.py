@@ -669,10 +669,25 @@ class AgentLoop:
             return
 
         # Build TradeProposal pydantic model from row payload (raw_response).
+        #
+        # If Opus modified the proposal (decision='modify'), overlay the
+        # reviewer's stop / take-profit / exit-condition changes onto the
+        # payload BEFORE validation, so the validator's inverted-level +
+        # exit-geometry gates, sizing, and order construction all see the
+        # levels that will actually be ordered. The `proposals` row itself
+        # is never touched (NFR-16 — append-only journal); the overlay
+        # lives only on this in-memory working copy, and the journal
+        # records the changes via `proposal_reviews.modifications_json`.
+        # (`size_pct_of_capital` is intentionally NOT overlaid here — it
+        # rides S5.4's working-copy `size_pct_requested` path.)
         from proposal.schemas import TradeProposal, validate_trade_proposal
 
+        overlay: dict[str, Any] = {}
         try:
             payload = json.loads(proposal_row.raw_response)
+            overlay = _reviewer_trade_overlay(review)
+            if overlay:
+                payload.update(overlay)
             trade = validate_trade_proposal(payload)
         except Exception as e:  # noqa: BLE001
             log.error(
@@ -685,11 +700,17 @@ class AgentLoop:
             )
             self._write_rejected_execution(proposal_id, "schema")
             return
-
-        # If Opus modified the proposal, apply the overlay before sizing.
-        # (S5.4 already wrote the working_proposal modifications onto a
-        # ProposalRow copy in-memory; we don't re-derive it here, we just
-        # honor the size_pct in `proposal_row.size_pct_requested`.)
+        if overlay:
+            log.info(
+                "execution.reviewer_overlay_applied",
+                extra={
+                    "event": "execution.reviewer_overlay_applied",
+                    "proposal_id": proposal_id,
+                    "fields": sorted(overlay),
+                    "stop_loss_price": overlay.get("stop_loss_price"),
+                    "take_profit_price": overlay.get("take_profit_price"),
+                },
+            )
 
         # Validator.
         validation = self._components.validator.validate(
@@ -1452,6 +1473,40 @@ class _UniverseAdapter:
 
     def is_in_universe(self, ticker: str) -> bool:
         return self._u.is_in_universe(ticker)
+
+
+# Trade-plan fields an Opus `modify` review may overlay onto the working
+# copy of the trade payload. `size_pct_of_capital` is deliberately absent
+# — it flows through S5.4's working-copy `size_pct_requested` path, not
+# through the payload overlay.
+_REVIEWER_OVERLAY_FIELDS = (
+    "exit_conditions",
+    "stop_loss_price",
+    "take_profit_price",
+)
+
+
+def _reviewer_trade_overlay(review: Any) -> dict[str, Any]:
+    """Map a modify-decision Opus review's journaled modifications
+    (`proposal_reviews.modifications_json`) onto `TradeProposal` field
+    updates for the in-memory working copy of the trade.
+
+    Returns `{}` when there is no review, the decision isn't `modify`,
+    or the modifications carry none of the overlayable fields. Raises on
+    a corrupt `modifications_json` — the caller's payload-parse guard
+    turns that into the existing `schema` rejection (fail closed: we
+    never execute a modified proposal at its unmodified levels).
+    """
+    if review is None or review.decision != "modify":
+        return {}
+    if not review.modifications_json:
+        return {}
+    mods = json.loads(review.modifications_json)
+    return {
+        field: mods[field]
+        for field in _REVIEWER_OVERLAY_FIELDS
+        if mods.get(field) is not None
+    }
 
 
 def _stub_execution_config() -> Any:
