@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import inspect
+import logging
 import statistics
 import time
 import uuid
@@ -132,7 +133,7 @@ class _FakeTradingClient:
             cash="50000.00",
             buying_power="200000.00",
             long_market_value="50000.00",
-            equity_previous_close="99877.00",  # used for daypl computation
+            last_equity="99877.00",  # prev trading-day close; used for daypl
         )
 
     def get_all_positions(self) -> list[Any]:
@@ -441,6 +442,7 @@ def test_get_account_normalizes_to_account_snapshot(paper_broker: AlpacaBroker) 
     assert snap.cash == 50_000.0
     assert snap.buying_power == 200_000.0
     assert snap.long_market_value == 50_000.0
+    assert snap.daypl == 123.0  # equity - last_equity
     assert snap.snapshot_at.tzinfo is not None
 
 
@@ -1055,7 +1057,6 @@ def test_alpaca_normalize_account_reads_pdt_fields(
         cash="5000.0",
         buying_power="44600.0",
         long_market_value="17300.0",
-        equity_previous_close="22000.0",
         last_equity="22000.0",
         daytrade_count=2,
     )
@@ -1080,7 +1081,6 @@ def test_alpaca_normalize_account_pdt_fields_defaults(
         cash="50000.0",
         buying_power="200000.0",
         long_market_value="50000.0",
-        equity_previous_close="99000.0",
     )  # no last_equity, no daytrade_count
     monkeypatch.setattr(
         paper_broker._trading, "get_account", lambda: fake_acct
@@ -1088,6 +1088,54 @@ def test_alpaca_normalize_account_pdt_fields_defaults(
     snap = paper_broker.get_account()
     assert snap.last_equity == 100_000.0  # fell back to equity
     assert snap.daytrade_count == 0
+
+
+def test_normalize_account_daypl_from_last_equity() -> None:
+    """daypl = equity - last_equity (Alpaca's previous trading-day close).
+
+    Regression (2026-07-08 incident): the old code computed daypl from a
+    nonexistent `equity_previous_close` attribute, whose getattr fallback
+    made daypl structurally 0.0 — KS-1 could never fire.
+    """
+    fake_acct = SimpleNamespace(
+        equity="3475.0",
+        cash="1200.0",
+        buying_power="6950.0",
+        long_market_value="2275.0",
+        last_equity="3600.0",
+        daytrade_count=0,
+    )
+    snap = alpaca_mod._normalize_account(fake_acct)
+    assert snap.daypl == -125.0
+    assert snap.equity == 3475.0
+    assert snap.cash == 1200.0
+    assert snap.buying_power == 6950.0
+    assert snap.long_market_value == 2275.0
+    assert snap.last_equity == 3600.0
+
+
+def test_normalize_account_missing_last_equity_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No `last_equity` on the account object → daypl degrades to 0.0
+    AND a WARNING is emitted, so the degradation cannot hide silently."""
+    monkeypatch.setattr(alpaca_mod, "_warned_missing_last_equity", False)
+    fake_acct = SimpleNamespace(
+        equity="3475.0",
+        cash="1200.0",
+        buying_power="6950.0",
+        long_market_value="2275.0",
+    )
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="broker.alpaca"):
+        snap = alpaca_mod._normalize_account(fake_acct)
+    assert snap.daypl == 0.0
+    assert snap.last_equity == 3475.0
+    warnings = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "broker.account.last_equity_missing"
+    ]
+    assert len(warnings) == 1
 
 
 # ---------------------------------------------------------------------------

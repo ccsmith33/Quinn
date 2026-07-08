@@ -220,6 +220,32 @@ def test_ks1_clears_at_session_start(journal: JournalRepo, ks: KillSwitch) -> No
     assert ks.is_halted() is False
 
 
+def test_ks1_incident_2026_07_08_daypl_blindness_cured(
+    journal: JournalRepo, ks: KillSwitch
+) -> None:
+    """Regression (2026-07-08 incident): the broker normalizer computed
+    daypl from a nonexistent `equity_previous_close` field, so every
+    snapshot carried daypl=0.0 and KS-1 was structurally blind.
+
+    Reconstruct: SOD equity 3600 → intraday equity 3475 (loss 3.47%)
+    against ks1_daily_loss_pct=0.03. With the old broken daypl=0.0 the
+    evaluator returns []; with the fixed daypl=-125.0 it returns KS-1.
+    """
+    ev = AutoHaltEvaluator()
+    cfg = _cfg(ks1=0.03)
+    now = dt.datetime(2026, 7, 8, 15, 30, 0, tzinfo=dt.UTC)
+
+    # OLD behavior: daypl always 0.0 → KS-1 never fires (the blindness).
+    _snapshot(journal, at=now - dt.timedelta(minutes=10), equity=3475.0, daypl=0.0)
+    assert ev._eval_ks1(now, journal, cfg) == []
+
+    # FIXED behavior: daypl = equity - last_equity = 3475 - 3600 = -125.
+    _snapshot(journal, at=now - dt.timedelta(minutes=5), equity=3475.0, daypl=-125.0)
+    halts = ev._eval_ks1(now, journal, cfg)
+    assert [h.rule for h in halts] == ["KS-1"]
+    assert halts[0].reason == "auto:KS-1"
+
+
 # ---------------------------------------------------------------------------
 # KS-2 — 30d trailing drawdown
 # ---------------------------------------------------------------------------

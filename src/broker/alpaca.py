@@ -242,23 +242,42 @@ def _normalize_submitted(alp: Any) -> SubmittedOrder:
     )
 
 
+_warned_missing_last_equity = False
+
+
 def _normalize_account(acct: Any) -> AccountSnapshot:
+    global _warned_missing_last_equity
     equity = float(acct.equity)
-    prev_close = float(getattr(acct, "equity_previous_close", equity) or equity)
     # PDT-SUNSET-2026-06-04: ADR-009 §3.3 — defensive reads with
     # defaults that survive Alpaca's planned 2026-07-06 field removal.
-    # `last_equity` falls back to current equity (keeps `< 25k` predicate
-    # functioning on intraday equity in the fallback case);
+    # `last_equity` (equity at previous trading-day close) falls back to
+    # current equity (keeps `< 25k` predicate functioning on intraday
+    # equity in the fallback case) — but that degrades daypl to 0.0 and
+    # blinds KS-1, so warn once instead of failing silently;
     # `daytrade_count` falls back to 0 (which makes `budget_remaining=3`
     # always — feature naturally inert post-API-removal).
-    last_equity = float(getattr(acct, "last_equity", equity) or equity)
+    raw_last_equity = getattr(acct, "last_equity", None)
+    if raw_last_equity:
+        last_equity = float(raw_last_equity)
+    else:
+        last_equity = equity
+        if not _warned_missing_last_equity:
+            _warned_missing_last_equity = True
+            log.warning(
+                "broker.account.last_equity_missing",
+                extra={
+                    "event": "broker.account.last_equity_missing",
+                    "detail": "daypl degraded to 0.0; KS-1 daily-loss "
+                    "halt is blind until last_equity is restored",
+                },
+            )
     daytrade_count = int(getattr(acct, "daytrade_count", 0) or 0)
     return AccountSnapshot(
         equity=equity,
         cash=float(acct.cash),
         buying_power=float(acct.buying_power),
         long_market_value=float(acct.long_market_value),
-        daypl=equity - prev_close,
+        daypl=equity - last_equity,
         snapshot_at=dt.datetime.now(dt.UTC),
         last_equity=last_equity,
         daytrade_count=daytrade_count,
