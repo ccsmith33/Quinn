@@ -1451,3 +1451,107 @@ def test_partially_pending_explained_absence_also_counted() -> None:
     assert len(alerter.calls) == 1
     assert "ord-ACME-thesis_close-22" in alerter.calls[0]
     assert ks.halts == []
+
+
+# ---------------------------------------------------------------------------
+# Negative-cash tripwire (hotfix 2026-07-08).
+#
+# Broker cash < 0 means an entry buy overshot available cash (a KS-7 slip).
+# The reconciler — the seam where account snapshots are already taken every
+# tick — emits a WARNING journal-log event (`account.cash_negative`) and one
+# operator alert per ≥0 → <0 crossing (in-memory edge detector, not one
+# alert per 5-minute cycle).
+# ---------------------------------------------------------------------------
+
+def _account_with_cash(cash: float, *, equity: float = 2600.0) -> AccountSnapshot:
+    return AccountSnapshot(
+        equity=equity,
+        cash=cash,
+        buying_power=max(cash, 0.0),
+        long_market_value=equity - cash,
+        daypl=0.0,
+        snapshot_at=dt.datetime(2026, 7, 8, 14, 30, tzinfo=dt.UTC),
+    )
+
+
+def test_negative_cash_fires_warning_and_alert_once() -> None:
+    """(d) cash < 0 → one `account.cash_negative` WARNING + one operator
+    alert on the crossing tick; the next tick with cash still negative
+    stays silent. No kill-switch halt — the tripwire observes, it does
+    not gate."""
+    import logging
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    named_logger = logging.getLogger("reconciler.reconciler")
+    named_logger.addHandler(handler)
+    try:
+        broker = _FakeBroker(positions=[], account=_account_with_cash(-17.32))
+        journal = _FakeJournal(expected_positions=[])
+        ks = _FakeKillSwitch()
+        alerter = _FakeAlerter()
+        rec = Reconciler(
+            broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market
+        )
+
+        rec.reconcile_now()
+        rec.reconcile_now()  # still negative → deduped, no second alert
+    finally:
+        named_logger.removeHandler(handler)
+
+    assert len(alerter.calls) == 1
+    assert "-17.32" in alerter.calls[0]
+    warnings = [
+        r for r in captured
+        if getattr(r, "event", None) == "account.cash_negative"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert ks.halts == []
+
+
+def test_negative_cash_realerts_after_recovery() -> None:
+    """(d) The dedupe is per-crossing: negative → recovered → negative
+    again alerts twice (once per crossing), while consecutive negative
+    ticks inside one episode alert once."""
+    broker = _FakeBroker(positions=[], account=_account_with_cash(-5.0))
+    journal = _FakeJournal(expected_positions=[])
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market
+    )
+
+    rec.reconcile_now()  # crossing #1 → alert
+    assert len(alerter.calls) == 1
+
+    broker._account = _account_with_cash(120.0)  # operator topped up / fill settled
+    rec.reconcile_now()  # recovered → resets the edge detector, no alert
+    assert len(alerter.calls) == 1
+
+    broker._account = _account_with_cash(-3.0)
+    rec.reconcile_now()  # crossing #2 → alert
+    rec.reconcile_now()  # still negative → silent
+    assert len(alerter.calls) == 2
+
+
+def test_positive_cash_never_alerts() -> None:
+    """(d) Regression: healthy cash produces no tripwire noise."""
+    broker = _FakeBroker(positions=[], account=_account_with_cash(1500.0))
+    journal = _FakeJournal(expected_positions=[])
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market
+    )
+
+    rec.reconcile_now()
+    rec.reconcile_now()
+
+    assert alerter.calls == []
+    assert ks.halts == []

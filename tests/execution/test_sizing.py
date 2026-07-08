@@ -565,3 +565,128 @@ def test_ks5_tiered_cap_above_all_tiers_uses_ceiling() -> None:
     assert isinstance(rej, SizingRejected)
     acc = _size_with_n_open(equity=1_000_000.0, n_open=29, cfg=cfg)
     assert isinstance(acc, SizingAccepted)
+
+
+# ---------------------------------------------------------------------------
+# KS-7 pending-entry-spend race (hotfix 2026-07-08).
+#
+# Broker-reported cash does NOT decrease while an entry buy is queued
+# (Alpaca holds buying_power, not cash, for open orders), so back-to-back
+# decisions each saw the same untouched cash and KS-7 approved spends that
+# summed past it — paper cash went to −$17 on 2026-07-08. The sizing engine
+# now subtracts `pending_entry_spend` (the committed-but-unfilled dollar
+# value of open entry buys, computed by the agent loop from journal order
+# prices) from `account.cash` before the reserve check.
+# ---------------------------------------------------------------------------
+
+def test_ks7_pending_entry_spend_reduces_available_cash() -> None:
+    """(a) A pending entry buy's committed spend shrinks what KS-7 will
+    let the next proposal spend.
+
+    Equity $5000 → reserve floor $250. Broker cash $1000, but $600 is
+    committed to a queued entry buy → available $400 → max spend $150.
+    Mid tier (cv 8) wants $250 → downsized to $150 (15 shares @ $10).
+    Pre-fix this sized to the full $250 against the untouched cash.
+    """
+    p = _proposal(conviction=8)
+    account = _account(equity=5000.0, cash=1000.0)
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=[],
+        quote=_quote(last=10.0),
+        cfg=_cfg(),
+        pending_buys=[_open_buy("PEND1", qty=24)],
+        pending_entry_spend=600.0,
+    )
+
+    assert isinstance(result, SizingAccepted)
+    assert result.realized_dollar_size == pytest.approx(150.0)
+    assert result.qty == 15
+
+
+def test_ks7_pending_entry_spend_rejects_when_floor_unfundable() -> None:
+    """(a) When pending spend pushes available cash below the reserve
+    floor, even one share is unfundable → the existing `ks7_cash_reserve`
+    rejection fires (same reject reason as before).
+
+    Equity $5000 → floor $250. Cash $500 with $300 pending → available
+    $200; max spend −$50 < 1 share @ $10 → reject. Pre-fix this accepted
+    a $250 spend.
+    """
+    p = _proposal(conviction=8)
+    account = _account(equity=5000.0, cash=500.0)
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=[],
+        quote=_quote(last=10.0),
+        cfg=_cfg(),
+        pending_buys=[_open_buy("PEND1", qty=30)],
+        pending_entry_spend=300.0,
+    )
+
+    assert isinstance(result, SizingRejected)
+    assert result.reason == "ks7_cash_reserve"
+
+
+def test_ks7_eols_incident_reconstruction() -> None:
+    """(b) The 2026-07-08 EOLS slip, reconstructed.
+
+    MCRB's ~$538 entry was committed but not yet reflected in broker cash
+    when EOLS was sized at 13:07 UTC: cash read $1062.44 while true
+    available cash was ~$524. Pre-fix KS-7 computed
+    max_spend = 1062.44 − 500 (5% of $10k equity) = $562.44 and approved
+    10 shares @ $54.10 ≈ $541 — which drove cash to −$17 when both
+    entries filled at the bell. Post-fix, the $538.36 pending spend is
+    subtracted first: 524.08 − 500 = $24.08 < one share → reject
+    `ks7_cash_reserve`.
+    """
+    p = _proposal(symbol="EOLS", conviction=9)
+    account = _account(equity=10_000.0, cash=1062.44)
+    engine = SizingEngine()
+
+    result = engine.size(
+        p,
+        account,
+        open_positions=[],
+        quote=_quote(last=54.10),
+        cfg=_cfg(),
+        pending_buys=[_open_buy("MCRB", qty=10)],
+        pending_entry_spend=538.36,
+    )
+
+    assert isinstance(result, SizingRejected)
+    assert result.reason == "ks7_cash_reserve"
+
+
+def test_ks7_no_pending_spend_behavior_unchanged() -> None:
+    """(c) Regression: with no pending orders (spend 0 / param omitted)
+    the engine behaves byte-for-byte as before — same downsizing math as
+    the original KS-7 test (#7)."""
+    p = _proposal(conviction=8, size_pct=0.10)
+    account = _account(equity=5000.0, cash=300.0)
+    engine = SizingEngine()
+
+    legacy = engine.size(
+        p, account, open_positions=[], quote=_quote(last=10.0), cfg=_cfg()
+    )
+    explicit_zero = engine.size(
+        p,
+        account,
+        open_positions=[],
+        quote=_quote(last=10.0),
+        cfg=_cfg(),
+        pending_buys=[],
+        pending_entry_spend=0.0,
+    )
+
+    assert isinstance(legacy, SizingAccepted)
+    assert isinstance(explicit_zero, SizingAccepted)
+    assert explicit_zero == legacy
+    assert explicit_zero.realized_dollar_size == pytest.approx(50.0)
+    assert explicit_zero.qty == 5

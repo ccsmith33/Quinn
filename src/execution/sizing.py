@@ -114,6 +114,7 @@ class SizingEngine:
         quote: Quote,
         cfg: ExecutionConfig,
         pending_buys: list[OpenOrder] | None = None,
+        pending_entry_spend: float = 0.0,
     ) -> SizingResult:
         # Defense-in-depth: a proposal below the conviction floor should
         # have been routed to NoTrade by the analyzer or rejected by Opus.
@@ -169,8 +170,18 @@ class SizingEngine:
         # violates this, *reduce* the size to maintain the reserve. Only
         # reject if even the minimum viable size (one share) cannot be
         # placed without breaching the floor.
+        #
+        # Hotfix 2026-07-08 (paper cash −$17): broker-reported cash does
+        # NOT shrink while an entry buy is queued (Alpaca holds
+        # buying_power, not cash, for open orders), so back-to-back
+        # decisions each passed KS-7 against the same untouched cash.
+        # `pending_entry_spend` — the committed-but-unfilled dollar value
+        # of open entry buys, priced by the agent loop from journal order
+        # rows — is subtracted first, mirroring how KS-5/KS-6 already
+        # count pending entries via `pending_buys` (hotfix 2026-05-07).
         reserve_floor = cfg.ks7_cash_reserve_pct * account.equity
-        max_spend_under_reserve = account.cash - reserve_floor
+        available_cash = account.cash - pending_entry_spend
+        max_spend_under_reserve = available_cash - reserve_floor
         if max_spend_under_reserve < quote.last:
             # One share would still breach the floor (or cash is already
             # below floor). Cannot proceed.

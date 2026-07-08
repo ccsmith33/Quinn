@@ -212,6 +212,11 @@ class Reconciler:
         self._fill_ingestor = fill_ingestor
         self._exit_policy_ticker = exit_policy_ticker
         self._external_miss: dict[str, int] = {}
+        # Negative-cash tripwire edge detector (hotfix 2026-07-08): True
+        # while the last observed broker cash was < 0, so a sustained
+        # episode alerts once (per ≥0 → <0 crossing), not every tick.
+        # In-memory — a restart mid-episode re-alerts at most once.
+        self._cash_was_negative = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -450,6 +455,13 @@ class Reconciler:
             )
         )
 
+        # Negative-cash tripwire (hotfix 2026-07-08): broker cash < 0
+        # means an entry buy overshot available cash (a KS-7 slip). This
+        # is the seam where account truth is already observed every tick,
+        # so check here: WARNING journal-log + one operator alert per
+        # crossing. Observational only — no halt, no early return.
+        self._check_negative_cash(broker_account)
+
         # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — refresh activation flag
         # AFTER the position-reconcile body succeeded (broker_account in
         # hand) and BEFORE retro/thesis/scanner hooks fire. The refresh
@@ -684,6 +696,35 @@ class Reconciler:
             external_closes=ext_closed,
             external_close_pending=ext_pending,
         )
+
+    def _check_negative_cash(self, account: AccountSnapshot) -> None:
+        """Hotfix 2026-07-08 — alert the operator once per ≥0 → <0 cash
+        crossing. Dedupe is a simple in-memory edge detector: consecutive
+        negative ticks inside one episode stay silent; recovery to ≥0
+        re-arms it. Chosen over a per-day cap for simplicity — it also
+        catches a second distinct crossing on the same day."""
+        if account.cash >= 0:
+            self._cash_was_negative = False
+            return
+        if self._cash_was_negative:
+            return
+        self._cash_was_negative = True
+        log.warning(
+            "account.cash_negative",
+            extra={
+                "event": "account.cash_negative",
+                "cash": account.cash,
+                "equity": account.equity,
+                "buying_power": account.buying_power,
+            },
+        )
+        if self._alerter is not None:
+            self._alerter.notify(
+                f"Account cash NEGATIVE: cash=${account.cash:.2f}, "
+                f"equity=${account.equity:.2f}. An entry buy overshot "
+                f"available cash (KS-7 gap). Check open orders and "
+                f"recent fills at the broker."
+            )
 
     @staticmethod
     def _fills_cover_absence(

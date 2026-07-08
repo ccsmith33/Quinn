@@ -35,7 +35,7 @@ import uuid
 from typing import Any
 
 from broker.alpaca import BrokerUnavailable
-from broker.protocol import BrokerRejected
+from broker.protocol import BrokerRejected, OpenOrder
 from execution.orders import AcceptedProposal, SubmissionAccepted, SubmissionFailed
 from execution.sizing import SizingAccepted, SizingRejected
 from execution.validator import Accepted, Rejected
@@ -755,6 +755,13 @@ class AgentLoop:
             )
             open_orders = []
         pending_buys = [o for o in open_orders if o.is_entry]
+        # Hotfix 2026-07-08: KS-7 must also see the DOLLARS those pending
+        # entries have committed — broker cash doesn't shrink until they
+        # fill, so without this a second same-morning proposal is sized
+        # against cash that is already spoken for (EOLS, −$17 cash).
+        pending_entry_spend = _pending_entry_spend(
+            self._components.journal.db_path, pending_buys
+        )
         quote = self._components.broker.get_quote(trade.symbol)
         sizing = self._components.sizer.size(
             trade,
@@ -763,6 +770,7 @@ class AgentLoop:
             quote,
             self._config.execution if self._config else _stub_execution_config(),
             pending_buys=pending_buys,
+            pending_entry_spend=pending_entry_spend,
         )
         if isinstance(sizing, SizingRejected):
             self._write_rejected_execution(proposal_id, sizing.reason)
@@ -1461,6 +1469,47 @@ class _PendingExecution:
     def __init__(self, filing: FilingRow, proposal_id: int) -> None:
         self.filing = filing
         self.proposal_id = proposal_id
+
+
+def _pending_entry_spend(db_path: str, pending_buys: list[OpenOrder]) -> float:
+    """Hotfix 2026-07-08 — dollar value of committed-but-unfilled entry buys.
+
+    Broker-reported cash does not decrease while an entry buy is queued
+    (pre-market especially: bracket entries are extended_hours=False and
+    sit until the bell), so KS-7 must subtract the spend those orders will
+    realize when they fill. Each pending buy is priced from its journal
+    `orders` row: qty × limit_price for limit entries, qty ×
+    pre_submission_last (the NBBO captured at submission) for market
+    entries. Orders with no journal row or no recorded price (e.g. an
+    operator-manual order) are skipped with a WARNING — the same blind
+    spot as pre-fix, but now visible. A partially-filled order slightly
+    over-subtracts (broker cash already reflects the filled part) —
+    conservative in the safe direction.
+    """
+    from journal.repo import get_order_by_broker_id
+
+    total = 0.0
+    for o in pending_buys:
+        row = get_order_by_broker_id(db_path, o.broker_order_id)
+        ref: float | None = None
+        if row is not None:
+            ref = (
+                row.limit_price
+                if row.limit_price is not None
+                else row.pre_submission_last
+            )
+        if ref is None:
+            log.warning(
+                "agent.pending_entry_spend_unpriced",
+                extra={
+                    "event": "agent.pending_entry_spend_unpriced",
+                    "symbol": o.symbol,
+                    "broker_order_id": o.broker_order_id,
+                },
+            )
+            continue
+        total += o.qty * ref
+    return total
 
 
 class _UniverseAdapter:
