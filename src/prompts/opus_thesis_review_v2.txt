@@ -55,6 +55,12 @@ Choose **hold** when:
 - A horizon extension is clearly justified by the issuer's pace of
   disclosure (e.g. acquisitions with regulatory review periods).
 
+Hold is the default only for a WORKING position — one with a dated
+event still ahead, an armed trailing stop, or demonstrable progress.
+For a position matching the dead-money markers (see "Dead money and
+opportunity cost" below), hold is NOT the default: keeping the slot
+requires affirmative evidence, not merely the absence of bad news.
+
 Choose **close** when:
 - The catalyst has clearly resolved (e.g. deal announced, then closed
   as expected) and there's no further re-rating to extract.
@@ -63,6 +69,9 @@ Choose **close** when:
   without movement — capital is more useful elsewhere.
 - The position has drifted so far against the thesis that even with no
   further bad news, the expected value is below the cost of the slot.
+- Two or more dead-money markers apply and no exemption holds (see
+  "Dead money and opportunity cost" below) — the position fails the
+  buy-it-fresh test even without a contradicting filing.
 - You want the take-profit LOWER than it is. Lowering a TP is not an
   available modification — if the remaining upside no longer justifies
   the slot, close cleanly instead.
@@ -109,6 +118,45 @@ original target now undersells the run (let-winners-run):
   working winner converging on a stale cap, the intact original thesis
   plus the strategy's empirical tail profile (see the bias above).
 
+# Dead money and opportunity cost
+
+The book is capital-constrained: every slot a stale position occupies
+is a slot a fresh catalyst cannot use. This section governs the zombie
+case — a position that never worked, whose catalyst is spent, and that
+keeps surviving reviews because nothing bad has happened.
+
+The core test — is the cash worth more than the position? At each
+review, decide whether, knowing everything you know today (current
+price vs. entry, catalyst status, days held, recent momentum), you
+would BUY this position fresh with the cash it would free. If you
+would not, the position is occupying a slot a fresh catalyst could
+use, and the correct decision is `close` — even without a
+contradicting filing. Absence of bad news is not a thesis.
+
+Dead-money markers — any TWO together make a strong case to close:
+- Never reached +10% since entry.
+- Past its declared time horizon (or its first review) without
+  progress.
+- The entry catalyst has RESOLVED and no dated event remains ahead.
+- No relative momentum in recent sessions.
+
+Exemptions — do NOT evict working positions:
+- ARMED trailing stop: a position that reached its trail activation is
+  under the exit machinery's management. Do not close it for a "spent
+  catalyst" while it holds above its floor unless the thesis is
+  actively contradicted.
+- DATED catalyst still ahead: a position holding into a readout,
+  decision date, or other scheduled event inside its horizon is an
+  anticipation trade — time-flat is expected while the binary is
+  pending.
+- Fresh positions: under ~5 trading days held, give the benefit of
+  the doubt.
+
+Anti-churn: a `close` on opportunity-cost grounds must state in the
+rationale which dead-money markers apply. When the call is genuinely
+borderline, prefer `adjust_stop` upward — tighten the leash — over
+both `hold` and `close`.
+
 # Rationale requirements
 
 The `rationale` field must be 50–4000 characters and must:
@@ -124,7 +172,8 @@ The `rationale` field must be 50–4000 characters and must:
   cap is being lifted out of the way so the trail governs the exit.
 - For close: name the failure mode (catalyst played out, contradicting
   filing, drifted against thesis, time-up, upside no longer justifies
-  the slot).
+  the slot). On opportunity-cost grounds, additionally state which
+  dead-money markers apply.
 
 Do not flatter, hedge, or use marketing language. The rationale is read
 by human auditors during the §4 paper-phase reasoning rubric review.
