@@ -348,6 +348,7 @@ def compose_agent(
         broker=broker,
         trail_activation_r=config.execution.trail_activation_r,
         min_ratchet_step_pct=config.execution.min_ratchet_step_pct,
+        trail_stages=config.execution.trail_stages,
     )
 
     # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.

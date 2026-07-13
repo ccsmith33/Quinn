@@ -27,11 +27,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from broker.protocol import BrokerAdapter
 from config.calendar import ET
+from config.loader import TrailStage
 from journal.exit_policy import (
     ExitPolicyStateRow,
     get_exit_policy_state,
@@ -133,6 +134,7 @@ class ExitPolicyTicker:
         broker: BrokerAdapter,
         trail_activation_r: float = 1.0,
         min_ratchet_step_pct: float = 0.25,
+        trail_stages: Sequence[TrailStage] = (),
         now_fn: Callable[[], dt.datetime] = _utcnow,
         record_order_outcome: Callable[..., None] | None = None,
     ) -> None:
@@ -140,6 +142,7 @@ class ExitPolicyTicker:
         self._broker = broker
         self._activation_r = trail_activation_r
         self._min_step_pct = min_ratchet_step_pct
+        self._trail_stages = tuple(trail_stages)
         self._now_fn = now_fn
         self._record_order_outcome = record_order_outcome or (
             lambda order_id, final_status, *, fill_price, fill_qty, fill_at:
@@ -261,6 +264,7 @@ class ExitPolicyTicker:
         quote = self._broker.get_quote(symbol)
         last = float(quote.last)
 
+        entry_price: float | None = None
         if state is None:
             geometry = self._initial_geometry(execution_id)
             if geometry is None:
@@ -279,6 +283,9 @@ class ExitPolicyTicker:
                 stop_order_journal_id=live_stop.id,
             )
             upsert_exit_policy_state(self._journal.db_path, state)
+            engaged_pct, engaged_stage = self._staged_trail_pct(
+                trail_pct, entry_price=entry_price, high_water=last
+            )
             log.info(
                 "exit_policy.trail_engaged",
                 extra={
@@ -288,6 +295,8 @@ class ExitPolicyTicker:
                     "entry_price": entry_price,
                     "initial_risk": initial_risk,
                     "trail_distance_pct": trail_pct,
+                    "effective_trail_pct": engaged_pct,
+                    "trail_stage_gain_pct": engaged_stage,
                     "high_water_mark": last,
                 },
             )
@@ -297,7 +306,20 @@ class ExitPolicyTicker:
         # Restart semantics: high-water resumes from the stored value; a
         # gap above it during downtime is simply a new high-water now.
         high_water = max(state.high_water_mark, last)
-        target = round(high_water * (1.0 - state.trail_distance_pct / 100.0), 2)
+        # Staged tightening: the persisted width is the BASE; the
+        # effective width is derived here every evaluation from config +
+        # current high-water, so newly configured stages apply to
+        # already-open positions on restart. Crossing a milestone
+        # tightens from the CURRENT high-water immediately — one large
+        # upward PATCH is intended.
+        if self._trail_stages and entry_price is None:
+            entry_price = self._entry_price(execution_id)
+        effective_pct, active_stage_gain = self._staged_trail_pct(
+            state.trail_distance_pct,
+            entry_price=entry_price,
+            high_water=high_water,
+        )
+        target = round(high_water * (1.0 - effective_pct / 100.0), 2)
         current_stop = float(live_stop.stop_price)
 
         should_replace = (
@@ -363,7 +385,7 @@ class ExitPolicyTicker:
                 final_status=None,
                 notes=(
                     f"trail_ratchet hw={high_water:.4f} "
-                    f"trail={state.trail_distance_pct:.2f}% "
+                    f"trail={effective_pct:.2f}% "
                     f"replaced {live_stop.broker_order_id}"
                 ),
             ),
@@ -389,6 +411,8 @@ class ExitPolicyTicker:
                 "old_stop_price": current_stop,
                 "new_stop_price": target,
                 "high_water_mark": high_water,
+                "effective_trail_pct": effective_pct,
+                "trail_stage_gain_pct": active_stage_gain,
                 "old_broker_order_id": live_stop.broker_order_id,
                 "new_broker_order_id": replaced.broker_order_id,
             },
@@ -432,6 +456,40 @@ class ExitPolicyTicker:
             max(default_pct, _DEFAULT_TRAIL_CLAMP_LO), _DEFAULT_TRAIL_CLAMP_HI
         )
         return entry_price, initial_risk, clamped
+
+    def _staged_trail_pct(
+        self, base_pct: float, *, entry_price: float | None, high_water: float
+    ) -> tuple[float, float | None]:
+        """Effective trail width under staged tightening: min(base, the
+        tightest stage whose gain milestone the high-water mark has
+        crossed). Tighten-only — a stage wider than the current width is
+        ignored. Returns (effective_pct, active stage's gain_pct or
+        None). Never persisted: derived from config + current HWM every
+        evaluation, so stages apply to already-open positions.
+        """
+        effective = base_pct
+        active: float | None = None
+        if not self._trail_stages or entry_price is None or entry_price <= 0:
+            return effective, active
+        gain_pct = (high_water / entry_price - 1.0) * 100.0
+        for stage in self._trail_stages:
+            if gain_pct >= stage.gain_pct and stage.trail_pct < effective:
+                effective = stage.trail_pct
+                active = stage.gain_pct
+        return effective, active
+
+    def _entry_price(self, execution_id: int) -> float | None:
+        """Entry fill (or pre-submission last) for the staged-trail gain
+        math; None when the journal can't support it (stages then leave
+        the base width untouched)."""
+        orders = get_orders_for_execution(self._journal.db_path, execution_id)
+        entry = next((o for o in orders if o.role == "entry"), None)
+        if entry is None:
+            return None
+        price = entry.realized_fill_price or entry.pre_submission_last
+        if price is None or price <= 0:
+            return None
+        return float(price)
 
     def _proposed_trail_pct(self, execution_id: int) -> float | None:
         execution = self._get_execution(execution_id)

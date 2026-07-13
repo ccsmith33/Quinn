@@ -68,6 +68,23 @@ class Ks5Tier(_Section):
     max_positions: int = Field(ge=0)
 
 
+class TrailStage(_Section):
+    """One milestone of the staged trail-tightening curve. When the
+    position's high-water gain vs entry (as a percent of entry) reaches
+    `gain_pct`, the effective trail width becomes min(current width,
+    `trail_pct`) — stages only ever TIGHTEN the trail on top of the
+    position's base width (proposal `trail_distance_pct` or the clamped
+    default), never widen it.
+
+    The list is ordered, strictly ascending in `gain_pct`, with
+    `trail_pct` non-increasing. Empty (the default) means the flat
+    base-width behavior is unchanged.
+    """
+
+    gain_pct: float = Field(gt=0.0)
+    trail_pct: float = Field(gt=0.0, lt=100.0)
+
+
 class ExecutionConfig(_Section):
     broker_mode: Literal["paper", "live"]
     ks4_pct_cap: float = Field(ge=0.0, le=1.0)
@@ -97,6 +114,12 @@ class ExecutionConfig(_Section):
     # stop by `min_ratchet_step_pct` percent (bounds PATCH chatter).
     trail_activation_r: float = Field(default=1.0, gt=0.0)
     min_ratchet_step_pct: float = Field(default=0.25, ge=0.0)
+    # Staged trail tightening — opt-in curve of {gain_pct, trail_pct}
+    # milestones (see `TrailStage`). Derived at runtime from config +
+    # current high-water mark each tick, so a config change applies to
+    # already-open positions on restart. Empty (the default) = the flat
+    # base-width trail, byte-identical to pre-feature behavior.
+    trail_stages: list[TrailStage] = Field(default_factory=list)
     # Feature A — cap the FIRST thesis-review interval. The analyzer's
     # declared catalyst horizon can run ~30d, which leaves a fresh position
     # un-re-evaluated for a month. This bounds the entry-time review so a
@@ -117,6 +140,27 @@ class ExecutionConfig(_Section):
             raise ValueError(
                 "ks5_tiers equity_max values must be strictly ascending; "
                 f"got {thresholds}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_trail_stages_monotonic(self) -> ExecutionConfig:
+        """Milestones must be strictly ascending in `gain_pct` (unambiguous
+        crossing order) with `trail_pct` non-increasing (the trail may only
+        tighten as milestones are crossed). A misordered list is an operator
+        error and is rejected at load time.
+        """
+        gains = [s.gain_pct for s in self.trail_stages]
+        if any(b <= a for a, b in zip(gains, gains[1:], strict=False)):
+            raise ValueError(
+                "trail_stages gain_pct values must be strictly ascending; "
+                f"got {gains}"
+            )
+        trails = [s.trail_pct for s in self.trail_stages]
+        if any(b > a for a, b in zip(trails, trails[1:], strict=False)):
+            raise ValueError(
+                "trail_stages trail_pct values must be non-increasing; "
+                f"got {trails}"
             )
         return self
 

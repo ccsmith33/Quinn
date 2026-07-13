@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from broker.protocol import Quote, SubmittedOrder
+from config.loader import TrailStage
 from execution.exit_policy import ExitPolicyTicker
 from journal.exit_policy import (
     ExitPolicyStateRow,
@@ -317,10 +319,13 @@ def _tick(
     *,
     recorder: _OutcomeRecorder | None = None,
     now: dt.datetime = NOW,
+    trail_stages: list[TrailStage] | None = None,
 ) -> ExitPolicyTicker:
     kwargs: dict[str, Any] = {}
     if recorder is not None:
         kwargs["record_order_outcome"] = recorder
+    if trail_stages is not None:
+        kwargs["trail_stages"] = trail_stages
     ticker = ExitPolicyTicker(
         journal=_Journal(db),
         broker=broker,
@@ -535,6 +540,162 @@ def test_restart_resumes_from_persisted_high_water(db: str) -> None:
     state = get_exit_policy_state(db, execution_id=eid)
     assert state is not None
     assert state.high_water_mark == pytest.approx(120.0)
+
+
+# ---------------------------------------------------------------------------
+# §3.5 — staged trail tightening
+# ---------------------------------------------------------------------------
+
+
+def test_stage_crossing_tightens_and_ratchets_from_current_hwm(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """entry=100, stop=90 (base 10%), stage (gain 15% → trail 5%).
+    Tick 1 last=110: gain 10% < 15 → base width, stop→99. Tick 2
+    last=120: gain 20% ≥ 15 → width 5%, stop jumps 99→114 in a single
+    PATCH from the CURRENT high-water (intended). The ratcheted payload
+    carries the effective width and active stage."""
+    stages = [TrailStage(gain_pct=15.0, trail_pct=5.0)]
+    _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+
+    _tick(db, broker, trail_stages=stages)
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(99.0)
+
+    broker.set_last("ACME", 120.0)
+    with caplog.at_level(logging.INFO, logger="execution.exit_policy"):
+        _tick(db, broker, trail_stages=stages)
+
+    assert len(broker.replaced) == 2
+    assert broker.replaced[1]["new_stop_price"] == pytest.approx(114.0)
+    ratcheted = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", "") == "exit_policy.stop_ratcheted"
+    ]
+    assert len(ratcheted) == 1
+    assert ratcheted[0].effective_trail_pct == pytest.approx(5.0)  # type: ignore[attr-defined]
+    assert ratcheted[0].trail_stage_gain_pct == pytest.approx(15.0)  # type: ignore[attr-defined]
+
+
+def test_hwm_below_milestone_keeps_base_width(db: str) -> None:
+    """Gain below the first milestone → base width untouched: last=110
+    (gain 10% < 50) trails at the base 10% → target 99."""
+    stages = [TrailStage(gain_pct=50.0, trail_pct=5.0)]
+    _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+
+    _tick(db, broker, trail_stages=stages)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(99.0)
+
+
+def test_stage_never_widens_base_width(db: str) -> None:
+    """A crossed stage whose trail_pct is WIDER than the base is ignored
+    — the effective width is min(base, stage), tighten-only. gain 10% ≥
+    5 but 12% > base 10% → target stays 99."""
+    stages = [TrailStage(gain_pct=5.0, trail_pct=12.0)]
+    _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+
+    _tick(db, broker, trail_stages=stages)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(99.0)
+
+
+def test_empty_stages_matches_legacy_behavior(db: str) -> None:
+    """Explicit empty stage list = exactly the pre-feature behavior
+    (regression guard for the default config shape)."""
+    eid, _ = _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+
+    _tick(db, broker, trail_stages=[])
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(99.0)
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.trail_distance_pct == pytest.approx(10.0)
+
+
+def test_stop_monotonic_across_stage_transition(db: str) -> None:
+    """The ratchet's never-lower invariant holds across a stage
+    boundary: 99 → 114 (tightened), then a price fall to 116 leaves
+    the stop at 114 — every replacement strictly raises."""
+    stages = [TrailStage(gain_pct=15.0, trail_pct=5.0)]
+    eid, _ = _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+    _tick(db, broker, trail_stages=stages)
+    broker.set_last("ACME", 120.0)
+    _tick(db, broker, trail_stages=stages)
+
+    broker.set_last("ACME", 116.0)
+    _tick(db, broker, trail_stages=stages)
+
+    prices = [r["new_stop_price"] for r in broker.replaced]
+    assert prices == sorted(prices)
+    assert len(broker.replaced) == 2  # no replace on the fall
+    assert broker.replaced[-1]["new_stop_price"] == pytest.approx(114.0)
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.high_water_mark == pytest.approx(120.0)
+
+
+def test_stages_apply_to_preexisting_state_on_restart(db: str) -> None:
+    """Deploy-time semantics: a position whose trail engaged BEFORE
+    stages existed (persisted base width 15%) tightens on the first
+    tick after restart — the effective width is derived at runtime
+    from config + current HWM, never frozen into the state row."""
+    stages = [TrailStage(gain_pct=15.0, trail_pct=8.0)]
+    eid, stop_id = _seed_position(db, entry_fill=18.31, stop_price=15.20, qty=50)
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=15.0,
+            trail_engaged=True,
+            high_water_mark=21.42,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBroker(last=21.0)
+
+    _tick(db, broker, trail_stages=stages)
+
+    # gain = (21.42 − 18.31)/18.31 ≈ 17% ≥ 15 → width 8% → 21.42×0.92.
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.71)
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.trail_distance_pct == pytest.approx(15.0)  # base preserved
+
+
+def test_live_scenario_base_trail_floor(db: str) -> None:
+    """TENX-shaped control: entry 18.31, initial risk 16.99% of entry →
+    default width clamps to 15. HWM 21.42 → floor 21.42×0.85 = 18.21."""
+    _seed_position(db, entry_fill=18.31, stop_price=15.20, qty=50)
+    broker = _FakeBroker(last=21.42)
+
+    _tick(db, broker)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(18.21)
+
+
+def test_live_scenario_staged_floor(db: str) -> None:
+    """Same position with stages [(15, 8)]: gain 17% ≥ 15 → width 8 →
+    floor 21.42×0.92 = 19.71 (vs 18.21 flat — the TENX giveback fix)."""
+    _seed_position(db, entry_fill=18.31, stop_price=15.20, qty=50)
+    broker = _FakeBroker(last=21.42)
+
+    _tick(db, broker, trail_stages=[TrailStage(gain_pct=15.0, trail_pct=8.0)])
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.71)
 
 
 # ---------------------------------------------------------------------------

@@ -133,6 +133,81 @@ def test_ks5_tier_rejects_negative_max_positions() -> None:
         )
 
 
+def test_trail_stages_default_to_empty() -> None:
+    """A config with no `trail_stages` (every existing prod shape) must
+    construct with an empty list — staged tightening OFF, flat base-width
+    trailing exactly as before."""
+    cfg = ExecutionConfig(**_execution_kwargs())  # type: ignore[arg-type]
+    assert cfg.trail_stages == []
+
+
+def test_trail_stages_parse_array_of_tables() -> None:
+    cfg = ExecutionConfig(
+        **_execution_kwargs(
+            trail_stages=[
+                {"gain_pct": 20.0, "trail_pct": 8.0},
+                {"gain_pct": 35.0, "trail_pct": 5.0},
+            ],
+        )  # type: ignore[arg-type]
+    )
+    assert [(s.gain_pct, s.trail_pct) for s in cfg.trail_stages] == [
+        (20.0, 8.0),
+        (35.0, 5.0),
+    ]
+
+
+def test_trail_stages_reject_non_ascending_gain_pct() -> None:
+    """Milestones must be strictly ascending in gain_pct; a misordered
+    (or duplicated) list is an operator error, rejected at load time."""
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(
+                trail_stages=[
+                    {"gain_pct": 35.0, "trail_pct": 8.0},
+                    {"gain_pct": 20.0, "trail_pct": 5.0},
+                ],
+            )  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(
+                trail_stages=[
+                    {"gain_pct": 20.0, "trail_pct": 8.0},
+                    {"gain_pct": 20.0, "trail_pct": 5.0},
+                ],
+            )  # type: ignore[arg-type]
+        )
+
+
+def test_trail_stages_reject_widening_trail_pct() -> None:
+    """trail_pct must be non-increasing across stages — the trail may
+    only tighten as gain milestones are crossed, never widen."""
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(
+                trail_stages=[
+                    {"gain_pct": 20.0, "trail_pct": 5.0},
+                    {"gain_pct": 35.0, "trail_pct": 8.0},
+                ],
+            )  # type: ignore[arg-type]
+        )
+
+
+def test_trail_stage_rejects_non_positive_fields() -> None:
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(
+                trail_stages=[{"gain_pct": 0.0, "trail_pct": 8.0}],
+            )  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(
+                trail_stages=[{"gain_pct": 20.0, "trail_pct": 0.0}],
+            )  # type: ignore[arg-type]
+        )
+
+
 def test_example_toml_disables_scaling_by_default() -> None:
     """The shipped example config must boot with the curve OFF so operators
     upgrade with zero behavior change until they explicitly opt in.
