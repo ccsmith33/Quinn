@@ -52,6 +52,9 @@ ks7_cash_reserve_pct = 0.03
 # Revisit before live.
 sizing_mid_pct = 0.07
 sizing_high_pct = 0.10
+# Conviction at/above which a proposal earns sizing_high_pct (below it,
+# sizing_mid_pct). Bounds [6, 10]. Omitted = 9, the original tiering.
+# sizing_high_conviction_min = 9
 # Staged trail tightening (opt-in). As the position's high-water gain vs
 # entry (% of entry) crosses each gain_pct milestone, the effective trail
 # width becomes min(current width, trail_pct) — the trail only ever

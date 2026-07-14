@@ -29,11 +29,10 @@ from proposal.schemas import TradeProposal
 
 log = get_logger(__name__)
 
-# Conviction-tier sizing rates (PRD §6.1). cv >= 9 → high-tier rate; cv in
-# [7, 8] → mid-tier rate; cv in [_CONVICTION_FLOOR, 6] also uses mid-tier
-# rate (small fraction of equity, consistent with the prompt's "~5% for
-# conviction 5–6" calibration).
-_TIER_HIGH_THRESHOLD = 9  # cv >= 9 → high tier (10% default)
+# Conviction-tier sizing rates (PRD §6.1). cv >= cfg.sizing_high_conviction_min
+# (default 9) → high-tier rate; below it, the mid-tier rate — including cv in
+# [_CONVICTION_FLOOR, 6] (small fraction of equity, consistent with the
+# prompt's "~5% for conviction 5–6" calibration).
 _TIER_MID_THRESHOLD = 7  # cv in [7, 8] → mid tier (5% default)
 
 # Floor below which we will not size a trade. Tracks the configured Opus-
@@ -154,7 +153,7 @@ class SizingEngine:
         # PRD §6.1: conviction-tier rate.
         tier_pct = (
             cfg.sizing_high_pct
-            if proposal.conviction >= _TIER_HIGH_THRESHOLD
+            if proposal.conviction >= cfg.sizing_high_conviction_min
             else cfg.sizing_mid_pct
         )
         tier_dollar = tier_pct * account.equity

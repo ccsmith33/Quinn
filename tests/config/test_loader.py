@@ -246,6 +246,35 @@ def test_max_initial_review_days_rejects_non_positive() -> None:
         )
 
 
+def test_sizing_high_conviction_min_defaults_to_9() -> None:
+    """A config omitting the key (every existing prod shape, and the shipped
+    example) defaults the high-tier threshold to 9 — zero behavior change."""
+    cfg = ExecutionConfig(**_execution_kwargs())  # type: ignore[arg-type]
+    assert cfg.sizing_high_conviction_min == 9
+    example = load_config(str(EXAMPLE_TOML))
+    assert example.execution.sizing_high_conviction_min == 9
+
+
+def test_sizing_high_conviction_min_override_parses() -> None:
+    """An operator may lower the high-tier threshold within [6, 10]."""
+    cfg = ExecutionConfig(
+        **_execution_kwargs(sizing_high_conviction_min=8)  # type: ignore[arg-type]
+    )
+    assert cfg.sizing_high_conviction_min == 8
+
+
+def test_sizing_high_conviction_min_rejects_out_of_range() -> None:
+    """Values outside [6, 10] are operator errors rejected at load time."""
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(sizing_high_conviction_min=5)  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(sizing_high_conviction_min=11)  # type: ignore[arg-type]
+        )
+
+
 def test_event_reviews_defaults_off_when_section_absent() -> None:
     """[event_reviews] — the section is optional and defaults OFF so a
     legacy prod quinn.toml (and the shipped example, which only carries a

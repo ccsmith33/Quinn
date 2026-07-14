@@ -121,6 +121,7 @@ def _cfg(
     ks7_cash_reserve_pct: float = 0.05,
     sizing_mid_pct: float = 0.05,
     sizing_high_pct: float = 0.10,
+    sizing_high_conviction_min: int = 9,
 ) -> ExecutionConfig:
     return ExecutionConfig(
         broker_mode="paper",
@@ -131,6 +132,7 @@ def _cfg(
         ks7_cash_reserve_pct=ks7_cash_reserve_pct,
         sizing_mid_pct=sizing_mid_pct,
         sizing_high_pct=sizing_high_pct,
+        sizing_high_conviction_min=sizing_high_conviction_min,
     )
 
 
@@ -173,6 +175,46 @@ def test_high_conviction_10pct_sizing() -> None:
     assert isinstance(result, SizingAccepted)
     assert result.realized_pct == pytest.approx(0.10)
     assert result.realized_dollar_size == pytest.approx(100.0)
+
+
+def test_default_high_tier_threshold_boundary() -> None:
+    """Regression: with the default config (sizing_high_conviction_min=9),
+    cv 8 sizes at the mid rate and cv 9 at the high rate — byte-identical
+    to the pre-config-knob `_TIER_HIGH_THRESHOLD = 9` behavior."""
+    account = _account(equity=5000.0)
+    engine = SizingEngine()
+
+    mid = engine.size(
+        _proposal(conviction=8), account, open_positions=[], quote=_quote(last=10.0), cfg=_cfg()
+    )
+    high = engine.size(
+        _proposal(conviction=9), account, open_positions=[], quote=_quote(last=10.0), cfg=_cfg()
+    )
+
+    assert isinstance(mid, SizingAccepted)
+    assert mid.realized_pct == pytest.approx(0.05)
+    assert isinstance(high, SizingAccepted)
+    assert high.realized_pct == pytest.approx(0.10)
+
+
+def test_configured_high_tier_threshold_lowers_boundary() -> None:
+    """With sizing_high_conviction_min=8, cv 8 now earns the high rate and
+    cv 7 stays at the mid rate."""
+    account = _account(equity=5000.0)
+    engine = SizingEngine()
+    cfg = _cfg(sizing_high_conviction_min=8)
+
+    high = engine.size(
+        _proposal(conviction=8), account, open_positions=[], quote=_quote(last=10.0), cfg=cfg
+    )
+    mid = engine.size(
+        _proposal(conviction=7), account, open_positions=[], quote=_quote(last=10.0), cfg=cfg
+    )
+
+    assert isinstance(high, SizingAccepted)
+    assert high.realized_pct == pytest.approx(0.10)
+    assert isinstance(mid, SizingAccepted)
+    assert mid.realized_pct == pytest.approx(0.05)
 
 
 def test_ks4_absolute_floor_caps_size() -> None:

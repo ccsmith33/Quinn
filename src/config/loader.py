@@ -100,6 +100,10 @@ class ExecutionConfig(_Section):
     ks7_cash_reserve_pct: float = Field(ge=0.0, le=1.0)
     sizing_mid_pct: float = Field(ge=0.0, le=1.0)
     sizing_high_pct: float = Field(ge=0.0, le=1.0)
+    # Conviction at/above which a proposal earns `sizing_high_pct` (below it,
+    # `sizing_mid_pct`). Default 9 preserves the original PRD §6.1 tiering
+    # exactly; bounded to [6, 10] so the high tier can't swallow the mid band.
+    sizing_high_conviction_min: int = Field(default=9, ge=6, le=10)
     # PDT-SUNSET-2026-06-04: ADR-009 §8 — operator escape hatch for the
     # PDT day-trade budget feature. Default True so the feature is on by
     # default; flip to False to short-circuit `PDTState.is_active()` and
