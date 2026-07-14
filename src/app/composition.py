@@ -351,6 +351,41 @@ def compose_agent(
         trail_stages=config.execution.trail_stages,
     )
 
+    # Event-triggered thesis reviews ([event_reviews]) — constructed
+    # ONLY when the flag is on so a disabled config wires `None` into
+    # the reconciler and the whole feature is unreachable (the A/B
+    # requirement: byte-identical behavior when disabled). The
+    # prev-close source is the daily universe snapshot (same value the
+    # analyzer's block-2 summary uses); a held name absent from the
+    # universe simply skips the anomaly trigger.
+    event_trigger_engine = None
+    if config.event_reviews.enabled:
+        from app.event_triggers import EventTriggerEngine
+
+        def _prev_close(symbol: str) -> float | None:
+            member = universe.get_member(symbol)
+            return member.prev_close if member is not None else None
+
+        event_trigger_engine = EventTriggerEngine(
+            journal=journal,
+            broker=broker,
+            enabled=True,
+            anomaly_move_pct=config.event_reviews.anomaly_move_pct,
+            cooldown_hours=config.event_reviews.cooldown_hours,
+            gain_thresholds_pct=config.event_reviews.gain_thresholds_pct,
+            trail_stages=config.execution.trail_stages,
+            prev_close_lookup=_prev_close,
+        )
+        log.info(
+            "event_triggers.enabled",
+            extra={
+                "event": "event_triggers.enabled",
+                "anomaly_move_pct": config.event_reviews.anomaly_move_pct,
+                "cooldown_hours": config.event_reviews.cooldown_hours,
+                "gain_thresholds_pct": config.event_reviews.gain_thresholds_pct,
+            },
+        )
+
     # Reconciler (S6.5) — depends on broker + journal + ks + cfg + alerter.
     # S5.6 carry-fwd S6.5 reviewer M-3 (HIGH): wire the Telegram alerter
     # at construction so position-discrepancy notifications reach the
@@ -375,6 +410,8 @@ def compose_agent(
         fill_ingestor=fill_ingestor,
         # D-079 §3.5: exit-policy hook, after the thesis hook.
         exit_policy_ticker=exit_policy_ticker,
+        # [event_reviews] — None unless the config flag is on.
+        event_trigger_engine=event_trigger_engine,
     )
 
     # AlertWatcher (S8.2) — must be constructed AFTER migrations have

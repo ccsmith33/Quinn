@@ -165,6 +165,56 @@ class ExecutionConfig(_Section):
         return self
 
 
+class EventReviewsConfig(_Section):
+    """Event-triggered, zone-aware thesis reviews (operator A/B feature).
+
+    Default OFF: with `enabled = false` (or the section absent) no event
+    trigger ever runs and behavior is byte-identical to the pure
+    calendar-review system. The operator enables it on one box only as
+    an A/B.
+
+    Triggers (all schedule an immediate thesis review through the
+    existing `thesis_review_schedule` seam — `due_at = now`,
+    `scheduled_reason = 'event:...'`):
+      - gain-cross: the position's high-water gain crosses a threshold
+        (default thresholds: the `trail_stages` gain_pcts plus +10%
+        arming; override via `gain_thresholds_pct`);
+      - held-name filing: a newly ingested filing matches a held symbol;
+      - tape anomaly: the quote moved >= `anomaly_move_pct` vs prev
+        close intraday (price-only);
+      - news headline (when the news client is available).
+
+    Anti-churn: per-position-per-trigger-type cooldown of
+    `cooldown_hours` (default 24 ~= once per trading day), and no
+    trigger fires while a review for the execution is already pending
+    or due.
+    """
+
+    enabled: bool = False
+    anomaly_move_pct: float = Field(default=7.0, gt=0.0)
+    cooldown_hours: float = Field(default=24.0, gt=0.0)
+    # Optional override of the gain-cross threshold list (percent gain
+    # vs entry). Empty (default) = derive from execution.trail_stages
+    # gain_pcts plus the +10% arming line.
+    gain_thresholds_pct: list[float] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check_gain_thresholds_monotonic(self) -> EventReviewsConfig:
+        """Threshold list must be strictly ascending so crossing order is
+        unambiguous (same operator-error posture as ks5_tiers)."""
+        t = self.gain_thresholds_pct
+        if any(b <= a for a, b in zip(t, t[1:], strict=False)):
+            raise ValueError(
+                "gain_thresholds_pct values must be strictly ascending; "
+                f"got {t}"
+            )
+        if any(v <= 0 for v in t):
+            raise ValueError(
+                f"gain_thresholds_pct values must be positive; got {t}"
+            )
+        return self
+
+
 class ReconcilerConfig(_Section):
     interval_seconds_market: int = Field(gt=0)
     # RETIRED — WS1 (D-078, delta §2.2). Diff explanation is now keyed to
@@ -228,6 +278,9 @@ class AppConfig(BaseModel):
     prefilter: PrefilterConfig
     analyzer: AnalyzerConfig
     execution: ExecutionConfig
+    # Event-triggered thesis reviews — optional section, default OFF so
+    # legacy configs keep booting with byte-identical behavior.
+    event_reviews: EventReviewsConfig = Field(default_factory=EventReviewsConfig)
     reconciler: ReconcilerConfig
     killswitch: KillSwitchConfig
     observability: ObservabilityConfig

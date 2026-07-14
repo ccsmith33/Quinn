@@ -244,3 +244,40 @@ def test_max_initial_review_days_rejects_non_positive() -> None:
         ExecutionConfig(
             **_execution_kwargs(max_initial_review_days=0)  # type: ignore[arg-type]
         )
+
+
+def test_event_reviews_defaults_off_when_section_absent() -> None:
+    """[event_reviews] — the section is optional and defaults OFF so a
+    legacy prod quinn.toml (and the shipped example, which only carries a
+    commented block) keeps booting with byte-identical behavior."""
+    cfg = load_config(str(EXAMPLE_TOML))
+    assert cfg.event_reviews.enabled is False
+    assert cfg.event_reviews.anomaly_move_pct == 7.0
+    assert cfg.event_reviews.cooldown_hours == 24.0
+    assert cfg.event_reviews.gain_thresholds_pct == []
+
+
+def test_event_reviews_section_parses(tmp_path: Path) -> None:
+    toml = EXAMPLE_TOML.read_text(encoding="utf-8") + (
+        "\n[event_reviews]\n"
+        "enabled = true\n"
+        "anomaly_move_pct = 5.0\n"
+        "cooldown_hours = 12.0\n"
+        "gain_thresholds_pct = [10.0, 20.0, 35.0]\n"
+    )
+    p = tmp_path / "event_reviews.toml"
+    p.write_text(toml, encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.event_reviews.enabled is True
+    assert cfg.event_reviews.anomaly_move_pct == 5.0
+    assert cfg.event_reviews.cooldown_hours == 12.0
+    assert cfg.event_reviews.gain_thresholds_pct == [10.0, 20.0, 35.0]
+
+
+def test_event_reviews_rejects_non_ascending_gain_thresholds() -> None:
+    from config.loader import EventReviewsConfig
+
+    with pytest.raises(ValidationError):
+        EventReviewsConfig(gain_thresholds_pct=[20.0, 10.0])
+    with pytest.raises(ValidationError):
+        EventReviewsConfig(gain_thresholds_pct=[-5.0, 10.0])

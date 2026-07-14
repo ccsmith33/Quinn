@@ -65,6 +65,25 @@ sizing_high_pct = 0.10
 # gain_pct = 35.0
 # trail_pct = 5.0
 
+# Event-triggered, zone-aware thesis reviews (A/B feature, default OFF).
+# When enabled, held positions get an IMMEDIATE Opus thesis review when:
+#   - the position's high-water gain crosses a threshold (defaults to the
+#     trail_stages gain_pcts plus the +10% arming line; override with
+#     gain_thresholds_pct, strictly ascending);
+#   - a newly ingested filing matches a held symbol;
+#   - the quote moves >= anomaly_move_pct vs prev close intraday;
+#   - a new Alpaca news headline mentions a held symbol.
+# Anti-churn: per-position-per-trigger-type cooldown_hours (default 24 ~=
+# once per trading day), and no trigger fires while a review is already
+# pending/due for that position. Section absent or enabled=false =
+# byte-identical behavior to the pure calendar-review system.
+# Structural change: requires restart, not SIGHUP.
+# [event_reviews]
+# enabled = true
+# anomaly_move_pct = 7.0
+# cooldown_hours = 24.0
+# gain_thresholds_pct = [10.0, 20.0, 35.0]
+
 [reconciler]
 interval_seconds_market = 300
 # Hotfix 2026-05-07 — false-positive halt window. When broker/journal

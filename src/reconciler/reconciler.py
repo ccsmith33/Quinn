@@ -187,6 +187,12 @@ class Reconciler:
         # a thesis-driven stop replacement lands before the ratchet reads
         # the live stop. None disables; WS2 wires the real ticker.
         exit_policy_ticker: Any | None = None,
+        # Event-triggered thesis reviews ([event_reviews], default OFF).
+        # Invoked BEFORE the thesis hook on the same gated ticks so an
+        # event row inserted with due_at=now is consumed by the thesis
+        # coordinator on the SAME tick. None (the default, and always
+        # the case when the config flag is off) disables entirely.
+        event_trigger_engine: Any | None = None,
     ) -> None:
         self._broker = broker
         self._journal = journal
@@ -211,6 +217,7 @@ class Reconciler:
         # WS1 wiring + external-close consecutive-miss counters (§2.2).
         self._fill_ingestor = fill_ingestor
         self._exit_policy_ticker = exit_policy_ticker
+        self._event_triggers = event_trigger_engine
         self._external_miss: dict[str, int] = {}
         # Negative-cash tripwire edge detector (hotfix 2026-07-08): True
         # while the last observed broker cash was < 0, so a sustained
@@ -276,6 +283,29 @@ class Reconciler:
                         "reconciler.retro_tick_error",
                         extra={
                             "event": "reconciler.retro_tick_error",
+                            "error": str(e),
+                            "error_class": type(e).__name__,
+                        },
+                    )
+
+            # Event-triggered reviews ([event_reviews], default OFF) —
+            # runs BEFORE the thesis hook so a trigger's due-now schedule
+            # row is consumed by the thesis coordinator on this same
+            # tick. Same gating + protective shape as the sibling hooks:
+            # errors logged, never propagated; sync like the scanner.
+            if (
+                self._event_triggers is not None
+                and report is not None
+                and not report.suppressed
+                and not report.deferred
+            ):
+                try:
+                    self._event_triggers.run_tick()
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "reconciler.event_trigger_tick_error",
+                        extra={
+                            "event": "reconciler.event_trigger_tick_error",
                             "error": str(e),
                             "error_class": type(e).__name__,
                         },
