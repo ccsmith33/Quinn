@@ -284,6 +284,8 @@ def test_event_reviews_defaults_off_when_section_absent() -> None:
     assert cfg.event_reviews.anomaly_move_pct == 7.0
     assert cfg.event_reviews.cooldown_hours == 24.0
     assert cfg.event_reviews.gain_thresholds_pct == []
+    assert cfg.event_reviews.daily_sweep is False
+    assert cfg.event_reviews.sweep_after_utc_hour == 11
 
 
 def test_event_reviews_section_parses(tmp_path: Path) -> None:
@@ -293,6 +295,8 @@ def test_event_reviews_section_parses(tmp_path: Path) -> None:
         "anomaly_move_pct = 5.0\n"
         "cooldown_hours = 12.0\n"
         "gain_thresholds_pct = [10.0, 20.0, 35.0]\n"
+        "daily_sweep = true\n"
+        "sweep_after_utc_hour = 12\n"
     )
     p = tmp_path / "event_reviews.toml"
     p.write_text(toml, encoding="utf-8")
@@ -301,6 +305,19 @@ def test_event_reviews_section_parses(tmp_path: Path) -> None:
     assert cfg.event_reviews.anomaly_move_pct == 5.0
     assert cfg.event_reviews.cooldown_hours == 12.0
     assert cfg.event_reviews.gain_thresholds_pct == [10.0, 20.0, 35.0]
+    assert cfg.event_reviews.daily_sweep is True
+    assert cfg.event_reviews.sweep_after_utc_hour == 12
+
+
+def test_event_reviews_rejects_out_of_range_sweep_hour() -> None:
+    """`sweep_after_utc_hour` is an hour-of-day (0-23); anything else is
+    an operator error rejected at load time."""
+    from config.loader import EventReviewsConfig
+
+    with pytest.raises(ValidationError):
+        EventReviewsConfig(sweep_after_utc_hour=24)
+    with pytest.raises(ValidationError):
+        EventReviewsConfig(sweep_after_utc_hour=-1)
 
 
 def test_event_reviews_rejects_non_ascending_gain_thresholds() -> None:

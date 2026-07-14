@@ -186,7 +186,13 @@ class EventReviewsConfig(_Section):
       - held-name filing: a newly ingested filing matches a held symbol;
       - tape anomaly: the quote moved >= `anomaly_move_pct` vs prev
         close intraday (price-only);
-      - news headline (when the news client is available).
+      - news headline (when the news client is available);
+      - daily pre-market sweep (opt-in via `daily_sweep`): once per UTC
+        day, on the first reconciler tick at/after
+        `sweep_after_utc_hour` (default 11 ~= 7am ET), EVERY held
+        position gets a review — the doctrine's fresh-buy test every
+        morning. Once per day per position, restart-safe (keyed on a
+        schedule row dated today).
 
     Anti-churn: per-position-per-trigger-type cooldown of
     `cooldown_hours` (default 24 ~= once per trading day), and no
@@ -197,6 +203,10 @@ class EventReviewsConfig(_Section):
     enabled: bool = False
     anomaly_move_pct: float = Field(default=7.0, gt=0.0)
     cooldown_hours: float = Field(default=24.0, gt=0.0)
+    daily_sweep: bool = False
+    # UTC hour-of-day after which the daily sweep may run (11 UTC ~= 7am
+    # ET — inside the pre-market window, before the open).
+    sweep_after_utc_hour: int = Field(default=11, ge=0, le=23)
     # Optional override of the gain-cross threshold list (percent gain
     # vs entry). Empty (default) = derive from execution.trail_stages
     # gain_pcts plus the +10% arming line.

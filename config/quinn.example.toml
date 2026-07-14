@@ -75,7 +75,12 @@ sizing_high_pct = 0.10
 #     gain_thresholds_pct, strictly ascending);
 #   - a newly ingested filing matches a held symbol;
 #   - the quote moves >= anomaly_move_pct vs prev close intraday;
-#   - a new Alpaca news headline mentions a held symbol.
+#   - a new Alpaca news headline mentions a held symbol;
+#   - daily_sweep = true adds a DAILY PRE-MARKET SWEEP: once per UTC day, on
+#     the first tick at/after sweep_after_utc_hour (11 UTC ~= 7am ET), EVERY
+#     held position gets a review — the fresh-buy test every morning. Once
+#     per day per position, restart-safe; positions already reviewed today
+#     or with a review pending-and-due are skipped.
 # Anti-churn: per-position-per-trigger-type cooldown_hours (default 24 ~=
 # once per trading day), and no trigger fires while a review is already
 # pending/due for that position. Section absent or enabled=false =
@@ -86,6 +91,8 @@ sizing_high_pct = 0.10
 # anomaly_move_pct = 7.0
 # cooldown_hours = 24.0
 # gain_thresholds_pct = [10.0, 20.0, 35.0]
+# daily_sweep = false
+# sweep_after_utc_hour = 11
 
 [reconciler]
 interval_seconds_market = 300

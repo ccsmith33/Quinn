@@ -238,6 +238,8 @@ def _engine(
     gain_thresholds_pct: tuple[float, ...] = (),
     cooldown_hours: float = 24.0,
     anomaly_move_pct: float = 7.0,
+    daily_sweep: bool = False,
+    sweep_after_utc_hour: int = 11,
 ) -> EventTriggerEngine:
     clock = {"now": now}
     engine = EventTriggerEngine(
@@ -249,6 +251,8 @@ def _engine(
         gain_thresholds_pct=gain_thresholds_pct,
         trail_stages=trail_stages,
         prev_close_lookup=(prev_close or {}).get,
+        daily_sweep=daily_sweep,
+        sweep_after_utc_hour=sweep_after_utc_hour,
         now_fn=lambda: clock["now"],
     )
     engine._clock = clock  # type: ignore[attr-defined] — test handle
@@ -731,6 +735,183 @@ def test_news_poll_failure_never_breaks_other_triggers(db: str) -> None:
     assert [r["scheduled_reason"] for r in _schedule_rows(db)] == [
         "event:filing:ev-with-news-down"
     ]
+
+
+# ---------------------------------------------------------------------------
+# Daily pre-market portfolio sweep
+# ---------------------------------------------------------------------------
+
+# A tick clock that starts BEFORE the default sweep window (11:00 UTC)
+# on the same trading day as NOW.
+PRE_WINDOW = dt.datetime(2026, 7, 13, 10, 30, 0, tzinfo=dt.UTC)
+
+
+def _sweep_engine(db: str, broker: _FakeBroker, **kwargs) -> EventTriggerEngine:
+    """Engine with the sweep on and every other trigger condition flat
+    (prices at entry / prev close) so only sweep rows can appear."""
+    prev_close = {p.symbol: 100.0 for p in broker.get_positions()}
+    return _engine(
+        db,
+        broker,
+        daily_sweep=kwargs.pop("daily_sweep", True),
+        now=kwargs.pop("now", PRE_WINDOW),
+        prev_close=prev_close,
+        **kwargs,
+    )
+
+
+def test_daily_sweep_schedules_all_positions_after_window_opens(db: str) -> None:
+    """(a) Ticks before `sweep_after_utc_hour` schedule nothing; the first
+    tick at/after it schedules one `event:daily_sweep` row per open
+    position."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.hold("BETA")
+    eid_a = _seed_position(db, symbol="ACME")
+    eid_b = _seed_position(db, symbol="BETA")
+    engine = _sweep_engine(db, broker)
+    engine.run_tick()  # 10:30 UTC — before the window
+    assert _schedule_rows(db) == []
+    _advance(engine, dt.timedelta(hours=1))  # 11:30 UTC — window open
+    engine.run_tick()
+    rows = _schedule_rows(db)
+    assert [r["scheduled_reason"] for r in rows] == [
+        "event:daily_sweep",
+        "event:daily_sweep",
+    ]
+    assert {r["execution_id"] for r in rows} == {eid_a, eid_b}
+    # The rows are due immediately (due_at = now).
+    now = PRE_WINDOW + dt.timedelta(hours=1)
+    assert {s.execution_id for s in find_due_thesis_reviews(db, now=now)} == {
+        eid_a,
+        eid_b,
+    }
+
+
+def test_daily_sweep_second_tick_same_day_schedules_nothing(db: str) -> None:
+    """(b) Once swept (and the review consumed), later ticks the same day
+    write nothing; the next day the sweep fires again (date-keyed)."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    _seed_position(db, symbol="ACME")
+    engine = _sweep_engine(db, broker)
+    _advance(engine, dt.timedelta(hours=1))  # 11:30
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    _mark_latest_reviewed(db)  # coordinator consumes it same tick
+    _advance(engine, dt.timedelta(minutes=5))
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    _advance(engine, dt.timedelta(hours=6))  # still same day
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    # Next trading day, first tick after the window: sweeps again — even
+    # though yesterday's sweep was < cooldown_hours ago in wall time.
+    _advance(engine, dt.timedelta(hours=23, minutes=50))  # next day 11:25
+    engine.run_tick()
+    rows = _schedule_rows(db)
+    assert [r["scheduled_reason"] for r in rows] == [
+        "event:daily_sweep",
+        "event:daily_sweep",
+    ]
+
+
+def test_daily_sweep_restart_mid_day_does_not_resweep(db: str) -> None:
+    """(c) A process bounce after the morning sweep must not re-sweep:
+    idempotency is derived from the ledger (a schedule row for the
+    execution already dated today), not from in-memory state."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    _seed_position(db, symbol="ACME")
+    engine = _sweep_engine(db, broker)
+    _advance(engine, dt.timedelta(hours=1))  # 11:30
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    _mark_latest_reviewed(db)
+    # Fresh engine = restart (all in-memory state lost), later same day.
+    engine2 = _sweep_engine(
+        db, broker, now=PRE_WINDOW + dt.timedelta(hours=2)
+    )
+    engine2.run_tick()
+    engine2.run_tick()
+    assert len(_schedule_rows(db)) == 1
+
+
+def test_daily_sweep_skips_position_with_pending_due_review(db: str) -> None:
+    """(d) A position whose latest schedule row is already pending AND due
+    (from yesterday, so not caught by the swept-today check) is skipped —
+    the coordinator reviews it this tick anyway."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.hold("BETA")
+    eid_a = _seed_position(db, symbol="ACME")
+    eid_b = _seed_position(db, symbol="BETA")
+    insert_thesis_review_schedule(
+        db,
+        ThesisReviewScheduleRow(
+            execution_id=eid_a,
+            due_at=PRE_WINDOW - dt.timedelta(days=1),  # due since yesterday
+            scheduled_reason="entry",
+        ),
+    )
+    engine = _sweep_engine(db, broker)
+    _advance(engine, dt.timedelta(hours=1))
+    engine.run_tick()
+    rows = _schedule_rows(db)
+    sweep_rows = [r for r in rows if r["scheduled_reason"] == "event:daily_sweep"]
+    assert [r["execution_id"] for r in sweep_rows] == [eid_b]
+
+
+def test_daily_sweep_skips_position_already_reviewed_today(db: str) -> None:
+    """A position that already faced an event review this morning (row
+    dated today) is not swept again — once per day per position, whatever
+    the reason."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 92.0  # -8% vs prev close: anomaly
+    _seed_position(db, symbol="ACME")
+    engine = _engine(
+        db,
+        broker,
+        daily_sweep=True,
+        now=PRE_WINDOW,
+        prev_close={"ACME": 100.0},
+    )
+    engine.run_tick()  # 10:30 — anomaly fires (events are not hour-gated)
+    assert [r["scheduled_reason"] for r in _schedule_rows(db)] == [
+        "event:anomaly"
+    ]
+    _mark_latest_reviewed(db)
+    _advance(engine, dt.timedelta(hours=1))  # 11:30 — sweep window open
+    engine.run_tick()
+    assert [r["scheduled_reason"] for r in _schedule_rows(db)] == [
+        "event:anomaly"
+    ]
+
+
+def test_daily_sweep_off_schedules_nothing(db: str) -> None:
+    """(e) daily_sweep=false (the default) adds zero behavior even with
+    the window open."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    _seed_position(db, symbol="ACME")
+    engine = _sweep_engine(db, broker, daily_sweep=False)
+    _advance(engine, dt.timedelta(hours=2))
+    engine.run_tick()
+    engine.run_tick()
+    assert _schedule_rows(db) == []
+
+
+def test_daily_sweep_disabled_section_stays_silent(db: str) -> None:
+    """Whole-section enabled=false beats daily_sweep=true: zero rows."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    _seed_position(db, symbol="ACME")
+    engine = _sweep_engine(db, broker, enabled=False)
+    _advance(engine, dt.timedelta(hours=2))
+    engine.run_tick()
+    engine.run_tick()
+    assert _schedule_rows(db) == []
 
 
 def test_news_disabled_engine_stays_silent(db: str) -> None:

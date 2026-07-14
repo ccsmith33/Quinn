@@ -401,6 +401,8 @@ def compose_agent(
             trail_stages=config.execution.trail_stages,
             prev_close_lookup=_prev_close,
             news_client=news_client,
+            daily_sweep=config.event_reviews.daily_sweep,
+            sweep_after_utc_hour=config.event_reviews.sweep_after_utc_hour,
         )
         log.info(
             "event_triggers.enabled",
@@ -409,6 +411,8 @@ def compose_agent(
                 "anomaly_move_pct": config.event_reviews.anomaly_move_pct,
                 "cooldown_hours": config.event_reviews.cooldown_hours,
                 "gain_thresholds_pct": config.event_reviews.gain_thresholds_pct,
+                "daily_sweep": config.event_reviews.daily_sweep,
+                "sweep_after_utc_hour": config.event_reviews.sweep_after_utc_hour,
             },
         )
 

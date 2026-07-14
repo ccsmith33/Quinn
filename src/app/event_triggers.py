@@ -32,6 +32,13 @@ Triggers (Milestone 1 + 3):
     the first successful poll so stale articles never fire at boot; the
     headline rides in the reason string so the review context can cite
     it.
+  - DAILY SWEEP (`event:daily_sweep`, opt-in via `daily_sweep`): once
+    per UTC day, on the first tick at/after `sweep_after_utc_hour`
+    (default 11 ~= 7am ET pre-market), every held position gets a
+    review row so each one faces the doctrine's "would we buy this
+    fresh?" test every morning. Idempotency is ledger-derived: a
+    position is skipped when ANY schedule row for it is already dated
+    today, so a mid-morning restart never double-sweeps.
 
 Anti-churn (all triggers):
   - per-position-per-trigger-type cooldown (`cooldown_hours`, default
@@ -122,6 +129,8 @@ class EventTriggerEngine:
         trail_stages: Sequence[TrailStage] = (),
         prev_close_lookup: Callable[[str], float | None] | None = None,
         news_client: NewsClientPort | None = None,
+        daily_sweep: bool = False,
+        sweep_after_utc_hour: int = 11,
         now_fn: Callable[[], dt.datetime] = _utcnow,
     ) -> None:
         self._journal = journal
@@ -140,7 +149,14 @@ class EventTriggerEngine:
         self._gain_thresholds = tuple(sorted(thresholds))
         self._prev_close_lookup = prev_close_lookup
         self._news_client = news_client
+        self._daily_sweep = daily_sweep
+        self._sweep_after_utc_hour = sweep_after_utc_hour
         self._now_fn = now_fn
+        # Date of the last completed sweep pass — a tick-loop
+        # short-circuit only. The durable once-per-day guarantee is
+        # ledger-derived (see `_check_daily_sweep`), so losing this on
+        # restart is safe.
+        self._sweep_done_for: dt.date | None = None
         # In-memory watermarks. A restart re-primes without firing, so a
         # process bounce can never replay historic filings/news as fresh
         # events (the calendar reviews backstop anything missed).
@@ -212,6 +228,20 @@ class EventTriggerEngine:
                         "event": "event_triggers.price_check_error",
                         "execution_id": execution_id,
                         "symbol": symbol,
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
+        # Sweep runs LAST so real events keep their descriptive reasons;
+        # the sweep only picks up positions nothing else touched today.
+        if self._daily_sweep:
+            try:
+                self._check_daily_sweep(held, now=now, scheduled=scheduled)
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "event_triggers.daily_sweep_error",
+                    extra={
+                        "event": "event_triggers.daily_sweep_error",
                         "error": str(e),
                         "error_class": type(e).__name__,
                     },
@@ -407,6 +437,48 @@ class EventTriggerEngine:
                     detail={"article_id": aid, "headline": headline},
                 )
 
+    def _check_daily_sweep(
+        self,
+        held: dict[str, int],
+        *,
+        now: dt.datetime,
+        scheduled: set[int],
+    ) -> None:
+        """DAILY PRE-MARKET SWEEP — once per UTC day, on the first tick
+        at/after `sweep_after_utc_hour`, put every held position in front
+        of the reviewer (`event:daily_sweep`).
+
+        Once-per-day-per-position is ledger-derived, not clock-derived: a
+        position whose schedule ledger already carries ANY row dated
+        today (an earlier sweep before a restart, or a real event review
+        this morning) is skipped, so a mid-morning bounce cannot
+        double-sweep. `_sweep_done_for` merely short-circuits the ticks
+        after a completed pass; an errored pass leaves it unset so the
+        next tick retries (already-swept positions still skip via the
+        ledger). The sweep bypasses the per-trigger-type cooldown — the
+        date key IS its anti-churn, and a rolling `cooldown_hours` window
+        could swallow a next-day sweep whose tick lands minutes earlier
+        than yesterday's."""
+        today = now.date()
+        if now.hour < self._sweep_after_utc_hour:
+            return
+        if self._sweep_done_for == today:
+            return
+        for symbol, execution_id in sorted(held.items()):
+            if self._has_schedule_row_today(execution_id, now=now):
+                continue
+            self._try_schedule(
+                execution_id=execution_id,
+                symbol=symbol,
+                trigger_type="daily_sweep",
+                reason="event:daily_sweep",
+                now=now,
+                scheduled=scheduled,
+                check_cooldown=False,
+                detail={"sweep_date": today.isoformat()},
+            )
+        self._sweep_done_for = today
+
     # ------------------------------------------------------------------
     # Scheduling + anti-churn guards
     # ------------------------------------------------------------------
@@ -421,6 +493,7 @@ class EventTriggerEngine:
         now: dt.datetime,
         scheduled: set[int],
         detail: dict[str, Any],
+        check_cooldown: bool = True,
     ) -> bool:
         """Apply the shared anti-churn guards and, if clear, insert the
         due-now schedule row. Returns True when a row was written."""
@@ -436,7 +509,9 @@ class EventTriggerEngine:
                 },
             )
             return False
-        if self._in_cooldown(execution_id, trigger_type, now=now):
+        if check_cooldown and self._in_cooldown(
+            execution_id, trigger_type, now=now
+        ):
             log.info(
                 "event_triggers.skipped_cooldown",
                 extra={
@@ -512,6 +587,24 @@ class EventTriggerEngine:
         if isinstance(last_at, str):  # defensive: driver-dependent shape
             last_at = dt.datetime.fromisoformat(last_at)
         return now - _ensure_aware(last_at) < self._cooldown
+
+    def _has_schedule_row_today(
+        self, execution_id: int, *, now: dt.datetime
+    ) -> bool:
+        """True when ANY schedule row for the execution has a `due_at`
+        dated today (UTC) — the sweep's restart-proof once-per-day key.
+        Calendar rows are future-dated at insert and event rows carry
+        `due_at = now`, so 'row dated today' == 'review already put in
+        front of the coordinator today'."""
+        day_start = dt.datetime.combine(now.date(), dt.time.min, tzinfo=dt.UTC)
+        with connect(self._journal.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM thesis_review_schedule "
+                "WHERE execution_id = ? AND due_at >= ? AND due_at < ? "
+                "LIMIT 1",
+                (execution_id, day_start, day_start + dt.timedelta(days=1)),
+            ).fetchone()
+        return row is not None
 
     def _reason_already_fired(self, execution_id: int, reason: str) -> bool:
         with connect(self._journal.db_path) as conn:
