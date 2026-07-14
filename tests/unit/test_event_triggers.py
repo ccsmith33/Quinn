@@ -573,3 +573,177 @@ def test_quote_failure_skips_symbol_without_crashing(db: str) -> None:
     engine = _engine(db, broker, prev_close={"ACME": 100.0})
     engine.run_tick()  # must not raise
     assert _schedule_rows(db) == []
+
+
+# ---------------------------------------------------------------------------
+# News trigger (Milestone 3)
+# ---------------------------------------------------------------------------
+
+
+class _FakeNewsClient:
+    """Newest-first article feed, mutable between ticks."""
+
+    def __init__(self) -> None:
+        self.articles: list = []
+        self.calls: list[list[str]] = []
+
+    def add(self, article_id: int, symbols: list[str], headline: str) -> None:
+        from broker.news import NewsArticle
+
+        self.articles.insert(
+            0,  # newest first
+            NewsArticle(
+                article_id=str(article_id),
+                headline=headline,
+                summary=f"summary of {headline}",
+                symbols=tuple(symbols),
+                created_at=NOW,
+            ),
+        )
+
+    def latest_news(self, symbols):  # noqa: ANN001, ANN202
+        self.calls.append(list(symbols))
+        return list(self.articles)
+
+
+def _news_engine(
+    db: str,
+    broker: _FakeBroker,
+    news: _FakeNewsClient,
+    **kwargs,
+) -> EventTriggerEngine:
+    clock = {"now": NOW}
+    engine = EventTriggerEngine(
+        journal=_Journal(db),
+        broker=broker,
+        enabled=kwargs.pop("enabled", True),
+        prev_close_lookup={"ACME": 100.0}.get,
+        news_client=news,
+        now_fn=lambda: clock["now"],
+        **kwargs,
+    )
+    engine._clock = clock  # type: ignore[attr-defined]
+    return engine
+
+
+def test_news_first_poll_primes_without_firing(db: str) -> None:
+    """Articles already in the feed at boot are stale context, not
+    events — the first poll primes the per-symbol cursor silently."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 100.0
+    _seed_position(db, symbol="ACME")
+    news = _FakeNewsClient()
+    news.add(1001, ["ACME"], "old headline from before boot")
+    engine = _news_engine(db, broker, news)
+    engine.run_tick()
+    assert _schedule_rows(db) == []
+
+
+def test_news_new_article_triggers_once(db: str) -> None:
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 100.0
+    _seed_position(db, symbol="ACME")
+    news = _FakeNewsClient()
+    news.add(1001, ["ACME"], "pre-boot noise")
+    engine = _news_engine(db, broker, news)
+    engine.run_tick()  # primes cursor at 1001
+    news.add(1002, ["ACME"], "ACME announces definitive merger agreement")
+    engine.run_tick()
+    rows = _schedule_rows(db)
+    assert len(rows) == 1
+    reason = rows[0]["scheduled_reason"]
+    assert reason.startswith("event:news:1002:")
+    assert "definitive merger agreement" in reason
+    assert rows[0]["execution_id"] == 1
+    # Same feed re-polled: cursor advanced -> no duplicate.
+    _mark_latest_reviewed(db)
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+
+
+def test_news_cooldown_suppresses_second_headline_same_day(db: str) -> None:
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 100.0
+    _seed_position(db, symbol="ACME")
+    news = _FakeNewsClient()
+    engine = _news_engine(db, broker, news)
+    engine.run_tick()  # primes (empty feed)
+    news.add(2001, ["ACME"], "first headline")
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    _mark_latest_reviewed(db)
+    # Second headline two hours later: inside the 24h news cooldown.
+    news.add(2002, ["ACME"], "second headline")
+    _advance(engine, dt.timedelta(hours=2))
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    # The suppressed article does NOT come back after the cooldown (the
+    # cursor advanced past it) — only a genuinely new one fires.
+    _advance(engine, dt.timedelta(hours=23))
+    engine.run_tick()
+    assert len(_schedule_rows(db)) == 1
+    news.add(2003, ["ACME"], "third headline")
+    engine.run_tick()
+    rows = _schedule_rows(db)
+    assert len(rows) == 2
+    assert rows[-1]["scheduled_reason"].startswith("event:news:2003:")
+
+
+def test_news_article_for_unheld_symbol_ignored(db: str) -> None:
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 100.0
+    _seed_position(db, symbol="ACME")
+    news = _FakeNewsClient()
+    engine = _news_engine(db, broker, news)
+    engine.run_tick()  # prime
+    news.add(3001, ["OTHR"], "unrelated headline")
+    engine.run_tick()
+    assert _schedule_rows(db) == []
+
+
+def test_news_poll_failure_never_breaks_other_triggers(db: str) -> None:
+    """A news outage is logged and skipped; the filing trigger on the
+    same tick still fires."""
+
+    class _BrokenNewsClient:
+        def latest_news(self, symbols):  # noqa: ANN001, ANN202
+            raise RuntimeError("simulated news outage")
+
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 100.0
+    _seed_position(db, symbol="ACME")
+    engine = EventTriggerEngine(
+        journal=_Journal(db),
+        broker=broker,
+        enabled=True,
+        prev_close_lookup={"ACME": 100.0}.get,
+        news_client=_BrokenNewsClient(),
+        now_fn=lambda: NOW,
+    )
+    engine.run_tick()  # primes the filings watermark; news fails silently
+    _insert_new_filing(db, symbol="ACME", accession="ev-with-news-down")
+    engine.run_tick()
+    assert [r["scheduled_reason"] for r in _schedule_rows(db)] == [
+        "event:filing:ev-with-news-down"
+    ]
+
+
+def test_news_disabled_engine_stays_silent(db: str) -> None:
+    """enabled=false wins over everything — even a wired news client
+    with fresh articles produces zero rows."""
+    broker = _FakeBroker()
+    broker.hold("ACME")
+    broker.last_by_symbol["ACME"] = 100.0
+    _seed_position(db, symbol="ACME")
+    news = _FakeNewsClient()
+    news.add(4001, ["ACME"], "would-be event")
+    engine = _news_engine(db, broker, news, enabled=False)
+    engine.run_tick()
+    engine.run_tick()
+    assert _schedule_rows(db) == []
+    assert news.calls == []  # never even polled

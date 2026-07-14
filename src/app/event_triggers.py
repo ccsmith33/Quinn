@@ -26,6 +26,12 @@ Triggers (Milestone 1 + 3):
     tick so historic filings never fire at boot.
   - TAPE ANOMALY (`event:anomaly`): the current quote moved >=
     `anomaly_move_pct` vs the previous close (absolute, price-only).
+  - NEWS (`event:news:<id>:<headline>`): a new Alpaca news headline for
+    a held symbol (only active when a news client is wired). The
+    last-seen article id per symbol is cached in memory and primed on
+    the first successful poll so stale articles never fire at boot; the
+    headline rides in the reason string so the review context can cite
+    it.
 
 Anti-churn (all triggers):
   - per-position-per-trigger-type cooldown (`cooldown_hours`, default
@@ -64,9 +70,21 @@ log = get_logger(__name__)
 # threshold list alongside the trail_stages milestones.
 _ARMING_GAIN_PCT = 10.0
 
+# Truncation bound for headline text embedded in `event:news:...`
+# reasons — the schedule ledger carries the evidence, but not a novel.
+_NEWS_HEADLINE_REASON_CAP = 200
+
 
 class _JournalLike(Protocol):
     db_path: str
+
+
+class NewsClientPort(Protocol):
+    """Minimal news surface the engine consumes. The real implementation
+    is `broker.news.AlpacaNewsClient`; tests inject a fake. Must return
+    articles sorted newest-first."""
+
+    def latest_news(self, symbols: Sequence[str]) -> list[Any]: ...
 
 
 def _utcnow() -> dt.datetime:
@@ -103,6 +121,7 @@ class EventTriggerEngine:
         gain_thresholds_pct: Sequence[float] = (),
         trail_stages: Sequence[TrailStage] = (),
         prev_close_lookup: Callable[[str], float | None] | None = None,
+        news_client: NewsClientPort | None = None,
         now_fn: Callable[[], dt.datetime] = _utcnow,
     ) -> None:
         self._journal = journal
@@ -120,11 +139,16 @@ class EventTriggerEngine:
             )
         self._gain_thresholds = tuple(sorted(thresholds))
         self._prev_close_lookup = prev_close_lookup
+        self._news_client = news_client
         self._now_fn = now_fn
-        # In-memory watermark. A restart re-primes without firing, so a
-        # process bounce can never replay historic filings as fresh
+        # In-memory watermarks. A restart re-primes without firing, so a
+        # process bounce can never replay historic filings/news as fresh
         # events (the calendar reviews backstop anything missed).
         self._filings_watermark: int | None = None
+        # Per-symbol highest news article id already seen. A symbol's
+        # first sighting primes its cursor from the current page without
+        # firing (boot / just-entered-position safety).
+        self._news_seen_max: dict[str, int] = {}
 
     def run_tick(self) -> None:
         """One trigger-evaluation pass. Errors on a single position /
@@ -148,8 +172,8 @@ class EventTriggerEngine:
         # arrive already pending/due) — one review per position per tick.
         scheduled: set[int] = set()
 
-        # The filing trigger scans its own feed and fans out to the held
-        # map; price triggers walk the held positions directly.
+        # Filing + news triggers scan their own feeds and fan out to the
+        # held map; price triggers walk the held positions directly.
         try:
             self._check_filings(held, now=now, scheduled=scheduled)
         except Exception as e:  # noqa: BLE001
@@ -161,6 +185,18 @@ class EventTriggerEngine:
                     "error_class": type(e).__name__,
                 },
             )
+        if self._news_client is not None:
+            try:
+                self._check_news(held, now=now, scheduled=scheduled)
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "event_triggers.news_check_error",
+                    extra={
+                        "event": "event_triggers.news_check_error",
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
         for symbol, execution_id in held.items():
             try:
                 self._check_price_triggers(
@@ -307,6 +343,69 @@ class EventTriggerEngine:
                 scheduled=scheduled,
                 detail={"accession": accession, "form_type": r["form_type"]},
             )
+
+    def _check_news(
+        self,
+        held: dict[str, int],
+        *,
+        now: dt.datetime,
+        scheduled: set[int],
+    ) -> None:
+        """NEWS — one batched poll of the newest headlines for all held
+        symbols (a single API request per tick; well inside Alpaca's
+        data rate limits).
+
+        Per-symbol cursor semantics mirror the filings watermark: a
+        symbol's FIRST sighting primes its cursor from the current page
+        and never fires (so boot, restart, and a just-opened position
+        cannot replay stale articles); afterwards an article fires only
+        when its id is above the cursor, and the cursor advances even
+        when cooldown suppresses the row — a suppressed headline does
+        not come back later."""
+        if not held:
+            return
+        articles = self._news_client.latest_news(sorted(held))  # type: ignore[union-attr]
+        parsed: list[tuple[int, Any]] = []
+        for article in articles:
+            try:
+                aid = int(str(article.article_id))
+            except (TypeError, ValueError):
+                continue  # non-numeric id: can't order it — skip
+            parsed.append((aid, article))
+
+        # Prime cursors for newly seen held symbols (no firing).
+        fresh = {s for s in held if s not in self._news_seen_max}
+        for symbol in fresh:
+            self._news_seen_max[symbol] = max(
+                (
+                    aid
+                    for aid, article in parsed
+                    if symbol in (getattr(article, "symbols", ()) or ())
+                ),
+                default=0,
+            )
+
+        # Oldest-to-newest so multi-article gaps between polls resolve in
+        # arrival order and the cursor lands on the newest id.
+        for aid, article in sorted(parsed, key=lambda t: t[0]):
+            headline = (getattr(article, "headline", "") or "")[
+                :_NEWS_HEADLINE_REASON_CAP
+            ]
+            for symbol in getattr(article, "symbols", ()) or ():
+                if symbol not in held or symbol in fresh:
+                    continue
+                if aid <= self._news_seen_max[symbol]:
+                    continue
+                self._news_seen_max[symbol] = aid
+                self._try_schedule(
+                    execution_id=held[symbol],
+                    symbol=symbol,
+                    trigger_type="news",
+                    reason=f"event:news:{aid}:{headline}",
+                    now=now,
+                    scheduled=scheduled,
+                    detail={"article_id": aid, "headline": headline},
+                )
 
     # ------------------------------------------------------------------
     # Scheduling + anti-churn guards
@@ -463,4 +562,4 @@ class EventTriggerEngine:
         return float(price)
 
 
-__all__ = ["EventTriggerEngine"]
+__all__ = ["EventTriggerEngine", "NewsClientPort"]

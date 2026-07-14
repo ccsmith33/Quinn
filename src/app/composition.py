@@ -369,6 +369,28 @@ def compose_agent(
             member = universe.get_member(symbol)
             return member.prev_close if member is not None else None
 
+        # News trigger data source — same Alpaca credential pair as the
+        # trading adapter (the news API rides the data plan). Best
+        # effort: a failed construction degrades to news-off while the
+        # filing / anomaly / gain-cross triggers keep running.
+        news_client = None
+        try:
+            from broker.news import AlpacaNewsClient
+
+            news_client = AlpacaNewsClient(
+                api_key_id=secrets.alpaca_api_key_id,
+                api_secret=secrets.alpaca_api_secret_key,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "event_triggers.news_client_unavailable",
+                extra={
+                    "event": "event_triggers.news_client_unavailable",
+                    "error": str(e),
+                    "error_class": type(e).__name__,
+                },
+            )
+
         event_trigger_engine = EventTriggerEngine(
             journal=journal,
             broker=broker,
@@ -378,6 +400,7 @@ def compose_agent(
             gain_thresholds_pct=config.event_reviews.gain_thresholds_pct,
             trail_stages=config.execution.trail_stages,
             prev_close_lookup=_prev_close,
+            news_client=news_client,
         )
         log.info(
             "event_triggers.enabled",
