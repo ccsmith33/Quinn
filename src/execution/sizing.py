@@ -114,6 +114,7 @@ class SizingEngine:
         cfg: ExecutionConfig,
         pending_buys: list[OpenOrder] | None = None,
         pending_entry_spend: float = 0.0,
+        displacement_credit: float = 0.0,
     ) -> SizingResult:
         # Defense-in-depth: a proposal below the conviction floor should
         # have been routed to NoTrade by the analyzer or rejected by Opus.
@@ -178,8 +179,14 @@ class SizingEngine:
         # of open entry buys, priced by the agent loop from journal order
         # rows — is subtracted first, mirroring how KS-5/KS-6 already
         # count pending entries via `pending_buys` (hotfix 2026-05-07).
+        # DISPLACEMENT (2026-07): when the agent loop has decided to evict
+        # a position to fund this entry, `displacement_credit` carries the
+        # haircut fraction of the victim's market value — proceeds that
+        # will exist once the victim's sale fills (same open when
+        # pre-market; moments earlier intraday). Default 0.0 keeps every
+        # non-displacement call byte-identical.
         reserve_floor = cfg.ks7_cash_reserve_pct * account.equity
-        available_cash = account.cash - pending_entry_spend
+        available_cash = account.cash - pending_entry_spend + displacement_credit
         max_spend_under_reserve = available_cash - reserve_floor
         if max_spend_under_reserve < quote.last:
             # One share would still breach the floor (or cash is already

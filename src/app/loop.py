@@ -773,8 +773,29 @@ class AgentLoop:
             pending_entry_spend=pending_entry_spend,
         )
         if isinstance(sizing, SizingRejected):
-            self._write_rejected_execution(proposal_id, sizing.reason)
-            return
+            # DISPLACEMENT (default OFF) — a HIGH-conviction proposal
+            # rejected by the KS-7 cash path may evict the weakest
+            # qualifying open position and fund itself from the sale
+            # proceeds. Every other reject reason — and every failure
+            # inside the displacement path — leaves the normal rejection
+            # standing, journal reason unchanged.
+            displaced = None
+            if sizing.reason == "ks7_cash_reserve":
+                displaced = self._attempt_displacement(
+                    proposal_id=proposal_id,
+                    trade=trade,
+                    account=account,
+                    positions=positions,
+                    quote=quote,
+                    pending_buys=pending_buys,
+                    pending_entry_spend=pending_entry_spend,
+                )
+            if displaced is None:
+                self._write_rejected_execution(proposal_id, sizing.reason)
+                return
+            # The victim's sell is already ACCEPTED at the broker; the
+            # buy below is sized against the haircut proceeds credit.
+            sizing = displaced
 
         accepted_proposal = AcceptedProposal(
             proposal=trade,
@@ -898,6 +919,61 @@ class AgentLoop:
         try:
             return int(self._config.analyzer.opus_review_conviction_threshold)
         except (AttributeError, TypeError, ValueError):
+            return None
+
+    def _attempt_displacement(
+        self,
+        *,
+        proposal_id: int,
+        trade: Any,
+        account: Any,
+        positions: list[Any],
+        quote: Any,
+        pending_buys: list[OpenOrder],
+        pending_entry_spend: float,
+    ) -> SizingAccepted | None:
+        """DISPLACEMENT — deterministic KS-7 escape hatch (default OFF).
+
+        When a high-conviction proposal cannot fund one share above the
+        KS-7 reserve floor, evict the weakest qualifying open position
+        and size the entry against the haircut sale proceeds (see
+        `execution.displacement`). Returns the displacement
+        `SizingAccepted` — the victim's sell already ACCEPTED at the
+        broker — or None, in which case the caller journals the normal
+        `ks7_cash_reserve` rejection, reason unchanged. Never raises:
+        any error inside the path degrades to the normal rejection.
+        """
+        cfg = getattr(self._config, "execution", None)
+        if cfg is None or not getattr(cfg, "displacement_enabled", False):
+            return None
+        try:
+            from execution.displacement import DisplacementEngine
+
+            engine = DisplacementEngine(
+                db_path=self._components.journal.db_path,
+                broker=self._components.broker,
+            )
+            return engine.attempt(
+                proposal=trade,
+                proposal_id=proposal_id,
+                account=account,
+                open_positions=positions,
+                quote=quote,
+                cfg=cfg,
+                sizer=self._components.sizer,
+                pending_buys=pending_buys,
+                pending_entry_spend=pending_entry_spend,
+            )
+        except Exception as e:  # noqa: BLE001 — the rejection must stand
+            log.error(
+                "execution.displacement.error",
+                extra={
+                    "event": "execution.displacement.error",
+                    "proposal_id": proposal_id,
+                    "error": str(e),
+                    "error_class": type(e).__name__,
+                },
+            )
             return None
 
     def _rearm_orphaned_thesis_reviews(self) -> None:

@@ -55,6 +55,18 @@ sizing_high_pct = 0.10
 # Conviction at/above which a proposal earns sizing_high_pct (below it,
 # sizing_mid_pct). Bounds [6, 10]. Omitted = 9, the original tiering.
 # sizing_high_conviction_min = 9
+# DISPLACEMENT (default OFF). When a HIGH-conviction proposal is rejected by
+# the KS-7 cash-reserve gate, deterministically evict the weakest qualifying
+# open position — trail NOT armed, held >= 5 trading days, not entered today,
+# unrealized gain < displacement_victim_max_gain_pct — and fund the new entry
+# from the sale proceeds (credited at the haircut; the sell always submits
+# before the buy). GRADUATED eligibility: conviction >= 9 ignores the gain
+# cutoff; armed positions are untouchable at every conviction. Hard cap in
+# code: max ONE displacement per trading day (not configurable).
+# displacement_enabled = true
+# displacement_min_conviction = 8        # bounds [6, 10]
+# displacement_proceeds_haircut = 0.90   # fraction of victim market value credited; (0, 1]
+# displacement_victim_max_gain_pct = 5.0 # base-tier victim gain cutoff (% vs cost)
 # Staged trail tightening (opt-in). As the position's high-water gain vs
 # entry (% of entry) crosses each gain_pct milestone, the effective trail
 # width becomes min(current width, trail_pct) — the trail only ever

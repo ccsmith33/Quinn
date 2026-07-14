@@ -132,6 +132,28 @@ class ExecutionConfig(_Section):
     # recur weekly via thesis_coordinator.HOLD_RESCHEDULE_DAYS. Default 7
     # = weekly first look.
     max_initial_review_days: int = Field(default=7, gt=0)
+    # DISPLACEMENT — when a HIGH-conviction proposal is rejected by the
+    # KS-7 cash path, deterministically evict the weakest qualifying open
+    # position (trail NOT armed, held >= 5 trading days, not entered
+    # today, unrealized gain below the cutoff) and fund the new entry
+    # from the same-open sale proceeds. Default OFF: with
+    # `displacement_enabled = false` behavior is byte-identical. Hard cap
+    # of ONE displacement per trading day is enforced in code (not
+    # configurable). See execution/displacement.py.
+    displacement_enabled: bool = Field(default=False)
+    # Only proposals at/above this conviction may displace. Same [6, 10]
+    # band as sizing_high_conviction_min so the knob can't reach into the
+    # mid tier.
+    displacement_min_conviction: int = Field(default=8, ge=6, le=10)
+    # Fraction of the victim's current market value credited as fundable
+    # cash when sizing the new entry (the haircut absorbs slippage between
+    # the sizing decision and the victim sale's fill).
+    displacement_proceeds_haircut: float = Field(default=0.90, gt=0.0, le=1.0)
+    # Victim gain cutoff (percent unrealized gain vs cost): positions
+    # at/above this are not evictable at the base tier. GRADUATED
+    # eligibility: proposals with conviction >= 9 ignore this cutoff —
+    # armed positions stay untouchable at every conviction.
+    displacement_victim_max_gain_pct: float = Field(default=5.0)
 
     @model_validator(mode="after")
     def _check_ks5_tiers_monotonic(self) -> ExecutionConfig:
