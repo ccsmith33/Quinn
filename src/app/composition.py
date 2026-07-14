@@ -288,6 +288,9 @@ def compose_agent(
         broker=broker,
         reviewer=thesis_reviewer,
         filings_lookup=make_journal_filings_lookup(journal.db_path),
+        # Jurisdiction zones: the first trail stage's gain_pct is the
+        # Zone-3 line the review context reports (default +20%).
+        trail_stages=config.execution.trail_stages,
     )
 
     # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — activation gate. Read once

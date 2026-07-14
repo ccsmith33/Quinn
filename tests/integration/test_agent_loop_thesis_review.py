@@ -2108,3 +2108,207 @@ async def test_boot_rearm_sweep_skips_closed_positions(
             (eid,),
         ).fetchone()[0]
     assert pending == 0
+
+
+# ---------------------------------------------------------------------------
+# Event-reviews doctrine: one-directional adjust_stop + zone-aware context
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_adjust_stop_raise_only_rejects_stop_below_current_stop(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """ONE-DIRECTIONAL review powers: a reviewer stop at/below the live
+    stop would LOOSEN protection (add risk). Reject with no broker
+    mutation; the original tighter stop stays live; retry rescheduled
+    +1d."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        sonnet_pv=sonnet_pv,
+        stop_loss_price=90.0,
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_stop_response(85.0), now,  # below the live stop at 90
+    )
+
+    await coordinator.run_tick()
+
+    assert broker.replaced == []
+    assert broker.submitted == []
+    assert broker.canceled == []
+    # Live stop row untouched (still the original 90 stop, still live).
+    stops = [
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "stop" and o.final_status is None
+    ]
+    assert len(stops) == 1
+    assert stops[0].stop_price == 90.0
+    follow_ups = _pending_schedules(db_path, eid, now)
+    assert len(follow_ups) == 1  # +1d retry
+
+
+class _CtxCapturingReviewer:
+    """Reviewer stub that records the ThesisReviewContext the coordinator
+    built (the zone/trigger fields under test) and holds."""
+
+    def __init__(self) -> None:
+        self.ctxs: list = []
+
+    async def review(self, ctx):  # noqa: ANN001, ANN202
+        from analyzer.thesis_review import ThesisHold
+
+        self.ctxs.append(ctx)
+        return ThesisHold(
+            rationale=(
+                "Catalyst still pending; no contradicting information since "
+                "entry. Holding the slot through the declared horizon."
+            )
+        )
+
+
+def _make_ctx_coordinator(
+    db_path: str, journal, broker, now: dt.datetime, **kwargs
+) -> tuple:
+    from app.thesis_coordinator import ThesisReviewCoordinator
+
+    reviewer = _CtxCapturingReviewer()
+    coordinator = ThesisReviewCoordinator(
+        journal=journal,
+        broker=broker,
+        reviewer=reviewer,  # type: ignore[arg-type]
+        filings_lookup=lambda *, issuer_ticker, since: "(no filings since entry)",
+        now_fn=lambda: now,
+        **kwargs,
+    )
+    return coordinator, reviewer
+
+
+@pytest.mark.asyncio
+async def test_review_context_zone1_for_calendar_review(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """A flat, un-armed position on a calendar review: zone 1, not
+    armed, HWM gain ~= current gain, trigger 'entry', no detail."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=105.0)
+    coordinator, reviewer = _make_ctx_coordinator(db_path, journal, broker, now)
+    await coordinator.run_tick()
+
+    assert len(reviewer.ctxs) == 1
+    ctx = reviewer.ctxs[0]
+    assert ctx.position_zone == 1
+    assert ctx.trail_armed is False
+    assert ctx.hwm_gain_pct == pytest.approx(5.0)
+    assert ctx.trigger_reason == "entry"
+    assert ctx.trigger_detail is None
+
+
+@pytest.mark.asyncio
+async def test_review_context_zone2_when_gain_in_arming_band(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Not armed, HWM gain >= +10% but below the Zone-3 line -> zone 2."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=112.0)
+    coordinator, reviewer = _make_ctx_coordinator(db_path, journal, broker, now)
+    await coordinator.run_tick()
+
+    ctx = reviewer.ctxs[0]
+    assert ctx.position_zone == 2
+    assert ctx.trail_armed is False
+    assert ctx.hwm_gain_pct == pytest.approx(12.0)
+
+
+@pytest.mark.asyncio
+async def test_review_context_zone3_armed_with_filing_trigger_detail(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """An armed position reviewed off a held-name-filing event: zone 3,
+    HWM from exit_policy_state (not the pulled-back quote), and the
+    triggering filing's form/accession in trigger_detail."""
+    from journal.exit_policy import ExitPolicyStateRow, upsert_exit_policy_state
+
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    upsert_exit_policy_state(
+        db_path,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=8.0,
+            trail_engaged=True,
+            high_water_mark=130.0,
+        ),
+    )
+    insert_thesis_review_schedule(
+        db_path,
+        ThesisReviewScheduleRow(
+            execution_id=eid,
+            due_at=now - dt.timedelta(minutes=5),
+            scheduled_reason="event:filing:thesis-acc-ACME",
+        ),
+    )
+
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    coordinator, reviewer = _make_ctx_coordinator(db_path, journal, broker, now)
+    await coordinator.run_tick()
+
+    assert len(reviewer.ctxs) == 1
+    ctx = reviewer.ctxs[0]
+    assert ctx.position_zone == 3
+    assert ctx.trail_armed is True
+    assert ctx.hwm_gain_pct == pytest.approx(30.0)  # HWM 130 vs fill 100
+    assert ctx.trigger_reason == "event:filing:thesis-acc-ACME"
+    assert "form=8-K" in ctx.trigger_detail
+    assert "thesis-acc-ACME" in ctx.trigger_detail
+
+
+@pytest.mark.asyncio
+async def test_review_context_zone3_line_from_first_trail_stage(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """With trail_stages configured, the first stage's gain_pct is the
+    Zone-3 line even when the trail hasn't armed (past first milestone
+    = the algorithm's jurisdiction)."""
+    from config.loader import TrailStage
+
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=116.0)
+    coordinator, reviewer = _make_ctx_coordinator(
+        db_path, journal, broker, now,
+        trail_stages=(TrailStage(gain_pct=15.0, trail_pct=8.0),),
+    )
+    await coordinator.run_tick()
+
+    ctx = reviewer.ctxs[0]
+    assert ctx.position_zone == 3  # +16% HWM gain >= first stage's 15%
+    assert ctx.trail_armed is False

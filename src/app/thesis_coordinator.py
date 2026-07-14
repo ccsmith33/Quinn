@@ -28,11 +28,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
 from broker.protocol import BrokerAdapter, OrderRequest
-from journal.exit_policy import set_stop_order_journal_id
+from config.loader import TrailStage
+from journal.exit_policy import get_exit_policy_state, set_stop_order_journal_id
 from journal.models import (
     OrderRow,
     ThesisReviewScheduleRow,
@@ -63,6 +64,27 @@ log = get_logger(__name__)
 
 # Default cadence for follow-up reviews after a `hold`. Per task spec.
 HOLD_RESCHEDULE_DAYS = 7
+
+# Jurisdiction zones (event-reviews doctrine). Zone 1: not yet
+# trail-armed — the reviewer's judgment is primary. Zone 3: armed and/or
+# HWM gain past the first trail-stage milestone (or +20% when no stages
+# are configured) — the staged-trail ALGORITHM is primary and the
+# reviewer may act only on a cited new-information event. Zone 2 is the
+# transitional band: not armed but HWM gain at/above the +10% arming
+# vicinity.
+_ZONE2_GAIN_PCT = 10.0
+_DEFAULT_ZONE3_GAIN_PCT = 20.0
+
+
+def compute_position_zone(
+    *, trail_armed: bool, hwm_gain_pct: float, zone3_gain_pct: float
+) -> int:
+    """Map (armed, HWM gain) onto the 1/2/3 jurisdiction zones."""
+    if trail_armed or hwm_gain_pct >= zone3_gain_pct:
+        return 3
+    if hwm_gain_pct >= _ZONE2_GAIN_PCT:
+        return 2
+    return 1
 
 # Broker order statuses that mean the order can no longer fill — the
 # §3.3 step-5 fallback re-places protection only when the PATCH target
@@ -188,6 +210,9 @@ class ThesisReviewCoordinator:
         # D-079 §3.4 belt-and-suspenders: a raised TP must not drop the
         # position's R:R below the §3.2 floor against the current stop.
         min_reward_risk: float = 1.5,
+        # Jurisdiction zones: the first stage's gain_pct is the Zone-3
+        # line (falls back to +20% when no stages are configured).
+        trail_stages: Sequence[TrailStage] = (),
         # WS1 §7.4 ports — see the module-level defaults above.
         get_live_protective_order: (
             Callable[..., OrderRow | None] | None
@@ -201,6 +226,9 @@ class ThesisReviewCoordinator:
         self._now_fn = now_fn
         self._default_horizon_days = default_horizon_days
         self._min_reward_risk = min_reward_risk
+        self._zone3_gain_pct = (
+            trail_stages[0].gain_pct if trail_stages else _DEFAULT_ZONE3_GAIN_PCT
+        )
         self._get_live_protective_order = get_live_protective_order or (
             lambda *, execution_id, roles: _default_get_live_protective_order(
                 self._journal.db_path, execution_id=execution_id, roles=roles
@@ -493,10 +521,12 @@ class ThesisReviewCoordinator:
           3. Failure → §3.3 step-5 fallback: branch on what actually
              happened to the PATCH target (`_adjust_stop_fallback`).
 
-        Direction: the stop may move either way (tighten a loser or
-        widen within validator-equivalent geometry) but never to/above
-        the current price for a long — that is a `close` wearing an
-        adjust_stop costume, and it would fire on the next tick.
+        Direction: RAISE-ONLY (event-reviews doctrine — one-directional
+        review powers). The new stop must sit strictly ABOVE the live
+        stop (never loosen protection / add risk) and strictly BELOW
+        the current price for a long — a stop at/above the price is a
+        `close` wearing an adjust_stop costume, and it would fire on
+        the next tick.
         """
         orders = get_orders_for_execution(self._journal.db_path, execution_id)
         entry = next((o for o in orders if o.role == "entry"), None)
@@ -546,6 +576,30 @@ class ThesisReviewCoordinator:
                     "new_stop_price": new_stop_price,
                     "current_price": current_price,
                     "reason": "stop_not_below_current_price",
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="adjust_stop"
+            )
+            return
+
+        # ONE-DIRECTIONAL review powers (event-reviews doctrine): the
+        # reviewer may only RAISE a stop. A new stop at/below the live
+        # stop would loosen protection — that is added risk, which no
+        # review outcome is allowed to create. Reject and retry
+        # tomorrow (the position keeps its current, tighter stop).
+        if (
+            old_stop.stop_price is not None
+            and new_stop_price <= old_stop.stop_price
+        ):
+            log.warning(
+                "thesis_coordinator.adjust_stop_rejected",
+                extra={
+                    "event": "thesis_coordinator.adjust_stop_rejected",
+                    "execution_id": execution_id,
+                    "new_stop_price": new_stop_price,
+                    "current_stop_price": old_stop.stop_price,
+                    "reason": "raise_only_stop_not_above_current_stop",
                 },
             )
             self._reschedule(
@@ -1121,6 +1175,28 @@ class ThesisReviewCoordinator:
         except Exception as e:  # noqa: BLE001
             raise _BuildContextError(f"proposal payload invalid: {e}") from e
 
+        # Zone-aware state (event-reviews doctrine): armed status + HWM
+        # from the trailing ratchet's operational memory. A position with
+        # no exit_policy_state row simply hasn't engaged the trail — the
+        # current price is the best available high-water proxy.
+        state = get_exit_policy_state(
+            self._journal.db_path, execution_id=execution.id
+        )
+        trail_armed = bool(state.trail_engaged) if state is not None else False
+        hwm = (
+            max(state.high_water_mark, current_price)
+            if state is not None
+            else current_price
+        )
+        hwm_gain_pct = (
+            (hwm - fill_price) / fill_price * 100.0 if fill_price else 0.0
+        )
+        zone = compute_position_zone(
+            trail_armed=trail_armed,
+            hwm_gain_pct=hwm_gain_pct,
+            zone3_gain_pct=self._zone3_gain_pct,
+        )
+
         return ThesisReviewContext(
             proposal=proposal,
             execution_id=execution.id,
@@ -1134,7 +1210,43 @@ class ThesisReviewCoordinator:
             stop_loss_price=trade.stop_loss_price,
             take_profit_price=trade.take_profit_price,
             filings_since_entry_summary=filings_summary,
+            position_zone=zone,
+            trail_armed=trail_armed,
+            hwm_gain_pct=hwm_gain_pct,
+            trigger_reason=schedule.scheduled_reason,
+            trigger_detail=self._trigger_detail(schedule.scheduled_reason),
         )
+
+    def _trigger_detail(self, reason: str) -> str | None:
+        """Human-readable evidence line for event-triggered reviews —
+        the filing's form/accession or the news headline the reviewer
+        must weigh (and cite when acting at altitude). Calendar reasons
+        ('entry', 'hold', ...) carry no detail."""
+        if reason.startswith("event:filing:"):
+            accession = reason.split(":", 2)[2]
+            with connect(self._journal.db_path) as conn:
+                row = conn.execute(
+                    "SELECT form_type, filed_at, item_codes FROM filings "
+                    "WHERE accession_number = ? LIMIT 1",
+                    (accession,),
+                ).fetchone()
+            if row is None:
+                return f"filing {accession} (not found in journal)"
+            return (
+                f"filing form={row['form_type']} acc={accession} "
+                f"items={row['item_codes'] or '[]'} filed_at={row['filed_at']}"
+            )
+        if reason.startswith("event:news:"):
+            # event:news:<article_id>:<headline (truncated)>
+            parts = reason.split(":", 3)
+            headline = parts[3] if len(parts) > 3 else ""
+            return f"news headline: {headline}" if headline else "news headline"
+        if reason.startswith("event:gain_cross:"):
+            threshold = reason.split(":", 2)[2]
+            return f"high-water gain crossed +{threshold}%"
+        if reason == "event:anomaly":
+            return "intraday price anomaly vs previous close"
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1223,5 +1335,6 @@ def make_journal_filings_lookup(db_path: str) -> _FilingsLookup:
 __all__ = [
     "HOLD_RESCHEDULE_DAYS",
     "ThesisReviewCoordinator",
+    "compute_position_zone",
     "make_journal_filings_lookup",
 ]

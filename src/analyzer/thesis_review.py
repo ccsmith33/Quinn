@@ -107,6 +107,11 @@ class _PromptBuilderPort(Protocol):
         stop_loss_price: float,
         take_profit_price: float | None,
         filings_since_entry_summary: str,
+        position_zone: int | None = None,
+        trail_armed: bool | None = None,
+        hwm_gain_pct: float | None = None,
+        trigger_reason: str | None = None,
+        trigger_detail: str | None = None,
     ) -> ApiRequest: ...
 
 
@@ -131,6 +136,18 @@ class ThesisReviewContext:
     stop_loss_price: float
     take_profit_price: float | None
     filings_since_entry_summary: str
+    # Zone-aware review context (event-reviews doctrine). Populated by
+    # the coordinator for every review — calendar AND event — so the
+    # prompt's jurisdiction-zones section has the state it governs by.
+    # Defaults keep legacy construction sites valid.
+    position_zone: int | None = None
+    trail_armed: bool | None = None
+    hwm_gain_pct: float | None = None
+    # The schedule row's scheduled_reason verbatim ('entry', 'hold',
+    # 'event:filing:...', ...) plus a human-readable detail line for
+    # event triggers (filing form/accession, headline text).
+    trigger_reason: str | None = None
+    trigger_detail: str | None = None
 
 
 class ThesisReviewer:
@@ -164,6 +181,11 @@ class ThesisReviewer:
             stop_loss_price=ctx.stop_loss_price,
             take_profit_price=ctx.take_profit_price,
             filings_since_entry_summary=ctx.filings_since_entry_summary,
+            position_zone=ctx.position_zone,
+            trail_armed=ctx.trail_armed,
+            hwm_gain_pct=ctx.hwm_gain_pct,
+            trigger_reason=ctx.trigger_reason,
+            trigger_detail=ctx.trigger_detail,
         )
         # Build a unique decision_id per thesis-review schedule so llm_calls
         # rows stay distinct from proposal-review rows for the same proposal.

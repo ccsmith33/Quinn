@@ -208,13 +208,23 @@ class PromptBuilder:
         stop_loss_price: float,
         take_profit_price: float | None,
         filings_since_entry_summary: str,
+        position_zone: int | None = None,
+        trail_armed: bool | None = None,
+        hwm_gain_pct: float | None = None,
+        trigger_reason: str | None = None,
+        trigger_detail: str | None = None,
     ) -> ApiRequest:
         """Feature A — compose the Opus thesis-review request for an open
-        position whose horizon has elapsed.
+        position whose horizon has elapsed (or an event trigger fired).
 
         The block-2 context is per-execution (not daily-stable) — Opus's
         cache-hit on these calls is limited to block 1 (role + rules +
         schema). Same trade-off as `opus_proposal_review_v1`.
+
+        The zone/trigger keywords render the "Position state and
+        jurisdiction" block the prompt's jurisdiction-zones doctrine
+        governs by. They default to None so legacy call sites keep the
+        pre-doctrine payload shape byte-identical.
         """
         ctx_summary = (
             f"# Thesis-review context\n"
@@ -242,6 +252,18 @@ class PromptBuilder:
             f"days_held_since_entry: {days_held}\n"
             f"current_price: {current_price:.2f}\n"
             f"pct_change_since_entry: {pct_change_since_entry:+.2%}\n"
+        )
+        if position_zone is not None:
+            block3 += self._position_state_block(
+                position_zone=position_zone,
+                trail_armed=trail_armed,
+                hwm_gain_pct=hwm_gain_pct,
+                pct_change_since_entry=pct_change_since_entry,
+                days_held=days_held,
+                trigger_reason=trigger_reason,
+                trigger_detail=trigger_detail,
+            )
+        block3 += (
             f"---\n"
             f"# Filings since entry (for {proposal.symbol})\n"
             f"{filings_since_entry_summary}\n"
@@ -251,6 +273,49 @@ class PromptBuilder:
             block2_text=ctx_summary,
             block3_text=block3,
         )
+
+    @staticmethod
+    def _position_state_block(
+        *,
+        position_zone: int,
+        trail_armed: bool | None,
+        hwm_gain_pct: float | None,
+        pct_change_since_entry: float,
+        days_held: int,
+        trigger_reason: str | None,
+        trigger_detail: str | None,
+    ) -> str:
+        """The structured zone/trigger block every thesis review carries
+        (calendar AND event) — the inputs the prompt's jurisdiction-zones
+        doctrine governs by, plus the strategy's own base rates."""
+        armed = "unknown" if trail_armed is None else str(trail_armed).lower()
+        hwm = (
+            "unknown"
+            if hwm_gain_pct is None
+            else f"{hwm_gain_pct:+.2f}%"
+        )
+        out = (
+            f"---\n"
+            f"# Position state and jurisdiction\n"
+            f"position_zone: {position_zone}\n"
+            f"trail_armed: {armed}\n"
+            f"hwm_gain_pct: {hwm}\n"
+            f"current_gain_pct: {pct_change_since_entry:+.2%}\n"
+            f"days_held: {days_held}\n"
+            f"review_trigger: {trigger_reason or 'unknown'}\n"
+        )
+        if trigger_detail:
+            out += f"trigger_detail: {trigger_detail}\n"
+        out += (
+            "---\n"
+            "# Base rates (measured on this strategy's own book)\n"
+            "- P(reach +50% | reached +30%) ~= 54%\n"
+            "- P(double | reached +50%) ~= 38%\n"
+            "- Harvest-early policies scored WORST when replayed against "
+            "our own book: cutting winners at intermediate gains gave up "
+            "more than it protected.\n"
+        )
+        return out
 
     # -- internals ----------------------------------------------------------
 

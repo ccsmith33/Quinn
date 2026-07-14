@@ -450,3 +450,101 @@ def test_filing_body_under_cap_emits_no_truncation_log(
         if getattr(r, "event", None) == "filing_body_truncated_at_cap"
     ]
     assert not matching
+
+
+# ---------------------------------------------------------------------------
+# Event-reviews doctrine: zone-aware thesis-review context
+# ---------------------------------------------------------------------------
+
+
+def _thesis_review_kwargs(**overrides: object) -> dict:
+    base: dict = dict(
+        proposal=_proposal(),
+        execution_id=7,
+        days_held=12,
+        current_price=118.0,
+        pct_change_since_entry=0.18,
+        realized_fill_price=100.0,
+        realized_dollar_size=10_000.0,
+        time_horizon_days=14,
+        stop_loss_price=95.0,
+        take_profit_price=150.0,
+        filings_since_entry_summary="(no filings since entry)",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_build_opus_thesis_review_renders_zone_block_and_base_rates() -> None:
+    """Every review (calendar AND event) carries the structured position
+    state block: zone, armed status, HWM gain, current gain, days held,
+    trigger reason (+ detail), and the hardcoded base-rates block."""
+    pdir = Path(__file__).resolve().parent.parent.parent / "src" / "prompts"
+    builder = PromptBuilder(pdir)
+    req = builder.build_opus_thesis_review(
+        **_thesis_review_kwargs(
+            position_zone=3,
+            trail_armed=True,
+            hwm_gain_pct=31.5,
+            trigger_reason="event:filing:0001234567-26-000001",
+            trigger_detail="filing form=8-K acc=0001234567-26-000001",
+        )
+    )
+    user_text = "".join(c.text for m in req.messages for c in m.content)
+    assert "# Position state and jurisdiction" in user_text
+    assert "position_zone: 3" in user_text
+    assert "trail_armed: true" in user_text
+    assert "hwm_gain_pct: +31.50%" in user_text
+    assert "current_gain_pct: +18.00%" in user_text
+    assert "days_held: 12" in user_text
+    assert "review_trigger: event:filing:0001234567-26-000001" in user_text
+    assert "trigger_detail: filing form=8-K" in user_text
+    assert "# Base rates (measured on this strategy's own book)" in user_text
+    assert "P(reach +50% | reached +30%) ~= 54%" in user_text
+    assert "P(double | reached +50%) ~= 38%" in user_text
+    assert "Harvest-early policies scored WORST" in user_text
+
+
+def test_build_opus_thesis_review_zone1_calendar_shape() -> None:
+    """A calendar review renders the block too (zone 1, trigger 'entry',
+    no detail line when none applies)."""
+    pdir = Path(__file__).resolve().parent.parent.parent / "src" / "prompts"
+    builder = PromptBuilder(pdir)
+    req = builder.build_opus_thesis_review(
+        **_thesis_review_kwargs(
+            position_zone=1,
+            trail_armed=False,
+            hwm_gain_pct=4.0,
+            trigger_reason="entry",
+            trigger_detail=None,
+        )
+    )
+    user_text = "".join(c.text for m in req.messages for c in m.content)
+    assert "position_zone: 1" in user_text
+    assert "trail_armed: false" in user_text
+    assert "review_trigger: entry" in user_text
+    assert "trigger_detail:" not in user_text
+
+
+def test_build_opus_thesis_review_legacy_shape_unchanged_without_zone() -> None:
+    """Callers that pass no zone kwargs (legacy shape) get the
+    pre-doctrine payload — no jurisdiction or base-rates block."""
+    pdir = Path(__file__).resolve().parent.parent.parent / "src" / "prompts"
+    builder = PromptBuilder(pdir)
+    req = builder.build_opus_thesis_review(**_thesis_review_kwargs())
+    user_text = "".join(c.text for m in req.messages for c in m.content)
+    assert "# Position state and jurisdiction" not in user_text
+    assert "# Base rates" not in user_text
+
+
+def test_thesis_review_v2_prompt_carries_jurisdiction_doctrine() -> None:
+    """The active thesis-review prompt states the zone doctrine: Zone 1
+    judgment-primary, Zone 3 algorithm-primary with information events
+    required (and price-shape reasoning banned), one-directional powers."""
+    pdir = Path(__file__).resolve().parent.parent.parent / "src" / "prompts"
+    text = (pdir / "opus_thesis_review_v2.txt").read_text(encoding="utf-8")
+    assert "# Jurisdiction zones" in text
+    assert "NEW INFORMATION" in text
+    assert "looks toppy" in text  # the ban is stated explicitly
+    assert "ONE-DIRECTIONAL" in text
+    assert "Information events pierce this exemption" in text
