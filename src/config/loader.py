@@ -112,6 +112,13 @@ class ExecutionConfig(_Section):
     # D-079 §3.2 — exit-geometry floor: minimum reward:risk a proposal
     # with a take-profit must clear. Tunable when H3 prod data lands.
     min_reward_risk: float = Field(default=1.5, gt=0.0)
+    # Trade-time hard price floor (FR-8 / ADR-006 §3). The daily universe
+    # snapshot screens on previous-close >= $5; this is the re-check at
+    # submission time. Configurable since 2026-07-17: a $946M-cap
+    # conviction-8 (ABUS at $4.79) was rejected for dipping cents under
+    # $5 intraday after passing the >=$5 universe screen. Default
+    # preserves behavior exactly.
+    price_floor_usd: float = Field(default=5.0, gt=0.0)
     # D-079 §3.5 / ADR-011 — trailing ratchet: engage once the winner has
     # earned `trail_activation_r` multiples of its initial risk distance;
     # raise the broker stop only when the new target clears the current

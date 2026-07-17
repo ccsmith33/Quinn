@@ -221,6 +221,71 @@ def test_price_floor_rejects_on_last_below_5() -> None:
     assert result.reason == "price_floor"
 
 
+def test_price_floor_configurable_accepts_abus_at_4_79() -> None:
+    """2026-07-17 incident: ABUS ($946M cap, conviction 8) at $4.79 was
+    rejected for dipping cents under $5 intraday after passing the >=$5
+    universe screen. With `price_floor_usd=4.50` wired from config the
+    same quote clears the floor (and proceeds to the capital check)."""
+    broker = _RecordingBroker(
+        quote=_quote(bid=4.78, ask=4.80, last=4.79),
+        account=_account(),
+    )
+    universe = _FakeUniverse({"ABUS"})
+    ks = _FakeKillSwitch()
+    validator = ProposalValidator(price_floor_usd=4.50)
+
+    result = validator.validate(
+        _proposal(symbol="ABUS", stop_loss_price=4.30),
+        broker, universe, ks, _FakeJournal(),
+    )
+
+    assert isinstance(result, Accepted)
+
+
+def test_price_floor_default_still_rejects_4_79_regression() -> None:
+    """Default-preserving regression: an unconfigured validator keeps
+    the exact $5.00 floor — the same ABUS quote is still rejected."""
+    broker = _RecordingBroker(
+        quote=_quote(bid=4.78, ask=4.80, last=4.79),
+        account=_account(),
+    )
+    universe = _FakeUniverse({"ABUS"})
+    ks = _FakeKillSwitch()
+    validator = ProposalValidator()
+
+    result = validator.validate(
+        _proposal(symbol="ABUS", stop_loss_price=4.30),
+        broker, universe, ks, _FakeJournal(),
+    )
+
+    assert isinstance(result, Rejected)
+    assert result.reason == "price_floor"
+
+
+def test_price_floor_config_field_default_and_parse() -> None:
+    """`[execution] price_floor_usd` parses from config and defaults to
+    5.0 when omitted (behavior-preserving)."""
+    from pydantic import ValidationError
+
+    from config.loader import ExecutionConfig
+
+    base = {
+        "broker_mode": "paper",
+        "ks4_pct_cap": 0.20,
+        "ks4_absolute_cap_usd": 1000.0,
+        "ks5_max_concurrent": 3,
+        "ks7_cash_reserve_pct": 0.05,
+        "sizing_mid_pct": 0.05,
+        "sizing_high_pct": 0.10,
+    }
+    assert ExecutionConfig(**base).price_floor_usd == 5.0
+    assert (
+        ExecutionConfig(**base, price_floor_usd=4.5).price_floor_usd == 4.5
+    )
+    with pytest.raises(ValidationError):
+        ExecutionConfig(**base, price_floor_usd=0.0)  # gt=0 enforced
+
+
 def test_price_floor_accepts_at_5_exactly() -> None:
     """Boundary: bid == $5.00 and last == $5.00 → not rejected by price_floor."""
     broker = _RecordingBroker(

@@ -52,6 +52,12 @@ ks7_cash_reserve_pct = 0.03
 # Revisit before live.
 sizing_mid_pct = 0.07
 sizing_high_pct = 0.10
+# Trade-time hard price floor in USD (FR-8 / ADR-006 §3). The universe
+# screens on previous-close >= $5; this is the re-check at submission.
+# Omitted = 5.0 (unchanged behavior). Lower slightly (e.g. 4.50) to stop
+# rejecting names that dip cents under $5 intraday after passing the
+# universe screen (2026-07-17: ABUS at $4.79, $946M cap, conviction 8).
+# price_floor_usd = 5.0
 # Conviction at/above which a proposal earns sizing_high_pct (below it,
 # sizing_mid_pct). Bounds [6, 10]. Omitted = 9, the original tiering.
 # sizing_high_conviction_min = 9

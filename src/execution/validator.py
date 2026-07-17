@@ -57,7 +57,10 @@ RejectReason = Literal[
 
 # Trade-time price floor (FR-8 / ADR-006 §3): the daily snapshot enforces
 # previous-close ≥ $5.00; this re-check covers names that fell below the
-# floor between snapshot and order submission.
+# floor between snapshot and order submission. Default only — the live
+# value is `[execution] price_floor_usd` (config), wired at composition
+# (2026-07-17: ABUS at $4.79 was rejected for dipping cents under $5
+# intraday after passing the ≥$5 universe screen).
 _PRICE_FLOOR_USD = 5.00
 
 
@@ -109,10 +112,19 @@ class ProposalValidator:
     `min_reward_risk` (D-079 §3.2, default 1.5): the exit-geometry floor.
     Wired from `config.execution.min_reward_risk` at composition; tunable
     when the H3 prod-data verdict lands (D-080).
+
+    `price_floor_usd` (default 5.0): the trade-time hard price floor.
+    Wired from `config.execution.price_floor_usd` at composition.
     """
 
-    def __init__(self, *, min_reward_risk: float = 1.5) -> None:
+    def __init__(
+        self,
+        *,
+        min_reward_risk: float = 1.5,
+        price_floor_usd: float = _PRICE_FLOOR_USD,
+    ) -> None:
         self._min_reward_risk = min_reward_risk
+        self._price_floor_usd = price_floor_usd
 
     def validate(
         self,
@@ -162,11 +174,12 @@ class ProposalValidator:
             return self._reject(proposal, "universe")
 
         # 5. Trade-time price floor (FR-8 / ADR-006 §3). Reject if the
-        #    current bid OR last has fallen below $5.00 since the daily
-        #    snapshot. We require BOTH bid and last to be ≥ $5 because a
-        #    crossed quote with bid < 5 still represents executable risk.
+        #    current bid OR last has fallen below the configured floor
+        #    since the daily snapshot. We require BOTH bid and last to be
+        #    at/above the floor because a crossed quote with bid below it
+        #    still represents executable risk.
         quote: Quote = broker.get_quote(proposal.symbol)
-        if quote.bid < _PRICE_FLOOR_USD or quote.last < _PRICE_FLOOR_USD:
+        if quote.bid < self._price_floor_usd or quote.last < self._price_floor_usd:
             return self._reject(proposal, "price_floor")
 
         # 5.5 Exit-geometry floor (D-079 §3.2, kills S-4's unconstrained

@@ -241,9 +241,11 @@ def compose_agent(
     )
 
     # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.
-    # D-079 §3.2: exit-geometry floor wired from config.
+    # D-079 §3.2: exit-geometry floor wired from config; trade-time
+    # price floor likewise (2026-07-17, ABUS-at-$4.79 incident).
     validator = ProposalValidator(
         min_reward_risk=config.execution.min_reward_risk,
+        price_floor_usd=config.execution.price_floor_usd,
     )
     sizer = SizingEngine()
     submitter = OrderSubmitter()
