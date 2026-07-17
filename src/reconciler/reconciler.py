@@ -822,8 +822,10 @@ class Reconciler:
                     f"NAKED POSITION: {pos.symbol} qty {pos.qty} "
                     f"(mv ${pos.market_value:.2f}) has ZERO live "
                     f"protective sell orders at the broker. Protection "
-                    f"was lost by an order-surgery path — place a stop "
-                    f"at the broker now and check the journal."
+                    f"was lost by an order-surgery path. The exit-policy "
+                    f"self-heal places a fresh stop this same tick "
+                    f"(exit_policy.stop_selfhealed) — verify it at the "
+                    f"broker; if none appears, place one manually."
                 )
 
     @staticmethod

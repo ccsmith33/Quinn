@@ -165,6 +165,7 @@ class ExitPolicyTicker:
         self._cancel_stale_entries()
         self._ratchet_trailing_stops()
         self._heal_engaged_without_live_stop()
+        self._heal_naked_positions_without_state()
 
     # ------------------------------------------------------------------
     # §3.6 — stale-entry hygiene
@@ -271,6 +272,18 @@ class ExitPolicyTicker:
         if state is None:
             geometry = self._initial_geometry(execution_id)
             if geometry is None:
+                # Silent-skip is the FEIM-37 bug class: any arming skip
+                # must say why. (This position still has its live stop —
+                # the skip only means the trail cannot engage.)
+                log.warning(
+                    "exit_policy.engagement_skipped",
+                    extra={
+                        "event": "exit_policy.engagement_skipped",
+                        "execution_id": execution_id,
+                        "symbol": symbol,
+                        "reason": "no_entry_geometry",
+                    },
+                )
                 return
             entry_price, initial_risk, trail_pct = geometry
             # Engage when the winner has earned `activation_r` multiples
@@ -561,7 +574,210 @@ class ExitPolicyTicker:
             old_row_id=None,
             old_disposition=None,
             old_broker_order_id=None,
+            mode="rearmed_engaged",
         )
+
+    def _heal_naked_positions_without_state(self) -> None:
+        """Stateless arm (FEIM follow-up, execution 37): a position can
+        be naked with NO `exit_policy_state` row at all — its stop was
+        canceled by order surgery BEFORE the trail ever engaged, and the
+        engagement scan only iterates live journaled stops, so it
+        silently never armed. Broker truth drives this arm (the same
+        condition the naked tripwire detects): every open broker
+        position with ZERO live sell orders at the broker gets a fresh
+        GTC stop immediately —
+
+          - gain past the activation threshold → engage PROPERLY: place
+            a trailing stop at the staged/computed floor and create the
+            state row with HWM initialized from the current price
+            (mode=engaged_fresh);
+          - otherwise → restore the position's ORIGINAL entry-time stop
+            price from the journal (mode=restored_original).
+
+        Every skip logs WARN with a reason — silent-skip is the bug
+        class this arm exists to kill. Legacy brokers/fakes without the
+        get_positions/get_open_orders surface leave the arm inert."""
+        get_positions = getattr(self._broker, "get_positions", None)
+        get_open_orders = getattr(self._broker, "get_open_orders", None)
+        if get_positions is None or get_open_orders is None:
+            return
+        try:
+            open_positions = [p for p in get_positions() if p.qty > 0]
+            if not open_positions:
+                return
+            open_orders = get_open_orders()
+        except Exception as e:  # noqa: BLE001 — broker read failed; next tick
+            log.warning(
+                "exit_policy.selfheal_broker_read_failed",
+                extra={
+                    "event": "exit_policy.selfheal_broker_read_failed",
+                    "error": str(e),
+                    "error_class": type(e).__name__,
+                },
+            )
+            return
+        sell_covered = {o.symbol for o in open_orders if o.side == "sell"}
+        for pos in open_positions:
+            if pos.symbol in sell_covered:
+                continue
+            try:
+                self._heal_one_stateless(pos)
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "exit_policy.selfheal_error",
+                    extra={
+                        "event": "exit_policy.selfheal_error",
+                        "symbol": pos.symbol,
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
+
+    def _heal_one_stateless(self, pos: Any) -> None:
+        execution_id = self._latest_accepted_execution_id(pos.symbol)
+        if execution_id is None:
+            log.warning(
+                "exit_policy.selfheal_skipped",
+                extra={
+                    "event": "exit_policy.selfheal_skipped",
+                    "symbol": pos.symbol,
+                    "reason": "no_journal_lineage",
+                },
+            )
+            return
+        if get_exit_policy_state(
+            self._journal.db_path, execution_id=execution_id
+        ) is not None:
+            # The engaged-state arm owns this execution (it ran earlier
+            # this tick); if it declined, its own logs say why. A
+            # duplicate stop from this arm would double-sell.
+            return
+        # A live journaled sell of ANY role (protective leg, thesis
+        # close, displacement close) holds or is about to consume the
+        # shares — placing a stop beside it would double-sell. The
+        # broker check above normally catches this; the journal check
+        # covers the submit-vs-open-orders visibility race.
+        with connect(self._journal.db_path) as conn:
+            live_sell = conn.execute(
+                "SELECT 1 FROM orders WHERE execution_id = ? "
+                "AND side = 'sell' AND final_status IS NULL LIMIT 1",
+                (execution_id,),
+            ).fetchone()
+        if live_sell is not None:
+            log.warning(
+                "exit_policy.selfheal_skipped",
+                extra={
+                    "event": "exit_policy.selfheal_skipped",
+                    "symbol": pos.symbol,
+                    "execution_id": execution_id,
+                    "reason": "live_journal_sell_not_at_broker",
+                },
+            )
+            return
+        geometry = self._initial_geometry(execution_id)
+        if geometry is None:
+            log.warning(
+                "exit_policy.selfheal_skipped",
+                extra={
+                    "event": "exit_policy.selfheal_skipped",
+                    "symbol": pos.symbol,
+                    "execution_id": execution_id,
+                    "reason": "no_entry_geometry",
+                },
+            )
+            return
+        entry_price, initial_risk, trail_pct = geometry
+        quote = self._broker.get_quote(pos.symbol)
+        last = float(quote.last)
+
+        log.warning(
+            "exit_policy.naked_trail_detected",
+            extra={
+                "event": "exit_policy.naked_trail_detected",
+                "execution_id": execution_id,
+                "symbol": pos.symbol,
+                "qty": pos.qty,
+                "last": last,
+                "stateless": True,
+            },
+        )
+
+        if last >= entry_price + self._activation_r * initial_risk:
+            # Gain supports engagement — arm properly: trailing stop at
+            # the staged/computed floor, state row with HWM = current
+            # price. Arming does NOT require a pre-existing live stop
+            # leg (the FEIM-37 silent-skip).
+            effective_pct, _ = self._staged_trail_pct(
+                trail_pct, entry_price=entry_price, high_water=last
+            )
+            target = round(last * (1.0 - effective_pct / 100.0), 2)
+            new_row_id = self._place_fresh_stop(
+                execution_id=execution_id,
+                symbol=pos.symbol,
+                qty=pos.qty,
+                target=target,
+                last=last,
+                old_row_id=None,
+                old_disposition=None,
+                old_broker_order_id=None,
+                mode="engaged_fresh",
+            )
+            if new_row_id is not None:
+                upsert_exit_policy_state(
+                    self._journal.db_path,
+                    ExitPolicyStateRow(
+                        execution_id=execution_id,
+                        symbol=pos.symbol,
+                        trail_distance_pct=trail_pct,
+                        trail_engaged=True,
+                        high_water_mark=last,
+                        stop_order_journal_id=new_row_id,
+                    ),
+                )
+            return
+
+        # Below activation — restore the ORIGINAL entry-time stop level
+        # (entry_price − initial_risk is exactly the earliest journaled
+        # stop's price; `_initial_geometry` derived it from that row).
+        original_stop = round(entry_price - initial_risk, 4)
+        if original_stop <= 0:
+            log.warning(
+                "exit_policy.selfheal_skipped",
+                extra={
+                    "event": "exit_policy.selfheal_skipped",
+                    "symbol": pos.symbol,
+                    "execution_id": execution_id,
+                    "reason": "invalid_original_stop",
+                },
+            )
+            return
+        self._place_fresh_stop(
+            execution_id=execution_id,
+            symbol=pos.symbol,
+            qty=pos.qty,
+            target=original_stop,
+            last=last,
+            old_row_id=None,
+            old_disposition=None,
+            old_broker_order_id=None,
+            mode="restored_original",
+            role="stop",
+        )
+
+    def _latest_accepted_execution_id(self, symbol: str) -> int | None:
+        """Newest accepted execution for a held symbol — the same
+        journal-lineage resolution displacement and the boot re-arm
+        sweep use (broker truth says the position is open; the newest
+        accepted execution is the entry that opened it)."""
+        with connect(self._journal.db_path) as conn:
+            row = conn.execute(
+                "SELECT e.id AS execution_id FROM executions e "
+                "JOIN proposals p ON p.id = e.proposal_id "
+                "WHERE e.decision = 'accepted' AND p.symbol = ? "
+                "ORDER BY e.id DESC LIMIT 1",
+                (symbol,),
+            ).fetchone()
+        return int(row["execution_id"]) if row is not None else None
 
     def _place_fresh_stop(
         self,
@@ -574,12 +790,15 @@ class ExitPolicyTicker:
         old_row_id: int | None,
         old_disposition: str | None,
         old_broker_order_id: str | None,
-    ) -> None:
-        """Submit a fresh GTC stop at the trail's computed floor (clamped
-        below the current quote so an in-the-money stop doesn't get
-        rejected), journal it, complete the dead row (when known), and
-        rotate the ratchet's pointer. Loud by design — this only runs
-        when a trail-armed position lost its broker-side protection."""
+        mode: str = "replaced_dead",
+        role: str = "trailing_stop",
+    ) -> int | None:
+        """Submit a fresh GTC stop at the computed price (clamped below
+        the current quote so an in-the-money stop doesn't get rejected),
+        journal it, complete the dead row (when known), and rotate the
+        ratchet's pointer. Loud by design — this only runs when an open
+        position lost (or never had) broker-side protection. Returns the
+        new journal row id, or None when the submit failed."""
         stop_price = target if target < last else round(
             last * (1.0 - self._min_step_pct / 100.0), 2
         )
@@ -605,15 +824,16 @@ class ExitPolicyTicker:
                     "execution_id": execution_id,
                     "symbol": symbol,
                     "stop_price": stop_price,
+                    "mode": mode,
                     "error": str(e),
                 },
             )
-            return
+            return None
         new_row_id = insert_order(
             self._journal.db_path,
             OrderRow(
                 execution_id=execution_id,
-                role="trailing_stop",
+                role=role,
                 symbol=symbol,
                 side="sell",
                 order_type="stop",
@@ -624,12 +844,12 @@ class ExitPolicyTicker:
                 submitted_at=resp.submitted_at,
                 final_status=None,
                 notes=(
-                    "trail_selfheal fresh stop"
+                    f"trail_selfheal fresh stop mode={mode}"
                     + (
                         f" replacing dead {old_broker_order_id} "
                         f"({old_disposition})"
                         if old_broker_order_id is not None
-                        else " (no live stop for engaged trail)"
+                        else ""
                     )
                 ),
             ),
@@ -654,10 +874,12 @@ class ExitPolicyTicker:
                 "execution_id": execution_id,
                 "symbol": symbol,
                 "stop_price": stop_price,
+                "mode": mode,
                 "broker_order_id": resp.broker_order_id,
                 "replaced_dead_broker_order_id": old_broker_order_id,
             },
         )
+        return new_row_id
 
     def _initial_geometry(
         self, execution_id: int

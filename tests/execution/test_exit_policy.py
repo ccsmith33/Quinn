@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from broker.protocol import Quote, SubmittedOrder
+from broker.protocol import OpenOrder, Position, Quote, SubmittedOrder
 from config.loader import TrailStage
 from execution.exit_policy import ExitPolicyTicker
 from journal.exit_policy import (
@@ -168,6 +168,45 @@ class _FakeBrokerWithLookup(_FakeBroker):
             submitted_at=NOW,
             stop_price=req.stop_price,
         )
+
+
+class _FakeBrokerFull(_FakeBrokerWithLookup):
+    """Adds broker-truth position/open-order surfaces — the stateless
+    self-heal arm keys on these (the same condition the naked tripwire
+    detects)."""
+
+    def __init__(self, *, last: float = 100.0) -> None:
+        super().__init__(last=last)
+        self.positions: list[Position] = []
+        self.open_orders: list[OpenOrder] = []
+
+    def get_positions(self) -> list[Position]:
+        return list(self.positions)
+
+    def get_open_orders(self) -> list[OpenOrder]:
+        return list(self.open_orders)
+
+
+def _broker_position(symbol: str = "ACME", *, qty: int = 100) -> Position:
+    return Position(
+        symbol=symbol,
+        qty=qty,
+        avg_entry_price=100.0,
+        market_value=qty * 100.0,
+        unrealized_pnl=0.0,
+    )
+
+
+def _broker_sell_order(symbol: str = "ACME", *, qty: int = 100) -> OpenOrder:
+    return OpenOrder(
+        symbol=symbol,
+        side="sell",
+        qty=qty,
+        order_type="stop",
+        status="accepted",
+        broker_order_id=f"live-sell-{symbol}",
+        client_order_id=f"cid-live-sell-{symbol}",
+    )
 
 
 class _OutcomeRecorder:
@@ -972,6 +1011,156 @@ def test_selfheal_skips_closed_position(db: str) -> None:
         ),
     )
     broker = _FakeBrokerWithLookup(last=128.0)
+
+    _tick(db, broker)
+
+    assert broker.submitted == []
+
+
+# ---------------------------------------------------------------------------
+# Stateless self-heal (FEIM follow-up, execution 37): a position whose
+# stop was canceled BEFORE the trail ever engaged has NO exit_policy_state
+# row — the engaged-state heal arm can never see it. The stateless arm
+# scans open broker positions with zero live sell orders (the naked
+# tripwire's condition) and repairs immediately.
+# ---------------------------------------------------------------------------
+
+
+def test_stateless_naked_past_activation_engages_with_fresh_trailing_stop(
+    db: str,
+) -> None:
+    """(a) FEIM-37 reconstruction: no state row, no live stop, gain past
+    the +1R activation → the heal ENGAGES properly: state row created
+    with HWM initialized from the current price, trailing stop placed at
+    the computed floor (mode=engaged_fresh)."""
+    eid, _ = _seed_position(
+        db, stop_final_status="canceled", trail_distance_pct=10.0
+    )
+    assert get_exit_policy_state(db, execution_id=eid) is None  # precondition
+    broker = _FakeBrokerFull(last=126.0)  # entry 100, risk 10 → 1R at 110
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []  # ZERO live sell orders — naked at the broker
+
+    _tick(db, broker)
+
+    # Fresh trailing stop at the floor: 126 × (1 − 10%) = 113.4.
+    assert len(broker.submitted) == 1
+    req = broker.submitted[0]
+    assert (req.side, req.order_type, req.tif, req.qty) == (
+        "sell", "stop", "gtc", 100
+    )
+    assert req.stop_price == pytest.approx(113.4)
+
+    # State row created: engaged, HWM = current price, pointer → new row.
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.trail_engaged is True
+    assert state.high_water_mark == pytest.approx(126.0)
+    heal_rows = [
+        o for o in get_orders_for_execution(db, eid)
+        if o.role == "trailing_stop" and o.final_status is None
+    ]
+    assert len(heal_rows) == 1
+    assert state.stop_order_journal_id == heal_rows[0].id
+    assert "mode=engaged_fresh" in (heal_rows[0].notes or "")
+
+
+def test_stateless_naked_below_activation_restores_original_stop(db: str) -> None:
+    """(b) Same nakedness but the gain is below activation → the heal
+    restores the position's ORIGINAL entry-time stop price (from the
+    journal's entry-time stop row), role='stop', NO state row (the trail
+    has not legitimately engaged)."""
+    eid, _ = _seed_position(
+        db, stop_final_status="canceled", trail_distance_pct=10.0
+    )
+    broker = _FakeBrokerFull(last=105.0)  # below 1R activation at 110
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []
+
+    _tick(db, broker)
+
+    assert len(broker.submitted) == 1
+    req = broker.submitted[0]
+    assert req.stop_price == pytest.approx(90.0)  # the original stop
+    assert (req.side, req.order_type, req.tif) == ("sell", "stop", "gtc")
+    # No state row — below activation is not an engagement.
+    assert get_exit_policy_state(db, execution_id=eid) is None
+    restored = [
+        o for o in get_orders_for_execution(db, eid)
+        if o.role == "stop" and o.final_status is None
+    ]
+    assert len(restored) == 1
+    assert "mode=restored_original" in (restored[0].notes or "")
+
+
+def test_stateless_engagement_arms_cleanly_and_ratchets_next_tick(db: str) -> None:
+    """(c) Engagement without a pre-existing live stop leg arms cleanly:
+    the healed stop is a normal ratchet citizen — the next tick PATCHes
+    it upward as price advances, and neither heal arm double-places."""
+    eid, _ = _seed_position(
+        db, stop_final_status="canceled", trail_distance_pct=10.0
+    )
+    broker = _FakeBrokerFull(last=126.0)
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []
+
+    _tick(db, broker)  # heal-engage: trailing stop at 113.4, HWM 126
+    assert len(broker.submitted) == 1
+
+    broker.default_last = 140.0  # price advances
+    _tick(db, broker)
+
+    # Normal ratchet PATCH: 140 × 0.9 = 126.0 — no second fresh submit.
+    assert len(broker.submitted) == 1
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(126.0)
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.high_water_mark == pytest.approx(140.0)
+
+
+def test_stateless_heal_skips_position_covered_by_broker_sell_order(
+    db: str,
+) -> None:
+    """A live sell order at the broker (protective leg or a pending
+    close) means the position is not naked — the stateless arm must not
+    place a second full-qty stop beside it (double-sell)."""
+    _seed_position(db, stop_final_status="canceled", trail_distance_pct=10.0)
+    broker = _FakeBrokerFull(last=126.0)
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = [_broker_sell_order("ACME")]
+
+    _tick(db, broker)
+
+    assert broker.submitted == []
+
+
+def test_stateless_heal_skips_when_live_journal_sell_exists(db: str) -> None:
+    """The journal guard covers the submit-vs-open-orders visibility
+    race: a live journaled sell (e.g. a thesis_close submitted this
+    tick, not yet visible in the broker's open-orders read) suppresses
+    the heal."""
+    eid, _ = _seed_position(
+        db, stop_final_status="canceled", trail_distance_pct=10.0
+    )
+    insert_order(
+        db,
+        OrderRow(
+            execution_id=eid,
+            role="thesis_close",
+            symbol="ACME",
+            side="sell",
+            order_type="market",
+            qty=100,
+            tif="day",
+            broker_order_id="close-in-flight",
+            submitted_at=NOW,
+            final_status=None,
+        ),
+    )
+    broker = _FakeBrokerFull(last=126.0)
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []  # stale broker view — sell not visible yet
 
     _tick(db, broker)
 
