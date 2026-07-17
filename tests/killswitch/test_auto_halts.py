@@ -412,3 +412,149 @@ def test_evaluator_called_after_closed_trade(journal: JournalRepo, ks: KillSwitc
     )
     assert any(h.rule == "KS-3" for h in halts_after)
     assert ks.is_halted() is True
+
+
+# ---------------------------------------------------------------------------
+# Operator-resume re-fire suppression (2026-07-14 clay incident: KS-1
+# halted 17:47:41, operator resumed 17:48:10, evaluator re-fired 17:48:42
+# because the daily-loss condition was still true; box sat halted 3 days
+# while the operator believed they had resumed).
+# ---------------------------------------------------------------------------
+
+
+def _ks_at(journal: JournalRepo, at: dt.datetime) -> KillSwitch:
+    """KillSwitch whose writes carry a controlled timestamp (the default
+    now_fn stamps the REAL clock, which would defeat the same-ET-day
+    comparison in tests)."""
+    return KillSwitch(journal, now_fn=lambda: at)
+
+
+def test_operator_resume_suppresses_same_day_ks1_refire(
+    journal: JournalRepo, ks: KillSwitch
+) -> None:
+    """(1) halt → operator resume → same-day condition still true → NO
+    re-halt, and the suppression is logged as
+    `killswitch.refire_suppressed`."""
+    import logging
+
+    now = dt.datetime(2026, 7, 14, 21, 48, 42, tzinfo=dt.UTC)  # 17:48:42 ET
+    _snapshot(journal, at=now - dt.timedelta(minutes=5), equity=960.0, daypl=-40.0)
+
+    # 17:47:41 ET — KS-1 fires.
+    halt_at = dt.datetime(2026, 7, 14, 21, 47, 41, tzinfo=dt.UTC)
+    _ks_at(journal, halt_at).halt(
+        reason="auto:KS-1", set_by="system", notes="daypl breach"
+    )
+    # 17:48:10 ET — the operator resumes: they have SEEN the condition.
+    resume_at = dt.datetime(2026, 7, 14, 21, 48, 10, tzinfo=dt.UTC)
+    _ks_at(journal, resume_at).resume(set_by="operator")
+    assert ks.is_halted() is False
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.INFO)
+    named_logger = logging.getLogger("killswitch.auto_halts")
+    prior_level = named_logger.level
+    named_logger.setLevel(logging.INFO)
+    named_logger.addHandler(handler)
+    try:
+        halts = AutoHaltEvaluator().evaluate(
+            now=now, journal=journal, ks=ks, cfg=_cfg(ks1=0.03)
+        )
+    finally:
+        named_logger.removeHandler(handler)
+        named_logger.setLevel(prior_level)
+
+    # The condition is still surfaced (fired=False) but NOT re-halted.
+    ks1 = [h for h in halts if h.rule == "KS-1"]
+    assert len(ks1) == 1
+    assert ks1[0].fired is False
+    assert ks.is_halted() is False
+    suppressions = [
+        r for r in captured
+        if getattr(r, "event", None) == "killswitch.refire_suppressed"
+    ]
+    assert len(suppressions) == 1
+    assert suppressions[0].rule == "KS-1"
+
+
+def test_next_et_day_breach_fires_normally_after_resume(
+    journal: JournalRepo, ks: KillSwitch
+) -> None:
+    """(2) The suppression dies at the ET date rollover: a fresh breach
+    the NEXT day halts normally."""
+    resume_day = dt.datetime(2026, 7, 14, 21, 48, 10, tzinfo=dt.UTC)
+    _ks_at(
+        journal, resume_day - dt.timedelta(seconds=30)
+    ).halt(reason="auto:KS-1", set_by="system", notes="daypl breach")
+    _ks_at(journal, resume_day).resume(set_by="operator")
+
+    # Next ET day, fresh breach.
+    now = dt.datetime(2026, 7, 15, 15, 30, 0, tzinfo=dt.UTC)
+    _snapshot(journal, at=now - dt.timedelta(minutes=5), equity=960.0, daypl=-40.0)
+
+    halts = AutoHaltEvaluator().evaluate(
+        now=now, journal=journal, ks=ks, cfg=_cfg(ks1=0.03)
+    )
+
+    assert any(h.rule == "KS-1" and h.fired for h in halts)
+    assert ks.is_halted() is True
+    assert ks.state().reason == "auto:KS-1"
+
+
+def test_ks2_still_fires_same_day_after_ks1_resume(
+    journal: JournalRepo, ks: KillSwitch
+) -> None:
+    """(3) Suppression is scoped PER RULE: a same-day KS-1 resume does
+    not shield a KS-2 breach."""
+    now = dt.datetime(2026, 7, 14, 21, 48, 42, tzinfo=dt.UTC)
+    # 30d peak 1200 vs current 960 → 20% drawdown > 10% threshold; also
+    # keep the KS-1 condition true so the test proves per-rule scoping.
+    _snapshot(
+        journal,
+        at=now - dt.timedelta(days=3),
+        equity=1200.0,
+        daypl=0.0,
+    )
+    _snapshot(journal, at=now - dt.timedelta(minutes=5), equity=960.0, daypl=-40.0)
+
+    _ks_at(
+        journal, now - dt.timedelta(seconds=61)
+    ).halt(reason="auto:KS-1", set_by="system", notes="daypl breach")
+    _ks_at(journal, now - dt.timedelta(seconds=32)).resume(set_by="operator")
+
+    halts = AutoHaltEvaluator().evaluate(
+        now=now, journal=journal, ks=ks, cfg=_cfg(ks1=0.03, ks2=0.10)
+    )
+
+    # KS-1 suppressed; KS-2 fired.
+    assert any(h.rule == "KS-1" and not h.fired for h in halts)
+    assert any(h.rule == "KS-2" and h.fired for h in halts)
+    assert ks.is_halted() is True
+    assert ks.state().reason == "auto:KS-2"
+
+
+def test_system_resume_does_not_suppress_refire(
+    journal: JournalRepo, ks: KillSwitch
+) -> None:
+    """A SYSTEM resume (session_start) is not an operator acceptance —
+    the same-day re-fire contract is unchanged for it."""
+    now = dt.datetime(2026, 7, 14, 21, 48, 42, tzinfo=dt.UTC)
+    _snapshot(journal, at=now - dt.timedelta(minutes=5), equity=960.0, daypl=-40.0)
+    _ks_at(
+        journal, now - dt.timedelta(seconds=61)
+    ).halt(reason="auto:KS-1", set_by="system", notes="daypl breach")
+    _ks_at(journal, now - dt.timedelta(seconds=32)).resume(
+        set_by="system", notes="session_start"
+    )
+
+    halts = AutoHaltEvaluator().evaluate(
+        now=now, journal=journal, ks=ks, cfg=_cfg(ks1=0.03)
+    )
+
+    assert any(h.rule == "KS-1" and h.fired for h in halts)
+    assert ks.is_halted() is True
