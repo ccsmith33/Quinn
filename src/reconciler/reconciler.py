@@ -41,6 +41,7 @@ from typing import Any, Protocol
 
 from broker.alpaca import BrokerUnavailable
 from broker.protocol import AccountSnapshot, BrokerAdapter, Position
+from config.calendar import ET as _ET
 from config.calendar import is_market_hours
 from config.loader import ReconcilerConfig
 from journal.models import AccountSnapshotRow, OrderRow, PositionRow
@@ -224,6 +225,11 @@ class Reconciler:
         # episode alerts once (per ≥0 → <0 crossing), not every tick.
         # In-memory — a restart mid-episode re-alerts at most once.
         self._cash_was_negative = False
+        # Naked-position tripwire dedupe (hotfix 2026-07-17, incident
+        # FEIM): symbol → ET date of the last alert, so a persistently
+        # naked position pages once per position per day. In-memory — a
+        # restart re-alerts at most once more, which is the safe side.
+        self._naked_alerted: dict[str, dt.date] = {}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -492,6 +498,14 @@ class Reconciler:
         # crossing. Observational only — no halt, no early return.
         self._check_negative_cash(broker_account)
 
+        # Naked-position tripwire (hotfix 2026-07-17, incident FEIM): an
+        # open position with ZERO live protective sell orders at the
+        # broker means some order-surgery path terminated with the
+        # protection canceled and nothing re-placed. Same observational
+        # shape as the cash tripwire: WARNING + one operator alert per
+        # position per ET day, no halt, no early return.
+        self._check_naked_positions(broker_positions, now)
+
         # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — refresh activation flag
         # AFTER the position-reconcile body succeeded (broker_account in
         # hand) and BEFORE retro/thesis/scanner hooks fire. The refresh
@@ -755,6 +769,62 @@ class Reconciler:
                 f"available cash (KS-7 gap). Check open orders and "
                 f"recent fills at the broker."
             )
+
+    def _check_naked_positions(
+        self, broker_positions: list[Position], now: dt.datetime
+    ) -> None:
+        """Hotfix 2026-07-17 (incident FEIM: +26% position naked for two
+        days after an adjust action canceled its stop and placed
+        nothing) — detect any open position (qty > 0) with ZERO live
+        protective sell orders at the broker. WARNING `position.naked` +
+        one operator alert per position per ET day. Broker truth only:
+        the journal's view is exactly what the broken paths corrupt."""
+        open_positions = [p for p in broker_positions if p.qty > 0]
+        if not open_positions:
+            self._naked_alerted.clear()
+            return
+        get_open_orders = getattr(self._broker, "get_open_orders", None)
+        if get_open_orders is None:  # legacy adapter/fake — feature inert
+            return
+        try:
+            open_orders = get_open_orders()
+        except Exception as e:  # noqa: BLE001 — observational; never abort tick
+            log.warning(
+                "reconciler.naked_check_deferred",
+                extra={
+                    "event": "reconciler.naked_check_deferred",
+                    "error": str(e),
+                    "error_class": type(e).__name__,
+                },
+            )
+            return
+        protected_symbols = {o.symbol for o in open_orders if o.side == "sell"}
+        today_et = now.astimezone(_ET).date()
+        for pos in open_positions:
+            if pos.symbol in protected_symbols:
+                self._naked_alerted.pop(pos.symbol, None)
+                continue
+            if self._naked_alerted.get(pos.symbol) == today_et:
+                continue  # already paged for this position today
+            self._naked_alerted[pos.symbol] = today_et
+            log.warning(
+                "position.naked",
+                extra={
+                    "event": "position.naked",
+                    "symbol": pos.symbol,
+                    "qty": pos.qty,
+                    "market_value": pos.market_value,
+                    "unrealized_pnl": pos.unrealized_pnl,
+                },
+            )
+            if self._alerter is not None:
+                self._alerter.notify(
+                    f"NAKED POSITION: {pos.symbol} qty {pos.qty} "
+                    f"(mv ${pos.market_value:.2f}) has ZERO live "
+                    f"protective sell orders at the broker. Protection "
+                    f"was lost by an order-surgery path — place a stop "
+                    f"at the broker now and check the journal."
+                )
 
     @staticmethod
     def _fills_cover_absence(

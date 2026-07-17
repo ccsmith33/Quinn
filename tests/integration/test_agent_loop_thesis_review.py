@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -39,7 +38,6 @@ from journal.repo import (
     insert_proposal,
     insert_thesis_review_schedule,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -74,6 +72,7 @@ class _FakeBrokerWithCancelTracking:
         self.orders_by_id: dict[str, SubmittedOrder] = {}
         self.positions: list[Position] = []
         self.submitted_oco: list[dict[str, Any]] = []
+        self._oco_should_fail = False
 
     def seed_order(self, order: SubmittedOrder) -> None:
         self.orders_by_id[order.broker_order_id] = order
@@ -91,6 +90,16 @@ class _FakeBrokerWithCancelTracking:
         limit_price: float | None,
         client_order_id: str,
     ) -> tuple[SubmittedOrder, SubmittedOrder | None]:
+        if self._oco_should_fail:
+            self._oco_should_fail = False
+            self.call_log.append(
+                (
+                    "submit_oco_failed",
+                    {"symbol": symbol, "stop_price": stop_price,
+                     "limit_price": limit_price},
+                )
+            )
+            raise RuntimeError("simulated oco failure")
         self.submitted_oco.append(
             {
                 "symbol": symbol,
@@ -149,6 +158,9 @@ class _FakeBrokerWithCancelTracking:
 
     def fail_next_replace_limit(self) -> None:
         self._replace_limit_should_fail = True
+
+    def fail_next_oco(self) -> None:
+        self._oco_should_fail = True
 
     def submit_order(self, req: OrderRequest) -> SubmittedOrder:
         if self._submit_should_fail:
@@ -721,6 +733,8 @@ async def test_thesis_review_hold_path_reschedules_plus_seven_days(
     )
     from journal.repo import (
         connect as _connect,
+    )
+    from journal.repo import (
         get_latest_thesis_schedule_for_execution,
     )
 
@@ -781,11 +795,13 @@ async def test_thesis_review_hold_path_reschedules_plus_seven_days(
 
 
 @pytest.mark.asyncio
-async def test_thesis_review_close_path_submits_market_sell_and_cancels_gtcs(
+async def test_thesis_review_close_path_cancels_gtcs_then_submits_market_sell(
     db_path: str, journal, prompt_builder
 ) -> None:
-    """AC: Opus says `close` → market sell submitted → GTC stop + TP
-    cancelled. No further schedule."""
+    """AC (incident VRDN 2026-07-14..17): Opus says `close` → GTC stop +
+    TP cancelled FIRST (they hold the shares — Alpaca rejects the sell
+    with 40310000 otherwise), THEN the market sell. No further
+    schedule."""
     from analyzer.thesis_review import ThesisReviewer
     from app.thesis_coordinator import ThesisReviewCoordinator
 
@@ -834,10 +850,11 @@ async def test_thesis_review_close_path_submits_market_sell_and_cancels_gtcs(
     # Both GTC legs cancelled (stop + take_profit).
     assert sorted(broker.canceled) == sorted(["orig-stop-ACME", "orig-tp-ACME"])
 
-    # SAFETY ORDERING: market sell MUST be submitted before either GTC
-    # cancel. Two separate lists (`submitted` and `canceled`) couldn't
-    # catch a bug that called cancel-then-submit. `call_log` records
-    # mutating ops in invocation order — assert positional precedence.
+    # SAFETY ORDERING (incident VRDN): both GTC cancels MUST happen
+    # BEFORE the market sell — the resting legs hold the position's
+    # shares (`held_for_orders`), so a sell submitted first is rejected
+    # by Alpaca with 40310000 `insufficient qty available`. `call_log`
+    # records mutating ops in invocation order — assert precedence.
     submit_idx = next(
         i for i, (op, payload) in enumerate(broker.call_log)
         if op == "submit"
@@ -851,11 +868,11 @@ async def test_thesis_review_close_path_submits_market_sell_and_cancels_gtcs(
         i for i, (op, payload) in enumerate(broker.call_log)
         if op == "cancel" and payload.get("id") == "orig-tp-ACME"
     )
-    assert submit_idx < stop_cancel_idx, (
-        "close path must submit market sell BEFORE cancelling the GTC stop"
+    assert stop_cancel_idx < submit_idx, (
+        "close path must cancel the GTC stop BEFORE submitting the market sell"
     )
-    assert submit_idx < tp_cancel_idx, (
-        "close path must submit market sell BEFORE cancelling the GTC take-profit"
+    assert tp_cancel_idx < submit_idx, (
+        "close path must cancel the GTC take-profit BEFORE submitting the market sell"
     )
 
     # No follow-up schedule (close → done).
@@ -863,6 +880,119 @@ async def test_thesis_review_close_path_submits_market_sell_and_cancels_gtcs(
     sched = get_latest_thesis_schedule_for_execution(db_path, eid)
     assert sched is not None
     assert sched.scheduled_reason == "entry"  # still the original
+
+
+@pytest.mark.asyncio
+async def test_close_leg_cancel_failure_submits_no_sell_and_retry_succeeds(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Incident VRDN reconstruction (Alpaca 40310000 class): when a
+    protective-leg cancel fails and the leg is confirmed STILL LIVE at
+    the broker, the close must NOT submit the market sell (it would be
+    rejected — the leg holds the shares) and must write a +1d retry
+    schedule. The retry, with the cancel now succeeding, completes the
+    close."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=None,  # stop-only (the VRDN shape: legs hold qty)
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=120.0)
+    broker.fail_next_cancel()
+    # The interrogation after the failed cancel finds the stop STILL
+    # LIVE — the true 40310000 precondition (held_for_orders).
+    broker.seed_order(
+        _live_order("orig-stop-ACME", status="accepted", stop_price=90.0)
+    )
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker, _close_response(), now
+    )
+
+    await coordinator.run_tick()
+
+    # ATTEMPT 1: no sell submitted — the leg still holds the shares.
+    assert broker.submitted == []
+    assert broker.canceled == []
+    # +1d retry schedule written, reason=close.
+    follow_ups = _pending_schedules(db_path, eid, now)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["scheduled_reason"] == "close"
+
+    # ATTEMPT 2 (next day): cancel succeeds → sell goes out.
+    now2 = now + dt.timedelta(days=1, hours=1)
+    broker2 = _FakeBrokerWithCancelTracking(last_price=120.0)
+    coordinator2 = _make_coordinator(
+        db_path, journal, prompt_builder, broker2, _close_response(), now2
+    )
+    await coordinator2.run_tick()
+
+    assert broker2.canceled == ["orig-stop-ACME"]
+    assert len(broker2.submitted) == 1
+    assert broker2.submitted[0].order_type == "market"
+    cancel_idx = next(
+        i for i, (op, _) in enumerate(broker2.call_log) if op == "cancel"
+    )
+    submit_idx = next(
+        i for i, (op, _) in enumerate(broker2.call_log) if op == "submit"
+    )
+    assert cancel_idx < submit_idx
+
+
+@pytest.mark.asyncio
+async def test_close_sell_failure_after_cancels_restores_protection(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Invariant: a close whose sell fails AFTER the legs cleared may
+    not terminate with the position less protected than it started —
+    the just-cleared stop+TP must be re-placed (one OCO) and a +1d
+    retry scheduled."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=150.0,
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=120.0)
+    broker.fail_next_submit()  # the market sell fails post-cancel
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker, _close_response(), now
+    )
+
+    await coordinator.run_tick()
+
+    # Both legs were canceled, the sell failed, and protection was
+    # RE-PLACED as one OCO at the original prices.
+    assert sorted(broker.canceled) == sorted(["orig-stop-ACME", "orig-tp-ACME"])
+    assert len(broker.submitted_oco) == 1
+    oco = broker.submitted_oco[0]
+    assert oco["stop_price"] == 90.0
+    assert oco["limit_price"] == 150.0
+    assert oco["qty"] == 100
+
+    # Journal: fresh live stop + TP rows exist (protective-order count
+    # is back to where the operation started).
+    rows = _orders_for_execution(db_path, eid)
+    live_protective = [
+        o for o in rows
+        if o.role in ("stop", "trailing_stop", "take_profit")
+        and o.final_status is None
+        and o.broker_order_id.startswith("thfake-oco-")
+    ]
+    assert {o.role for o in live_protective} == {"stop", "take_profit"}
+
+    # +1d retry schedule written, reason=close.
+    follow_ups = _pending_schedules(db_path, eid, now)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["scheduled_reason"] == "close"
 
 
 @pytest.mark.asyncio
@@ -1101,6 +1231,7 @@ async def test_entry_schedules_thesis_review_at_horizon(
     the contract the coordinator depends on.
     """
     import asyncio
+
     from app.loop import AgentLoop
     from app.state import AgentState
     from tests.integration.conftest import (
@@ -1701,12 +1832,99 @@ async def test_adjust_tp_keeps_old_tp_when_replace_fails(
 
 
 @pytest.mark.asyncio
-async def test_adjust_tp_skipped_when_no_live_tp_leg(
+async def test_adjust_tp_on_stop_only_position_cancels_stop_then_places_oco(
     db_path: str, journal, prompt_builder
 ) -> None:
-    """§3.4: the raise actuator exists for the OCO TP leg — a no-TP
-    position has nothing to raise. Treated as hold (+7d), no broker
-    calls."""
+    """Incident FEIM 2026-07-16 (happy path): adding a TP to a stop-only
+    position requires freeing the shares the stop holds — cancel the
+    stop, then submit the stop+TP pair as ONE OCO at the original stop
+    price. Journal chain + ratchet pointer rotate to the new stop."""
+    from journal.exit_policy import (
+        ExitPolicyStateRow,
+        get_exit_policy_state,
+        upsert_exit_policy_state,
+    )
+
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=None,  # OTO stop-only — the FEIM entry shape
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+    old_stop_row = next(
+        o for o in _orders_for_execution(db_path, eid) if o.role == "stop"
+    )
+    # Trail-armed state pointing at the stop (FEIM was armed via
+    # gain_cross the same day) — the pointer must rotate with the OCO.
+    upsert_exit_policy_state(
+        db_path,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=10.0,
+            trail_engaged=True,
+            high_water_mark=145.0,
+            stop_order_journal_id=old_stop_row.id,
+        ),
+    )
+
+    broker = _FakeBrokerWithCancelTracking(last_price=145.0)
+    recorder = _OutcomeRecorder()
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_tp_response(180.0), now, recorder=recorder,
+    )
+
+    await coordinator.run_tick()
+
+    # Cancel the stop, then ONE OCO with original stop price + new TP.
+    assert broker.canceled == ["orig-stop-ACME"]
+    assert len(broker.submitted_oco) == 1
+    oco = broker.submitted_oco[0]
+    assert oco["symbol"] == "ACME"
+    assert oco["qty"] == 100
+    assert oco["stop_price"] == 90.0  # protection level preserved
+    assert oco["limit_price"] == 180.0
+    cancel_idx = next(
+        i for i, (op, _) in enumerate(broker.call_log) if op == "cancel"
+    )
+    oco_idx = next(
+        i for i, (op, _) in enumerate(broker.call_log) if op == "submit_oco"
+    )
+    assert cancel_idx < oco_idx
+    # No naked plain submits.
+    assert broker.submitted == []
+
+    # Journal chain: fresh live stop + TP rows; old stop completed
+    # 'canceled'; ratchet pointer rotated to the new stop row.
+    rows = _orders_for_execution(db_path, eid)
+    new_stop = next(
+        o for o in rows if o.role == "stop" and o.id != old_stop_row.id
+    )
+    new_tp = next(o for o in rows if o.role == "take_profit")
+    assert new_stop.stop_price == 90.0 and new_stop.final_status is None
+    assert new_tp.limit_price == 180.0 and new_tp.final_status is None
+    assert recorder.calls == [(old_stop_row.id, "canceled")]
+    state = get_exit_policy_state(db_path, execution_id=eid)
+    assert state is not None
+    assert state.stop_order_journal_id == new_stop.id
+    # Re-protected → next review at +7d.
+    assert len(_pending_schedules(db_path, eid, now)) == 1
+
+
+@pytest.mark.asyncio
+async def test_adjust_tp_on_stop_only_position_restores_stop_when_oco_fails(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Incident FEIM 2026-07-16 (THE bug): the stop was canceled, the
+    follow-up placement failed, and nothing was re-placed — naked at
+    +26% for two days. Invariant under test: when the OCO submission
+    fails, the ORIGINAL stop is immediately re-placed at its prior
+    price; the operation never terminates with fewer protective orders
+    than it started with."""
     sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
     now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
     _, eid = _setup_open_position(
@@ -1715,6 +1933,115 @@ async def test_adjust_tp_skipped_when_no_live_tp_leg(
         take_profit_price=None,
         sonnet_pv=sonnet_pv,
     )
+    _due_schedule(db_path, eid, now)
+    old_stop_row = next(
+        o for o in _orders_for_execution(db_path, eid) if o.role == "stop"
+    )
+    live_protective_before = [
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role in ("stop", "trailing_stop", "take_profit")
+        and o.final_status is None
+    ]
+
+    broker = _FakeBrokerWithCancelTracking(last_price=145.0)
+    broker.fail_next_oco()  # the FEIM failure: cancel succeeded, OCO didn't
+    recorder = _OutcomeRecorder()
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_tp_response(180.0), now, recorder=recorder,
+    )
+
+    await coordinator.run_tick()
+
+    # The stop was canceled, the OCO failed — and the restore re-placed
+    # a plain GTC stop at the ORIGINAL price (limit_price=None path).
+    assert broker.canceled == ["orig-stop-ACME"]
+    assert any(op == "submit_oco_failed" for op, _ in broker.call_log)
+    assert len(broker.submitted_oco) == 1  # the restore call
+    restore = broker.submitted_oco[0]
+    assert restore["stop_price"] == 90.0
+    assert restore["limit_price"] is None
+    assert restore["qty"] == 100
+
+    # PROTECTIVE-ORDER INVARIANT: at least as many live protective
+    # journal rows as before the operation, at the same stop price.
+    rows = _orders_for_execution(db_path, eid)
+    live_protective_after = [
+        o for o in rows
+        if o.role in ("stop", "trailing_stop", "take_profit")
+        and o.final_status is None
+        and o.id != old_stop_row.id  # old row completed via recorder port
+    ]
+    assert len(live_protective_after) >= len(live_protective_before)
+    restored_stop = next(o for o in live_protective_after if o.role == "stop")
+    assert restored_stop.stop_price == 90.0
+    assert recorder.calls == [(old_stop_row.id, "canceled")]
+
+    # +1d retry (the reviewer's TP intent is retried tomorrow).
+    follow_ups = _pending_schedules(db_path, eid, now)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["scheduled_reason"] == "adjust_take_profit"
+
+
+@pytest.mark.asyncio
+async def test_adjust_tp_stop_cancel_failure_leaves_stop_and_retries(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Stop-only add-TP: when the stop's cancel fails and the stop is
+    confirmed STILL LIVE, no OCO is attempted (it would be rejected —
+    the stop holds the shares); position keeps its stop; +1d retry."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=None,
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=145.0)
+    broker.fail_next_cancel()
+    broker.seed_order(
+        _live_order("orig-stop-ACME", status="accepted", stop_price=90.0)
+    )
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_tp_response(180.0), now,
+    )
+
+    await coordinator.run_tick()
+
+    assert broker.submitted_oco == []
+    assert broker.submitted == []
+    assert broker.canceled == []
+    # Original stop row still the live leg.
+    stop_rows = [
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "stop" and o.final_status is None
+    ]
+    assert len(stop_rows) == 1
+    follow_ups = _pending_schedules(db_path, eid, now)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["scheduled_reason"] == "adjust_take_profit"
+
+
+@pytest.mark.asyncio
+async def test_adjust_tp_skipped_when_no_live_tp_or_stop(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """§3.4: with neither a live TP nor a live stop journaled there is
+    nothing protective to rebuild around — treated as hold (+7d), no
+    broker calls (the reconciler's naked tripwire owns alerting)."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=None,
+        sonnet_pv=sonnet_pv,
+    )
+    _complete_live_stop(db_path, eid)  # no live stop remains either
     _due_schedule(db_path, eid, now)
 
     broker = _FakeBrokerWithCancelTracking(last_price=145.0)
@@ -1728,6 +2055,7 @@ async def test_adjust_tp_skipped_when_no_live_tp_leg(
     assert broker.replaced_limits == []
     assert broker.submitted == []
     assert broker.canceled == []
+    assert broker.submitted_oco == []
     assert len(_pending_schedules(db_path, eid, now)) == 1
 
 

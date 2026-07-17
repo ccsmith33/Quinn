@@ -30,12 +30,14 @@ import json
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
-from broker.protocol import BrokerAdapter
+from broker.protocol import BrokerAdapter, OrderRequest
 from config.calendar import ET
 from config.loader import TrailStage
+from execution.protection import DEAD_ORDER_STATUSES
 from journal.exit_policy import (
     ExitPolicyStateRow,
     get_exit_policy_state,
+    set_stop_order_journal_id,
     upsert_exit_policy_state,
 )
 from journal.models import OrderRow
@@ -162,6 +164,7 @@ class ExitPolicyTicker:
         shape as the retro/thesis hooks)."""
         self._cancel_stale_entries()
         self._ratchet_trailing_stops()
+        self._heal_engaged_without_live_stop()
 
     # ------------------------------------------------------------------
     # §3.6 — stale-entry hygiene
@@ -347,8 +350,27 @@ class ExitPolicyTicker:
                 client_order_id=client_order_id,
             )
         except Exception as e:  # noqa: BLE001
-            # Atomic PATCH contract: the original stop is still live.
-            # Persist the high-water advance and retry next tick.
+            # Atomic PATCH contract: on a transient failure the original
+            # stop is still live — persist the high-water advance and
+            # retry next tick. BUT a PATCH against a DEAD order (the
+            # tracked stop was canceled out from under the ratchet —
+            # incident FEIM 2026-07-16) fails every tick forever without
+            # ever re-establishing protection. Interrogate the target:
+            # dead + position open → submit a FRESH stop at the computed
+            # floor instead of retrying a doomed PATCH.
+            if high_water > state.high_water_mark:
+                upsert_exit_policy_state(
+                    self._journal.db_path,
+                    state.model_copy(update={"high_water_mark": high_water}),
+                )
+                state = state.model_copy(update={"high_water_mark": high_water})
+            if self._selfheal_if_dead(
+                live_stop=live_stop,
+                target=target,
+                last=last,
+                replace_error=e,
+            ):
+                return
             log.error(
                 "exit_policy.ratchet_replace_failed",
                 extra={
@@ -360,11 +382,6 @@ class ExitPolicyTicker:
                     "error": str(e),
                 },
             )
-            if high_water > state.high_water_mark:
-                upsert_exit_policy_state(
-                    self._journal.db_path,
-                    state.model_copy(update={"high_water_mark": high_water}),
-                )
             return
 
         # Journal chain identical to §3.3: fresh live row, old completed
@@ -415,6 +432,230 @@ class ExitPolicyTicker:
                 "trail_stage_gain_pct": active_stage_gain,
                 "old_broker_order_id": live_stop.broker_order_id,
                 "new_broker_order_id": replaced.broker_order_id,
+            },
+        )
+
+    # ------------------------------------------------------------------
+    # Self-heal (incident FEIM 2026-07-16): a trail-armed position whose
+    # tracked stop was canceled out from under the ratchet must get a
+    # FRESH stop, not a doomed PATCH retry (or, worse, silence once fill
+    # ingestion records the cancel and the row leaves the live set).
+    # ------------------------------------------------------------------
+
+    def _selfheal_if_dead(
+        self,
+        *,
+        live_stop: OrderRow,
+        target: float,
+        last: float,
+        replace_error: Exception,
+    ) -> bool:
+        """PATCH-failure arm: True when the failed PATCH target turned
+        out to be dead at the broker and a fresh stop was submitted (or
+        the position is exiting some other way); False → the failure was
+        transient, caller logs and retries next tick."""
+        get_order_by_id = getattr(self._broker, "get_order_by_id", None)
+        if get_order_by_id is None:
+            return False
+        try:
+            current = get_order_by_id(live_stop.broker_order_id)
+        except Exception:  # noqa: BLE001 — lookup failed; treat as transient
+            return False
+        if current is not None and current.status == "filled":
+            return True  # stop filled — fill ingestion owns the exit
+        if current is not None and current.status not in DEAD_ORDER_STATUSES:
+            return False  # still live at the broker — transient PATCH failure
+        disposition = current.status if current is not None else "canceled"
+        log.warning(
+            "exit_policy.tracked_stop_dead",
+            extra={
+                "event": "exit_policy.tracked_stop_dead",
+                "execution_id": live_stop.execution_id,
+                "symbol": live_stop.symbol,
+                "old_broker_order_id": live_stop.broker_order_id,
+                "broker_status": disposition,
+                "replace_error": str(replace_error),
+            },
+        )
+        self._place_fresh_stop(
+            execution_id=live_stop.execution_id,
+            symbol=live_stop.symbol,
+            qty=live_stop.qty,
+            target=target,
+            last=last,
+            old_row_id=live_stop.id,
+            old_disposition=disposition,
+            old_broker_order_id=live_stop.broker_order_id,
+        )
+        return True
+
+    def _heal_engaged_without_live_stop(self) -> None:
+        """Silent-blindness arm: a trail-engaged execution with NO live
+        journaled stop at all (fill ingestion recorded the cancel, so
+        `_live_protective_stops` no longer surfaces it — the ratchet
+        would otherwise never look at the position again) gets a fresh
+        GTC stop at its computed trail floor."""
+        with connect(self._journal.db_path) as conn:
+            rows = conn.execute(
+                "SELECT s.* FROM exit_policy_state s "
+                "WHERE s.trail_engaged = 1 AND NOT EXISTS ("
+                "  SELECT 1 FROM orders o WHERE o.execution_id = s.execution_id "
+                "  AND o.role IN ('stop', 'trailing_stop') "
+                "  AND o.final_status IS NULL"
+                ")"
+            ).fetchall()
+        for raw in rows:
+            d = dict(raw)
+            d["trail_engaged"] = bool(d["trail_engaged"])
+            state = ExitPolicyStateRow(**d)
+            try:
+                self._heal_one_naked(state)
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "exit_policy.selfheal_error",
+                    extra={
+                        "event": "exit_policy.selfheal_error",
+                        "execution_id": state.execution_id,
+                        "symbol": state.symbol,
+                        "error": str(e),
+                        "error_class": type(e).__name__,
+                    },
+                )
+
+    def _heal_one_naked(self, state: ExitPolicyStateRow) -> None:
+        if not has_open_position(self._journal.db_path, state.symbol):
+            return
+        orders = get_orders_for_execution(
+            self._journal.db_path, state.execution_id
+        )
+        entry = next((o for o in orders if o.role == "entry"), None)
+        if entry is None or entry.qty <= 0:
+            return
+        qty = entry.realized_fill_qty or entry.qty
+        quote = self._broker.get_quote(state.symbol)
+        last = float(quote.last)
+        entry_price = entry.realized_fill_price or entry.pre_submission_last
+        high_water = max(state.high_water_mark, last)
+        effective_pct, _ = self._staged_trail_pct(
+            state.trail_distance_pct,
+            entry_price=entry_price,
+            high_water=high_water,
+        )
+        target = round(high_water * (1.0 - effective_pct / 100.0), 2)
+        log.warning(
+            "exit_policy.naked_trail_detected",
+            extra={
+                "event": "exit_policy.naked_trail_detected",
+                "execution_id": state.execution_id,
+                "symbol": state.symbol,
+                "high_water_mark": high_water,
+                "target_stop_price": target,
+            },
+        )
+        self._place_fresh_stop(
+            execution_id=state.execution_id,
+            symbol=state.symbol,
+            qty=qty,
+            target=target,
+            last=last,
+            old_row_id=None,
+            old_disposition=None,
+            old_broker_order_id=None,
+        )
+
+    def _place_fresh_stop(
+        self,
+        *,
+        execution_id: int,
+        symbol: str,
+        qty: int,
+        target: float,
+        last: float,
+        old_row_id: int | None,
+        old_disposition: str | None,
+        old_broker_order_id: str | None,
+    ) -> None:
+        """Submit a fresh GTC stop at the trail's computed floor (clamped
+        below the current quote so an in-the-money stop doesn't get
+        rejected), journal it, complete the dead row (when known), and
+        rotate the ratchet's pointer. Loud by design — this only runs
+        when a trail-armed position lost its broker-side protection."""
+        stop_price = target if target < last else round(
+            last * (1.0 - self._min_step_pct / 100.0), 2
+        )
+        client_order_id = (
+            f"trail-heal-{execution_id}-{self._now_fn().timestamp():.0f}"
+        )
+        req = OrderRequest(
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            order_type="stop",
+            tif="gtc",
+            stop_price=stop_price,
+            client_order_id=client_order_id,
+        )
+        try:
+            resp = self._broker.submit_order(req)
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "exit_policy.selfheal_submit_failed",
+                extra={
+                    "event": "exit_policy.selfheal_submit_failed",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "stop_price": stop_price,
+                    "error": str(e),
+                },
+            )
+            return
+        new_row_id = insert_order(
+            self._journal.db_path,
+            OrderRow(
+                execution_id=execution_id,
+                role="trailing_stop",
+                symbol=symbol,
+                side="sell",
+                order_type="stop",
+                qty=qty,
+                tif="gtc",
+                stop_price=stop_price,
+                broker_order_id=resp.broker_order_id,
+                submitted_at=resp.submitted_at,
+                final_status=None,
+                notes=(
+                    "trail_selfheal fresh stop"
+                    + (
+                        f" replacing dead {old_broker_order_id} "
+                        f"({old_disposition})"
+                        if old_broker_order_id is not None
+                        else " (no live stop for engaged trail)"
+                    )
+                ),
+            ),
+        )
+        if old_row_id is not None and old_disposition is not None:
+            self._record_order_outcome(
+                old_row_id,
+                old_disposition,
+                fill_price=None,
+                fill_qty=None,
+                fill_at=None,
+            )
+        set_stop_order_journal_id(
+            self._journal.db_path,
+            execution_id=execution_id,
+            order_journal_id=new_row_id,
+        )
+        log.warning(
+            "exit_policy.stop_selfhealed",
+            extra={
+                "event": "exit_policy.stop_selfhealed",
+                "execution_id": execution_id,
+                "symbol": symbol,
+                "stop_price": stop_price,
+                "broker_order_id": resp.broker_order_id,
+                "replaced_dead_broker_order_id": old_broker_order_id,
             },
         )
 

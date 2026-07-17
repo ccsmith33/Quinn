@@ -17,11 +17,18 @@ CRITICAL safety constraint (per task description + reviewer pre-read):
   (original stop still live). There is never a moment where the
   position is uncovered. If the replace fails, the old stop is intact
   and the coordinator reschedules the review for tomorrow.
-- For `close`, the sell-market order goes out first; only after broker
-  ack do we cancel the GTC stop and take-profit legs. A successful
-  market sell + delayed cancel still leaves the GTC legs lingering on a
-  zero-qty position, which Alpaca rejects on trigger — acceptable
-  because the qty is already zero and the position is closed.
+- For `close`, the live GTC protective legs are canceled FIRST (and
+  each cancel confirmed) — only then does the market sell go out.
+  Submitting the sell while the legs still hold the shares is exactly
+  Alpaca's 40310000 `insufficient qty available ... held_for_orders`
+  rejection (incident VRDN 2026-07-14..17: four consecutive daily
+  failures, no retry-with-cancel, no alert). If a cancel cannot be
+  confirmed, NO sell is submitted (the legs still protect) and the
+  close retries via a +1d schedule. If the sell fails after the legs
+  cleared, the original protection is immediately RE-PLACED
+  (`execution.protection.restore_protection`) so the operation never
+  ends with the position less protected than it started (incident FEIM
+  2026-07-16: cancel-then-nothing left a +26% position naked 2 days).
 """
 
 from __future__ import annotations
@@ -31,8 +38,21 @@ import json
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
+from analyzer.thesis_review import (
+    ThesisAdjustStop,
+    ThesisAdjustTakeProfit,
+    ThesisClose,
+    ThesisHold,
+    ThesisReviewContext,
+    ThesisReviewer,
+    ThesisReviewMalformed,
+)
 from broker.protocol import BrokerAdapter, OrderRequest
 from config.loader import TrailStage
+from execution.protection import (
+    cancel_protective_legs,
+    restore_protection,
+)
 from journal.exit_policy import get_exit_policy_state, set_stop_order_journal_id
 from journal.models import (
     OrderRow,
@@ -48,16 +68,6 @@ from journal.repo import (
     insert_thesis_review_schedule,
 )
 from observability.log_port import get_logger
-
-from analyzer.thesis_review import (
-    ThesisAdjustStop,
-    ThesisAdjustTakeProfit,
-    ThesisClose,
-    ThesisHold,
-    ThesisReviewContext,
-    ThesisReviewer,
-    ThesisReviewMalformed,
-)
 
 log = get_logger(__name__)
 
@@ -364,7 +374,7 @@ class ThesisReviewCoordinator:
             self._reschedule(execution.id, when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS), reason="hold")
             return
         if isinstance(result, ThesisClose):
-            self._apply_close(execution.id, proposal.symbol, ctx)
+            self._apply_close(execution.id, proposal.symbol, ctx, now=now)
             return
         if isinstance(result, ThesisAdjustStop):
             self._apply_adjust_stop(
@@ -406,12 +416,25 @@ class ThesisReviewCoordinator:
         execution_id: int,
         symbol: str,
         ctx: ThesisReviewContext,
+        *,
+        now: dt.datetime,
     ) -> None:
-        """Submit a sell-market closing order, then cancel the open GTC
-        stop and take-profit legs (best-effort).
+        """Cancel the live GTC protective legs (confirmed), THEN submit
+        the sell-market closing order.
 
-        Order: market sell FIRST, then cancel GTCs. If the market sell
-        fails, no cancel is attempted (the protective legs remain live).
+        Incident VRDN 2026-07-14..17: the previous sell-first ordering
+        was rejected by Alpaca with 40310000 (`insufficient qty
+        available ... held_for_orders`) four days running — the resting
+        legs hold the shares. Sequencing:
+
+          1. cancel every live leg; any cancel not confirmed dead →
+             WARN, NO sell, retry via a +1d schedule (legs still live =
+             position still protected, and next attempt re-tries the
+             cancels so it CAN succeed).
+          2. all legs cleared → submit the market sell.
+          3. sell failed anyway → RE-PLACE the just-cleared protection
+             immediately and retry via +1d (invariant: never end less
+             protected than we started, except a completed close).
         """
         # Determine quantity to sell — the sizing engine recorded
         # realized qty on entry, but the safest source is the latest
@@ -428,6 +451,53 @@ class ThesisReviewCoordinator:
             )
             return
 
+        # 1. Free the shares: cancel the resting protective legs first.
+        outcome = cancel_protective_legs(
+            self._journal.db_path, self._broker, execution_id
+        )
+        if outcome.any_filled:
+            # A protective leg filled while we were canceling — the
+            # position is exiting through it; fill ingestion owns the
+            # rest. Submitting our sell too would double-sell.
+            log.info(
+                "thesis_coordinator.close_lost_race_to_leg_fill",
+                extra={
+                    "event": "thesis_coordinator.close_lost_race_to_leg_fill",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                },
+            )
+            return
+        if not outcome.all_cleared:
+            # Legs still hold the shares — the sell would be rejected
+            # (40310000). Restore anything we DID clear, keep the
+            # position protected, retry tomorrow.
+            if outcome.cleared:
+                restore_protection(
+                    self._journal.db_path,
+                    self._broker,
+                    execution_id,
+                    outcome.cleared,
+                    client_order_id=f"thesis-close-restore-{execution_id}",
+                    notes="thesis_review:close leg-cancel failed; protection restored",
+                )
+            log.warning(
+                "thesis_coordinator.close_leg_cancel_failed",
+                extra={
+                    "event": "thesis_coordinator.close_leg_cancel_failed",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "still_live_broker_order_ids": [
+                        o.broker_order_id for o in outcome.failed
+                    ],
+                },
+            )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="close"
+            )
+            return
+
+        # 2. Legs cleared — the shares are free; submit the sell.
         client_order_id = f"thesis-close-exec-{execution_id}"
         req = OrderRequest(
             symbol=symbol,
@@ -440,13 +510,35 @@ class ThesisReviewCoordinator:
         try:
             submitted = self._broker.submit_order(req)
         except Exception as e:  # noqa: BLE001
+            # 3. Sell failed AFTER the legs cleared — the position is
+            # naked right now. Re-place the original protection before
+            # doing anything else, then retry tomorrow.
+            restored = restore_protection(
+                self._journal.db_path,
+                self._broker,
+                execution_id,
+                outcome.cleared,
+                client_order_id=f"thesis-close-restore-{execution_id}",
+                notes="thesis_review:close sell failed; protection restored",
+            )
             log.error(
                 "thesis_coordinator.close_submit_failed",
                 extra={
                     "event": "thesis_coordinator.close_submit_failed",
                     "execution_id": execution_id,
+                    "symbol": symbol,
+                    "protection_restored": restored is not None,
                     "error": str(e),
                 },
+            )
+            if restored is not None:
+                set_stop_order_journal_id(
+                    self._journal.db_path,
+                    execution_id=execution_id,
+                    order_journal_id=restored.id or 0,
+                )
+            self._reschedule(
+                execution_id, when=now + dt.timedelta(days=1), reason="close"
             )
             return
 
@@ -466,24 +558,17 @@ class ThesisReviewCoordinator:
                 notes="thesis_review:close",
             ),
         )
-
-        # Cancel the GTC stop + take-profit, best effort. Failures here
-        # are not fatal — the position is closing.
-        for o in orders:
-            if o.role in ("stop", "take_profit"):
-                try:
-                    self._broker.cancel_order(o.broker_order_id)
-                except Exception as e:  # noqa: BLE001
-                    log.warning(
-                        "thesis_coordinator.cancel_failed",
-                        extra={
-                            "event": "thesis_coordinator.cancel_failed",
-                            "execution_id": execution_id,
-                            "role": o.role,
-                            "broker_order_id": o.broker_order_id,
-                            "error": str(e),
-                        },
-                    )
+        # Complete the cleared legs' journal rows with their observed
+        # dispositions (§7.4 one-time NULL→value completion).
+        for c in outcome.cleared:
+            if c.row.id is not None:
+                self._record_order_outcome(
+                    c.row.id,
+                    c.disposition,
+                    fill_price=None,
+                    fill_qty=None,
+                    fill_at=None,
+                )
 
         log.info(
             "thesis_coordinator.close_submitted",
@@ -492,6 +577,9 @@ class ThesisReviewCoordinator:
                 "execution_id": execution_id,
                 "symbol": symbol,
                 "qty": entry.qty,
+                "canceled_leg_broker_order_ids": [
+                    c.row.broker_order_id for c in outcome.cleared
+                ],
                 "broker_order_id": submitted.broker_order_id,
             },
         )
@@ -852,12 +940,29 @@ class ThesisReviewCoordinator:
                 client_order_id=f"thesis-adjstop-replace-{schedule_id}",
             )
         except Exception as e:  # noqa: BLE001
+            # The dead stop is gone AND (when one survived) the TP was
+            # just canceled — the position is naked right now. Re-place
+            # a plain GTC stop before rescheduling (protective-order
+            # invariant; the FEIM class).
+            restored = False
+            if tp_was_live and tp_row is not None:
+                restored = self._broker_restore_stop(
+                    execution_id=execution_id,
+                    symbol=symbol,
+                    qty=qty,
+                    stop_row=tp_row.model_copy(
+                        update={"role": "stop", "stop_price": new_stop_price}
+                    ),
+                    disposition="canceled",
+                    client_order_id=f"thesis-adjstop-restore-{schedule_id}",
+                )
             log.error(
                 "thesis_coordinator.adjust_stop_replace_dead_failed",
                 extra={
                     "event": "thesis_coordinator.adjust_stop_replace_dead_failed",
                     "execution_id": execution_id,
                     "symbol": symbol,
+                    "protection_restored": restored,
                     "error": str(e),
                 },
             )
@@ -963,21 +1068,29 @@ class ThesisReviewCoordinator:
         resulting R:R against the *current* stop must not fall below
         the §3.2 floor (belt-and-suspenders: raising a TP can only
         improve R:R).
+
+        STOP-ONLY positions (no live TP leg — the no-TP-by-default entry
+        shape): adding a TP requires freeing the shares the stop holds,
+        so the sequence is cancel stop → submit stop+TP as ONE OCO →
+        and, if the OCO submission fails for ANY reason, IMMEDIATELY
+        re-place the original stop (incident FEIM 2026-07-16: the
+        cancel went through, the follow-up never did, and a +26%
+        position sat naked for two days with no error). Invariant: this
+        operation never terminates with fewer protective orders than it
+        started with.
         """
         orders = get_orders_for_execution(self._journal.db_path, execution_id)
         entry = next((o for o in orders if o.role == "entry"), None)
         tp_row = self._get_live_protective_order(
             execution_id=execution_id, roles=("take_profit",)
         )
-        if entry is None or tp_row is None or entry.qty <= 0:
-            # No live TP leg to raise (no-TP proposal, or pre-conversion
-            # PDT-era position). Nothing actionable — treat as hold.
+        if entry is None or entry.qty <= 0:
             log.warning(
                 "thesis_coordinator.adjust_tp_skipped",
                 extra={
                     "event": "thesis_coordinator.adjust_tp_skipped",
                     "execution_id": execution_id,
-                    "reason": "missing_entry_or_live_tp",
+                    "reason": "missing_entry",
                 },
             )
             self._reschedule(
@@ -1036,6 +1149,18 @@ class ThesisReviewCoordinator:
                     reason="adjust_take_profit",
                 )
                 return
+
+        if tp_row is None:
+            self._add_tp_to_stop_only_position(
+                execution_id=execution_id,
+                symbol=symbol,
+                entry_qty=entry.qty,
+                stop_row=stop_row,
+                new_tp_price=new_tp_price,
+                now=now,
+                schedule_id=schedule_id,
+            )
+            return
 
         try:
             replaced = self._broker.replace_limit_order(
@@ -1104,6 +1229,242 @@ class ThesisReviewCoordinator:
             when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
             reason="adjust_take_profit",
         )
+
+    def _add_tp_to_stop_only_position(
+        self,
+        *,
+        execution_id: int,
+        symbol: str,
+        entry_qty: int,
+        stop_row: OrderRow | None,
+        new_tp_price: float,
+        now: dt.datetime,
+        schedule_id: int,
+    ) -> None:
+        """FEIM-class fix: add a TP to a position whose only protection
+        is a live stop. Cancel-confirm the stop, submit stop+TP as one
+        OCO, and on ANY failure of the OCO re-place the original stop
+        immediately (protective-order-count invariant)."""
+        if stop_row is None or stop_row.stop_price is None:
+            # Neither a live TP nor a live stop is journaled — nothing
+            # protective to rebuild around. Treat as hold (the naked
+            # tripwire in the reconciler owns alerting on this state).
+            log.warning(
+                "thesis_coordinator.adjust_tp_skipped",
+                extra={
+                    "event": "thesis_coordinator.adjust_tp_skipped",
+                    "execution_id": execution_id,
+                    "reason": "no_live_tp_or_stop",
+                },
+            )
+            self._reschedule(
+                execution_id,
+                when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
+                reason="adjust_take_profit",
+            )
+            return
+
+        from execution.protection import resolve_leg_cancel
+
+        disposition = resolve_leg_cancel(self._broker, stop_row)
+        if disposition is None:
+            # Stop still live at the broker — it still holds the shares,
+            # so the OCO would be rejected. Position remains protected;
+            # retry tomorrow.
+            log.warning(
+                "thesis_coordinator.adjust_tp_stop_cancel_failed",
+                extra={
+                    "event": "thesis_coordinator.adjust_tp_stop_cancel_failed",
+                    "execution_id": execution_id,
+                    "stop_broker_order_id": stop_row.broker_order_id,
+                },
+            )
+            self._reschedule(
+                execution_id,
+                when=now + dt.timedelta(days=1),
+                reason="adjust_take_profit",
+            )
+            return
+        if disposition == "filled":
+            # Lost the race — the stop filled; fill ingestion owns the exit.
+            log.info(
+                "thesis_coordinator.adjust_tp_lost_race",
+                extra={
+                    "event": "thesis_coordinator.adjust_tp_lost_race",
+                    "execution_id": execution_id,
+                    "stop_broker_order_id": stop_row.broker_order_id,
+                },
+            )
+            return
+
+        try:
+            stop_resp, tp_resp = self._broker.submit_oco_sell(
+                symbol=symbol,
+                qty=entry_qty,
+                stop_price=stop_row.stop_price,
+                limit_price=new_tp_price,
+                client_order_id=f"thesis-adjtp-oco-{schedule_id}",
+            )
+        except Exception as e:  # noqa: BLE001
+            # THE FEIM SWALLOW, closed: the stop is canceled and the
+            # replacement did not go up. Re-place the original stop NOW.
+            restore = self._broker_restore_stop(
+                execution_id=execution_id,
+                symbol=symbol,
+                qty=entry_qty,
+                stop_row=stop_row,
+                disposition=disposition,
+                client_order_id=f"thesis-adjtp-restore-{schedule_id}",
+            )
+            log.error(
+                "thesis_coordinator.adjust_tp_oco_failed",
+                extra={
+                    "event": "thesis_coordinator.adjust_tp_oco_failed",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "new_tp_price": new_tp_price,
+                    "original_stop_price": stop_row.stop_price,
+                    "protection_restored": restore,
+                    "error": str(e),
+                },
+            )
+            self._reschedule(
+                execution_id,
+                when=now + dt.timedelta(days=1),
+                reason="adjust_take_profit",
+            )
+            return
+
+        new_stop_row_id = insert_order(
+            self._journal.db_path,
+            OrderRow(
+                execution_id=execution_id,
+                role=stop_row.role,
+                symbol=symbol,
+                side="sell",
+                order_type="stop",
+                qty=entry_qty,
+                tif="gtc",
+                stop_price=stop_row.stop_price,
+                broker_order_id=stop_resp.broker_order_id,
+                submitted_at=stop_resp.submitted_at,
+                final_status=None,
+                notes=(
+                    "thesis_review:adjust_take_profit re-placed stop "
+                    f"{stop_row.broker_order_id} as OCO"
+                ),
+            ),
+        )
+        if tp_resp is not None:
+            insert_order(
+                self._journal.db_path,
+                OrderRow(
+                    execution_id=execution_id,
+                    role="take_profit",
+                    symbol=symbol,
+                    side="sell",
+                    order_type="limit",
+                    qty=entry_qty,
+                    tif="gtc",
+                    limit_price=new_tp_price,
+                    broker_order_id=tp_resp.broker_order_id,
+                    submitted_at=tp_resp.submitted_at,
+                    final_status=None,
+                    notes="thesis_review:adjust_take_profit added TP as OCO",
+                ),
+            )
+        self._record_order_outcome(
+            stop_row.id, disposition, fill_price=None, fill_qty=None, fill_at=None
+        )
+        set_stop_order_journal_id(
+            self._journal.db_path,
+            execution_id=execution_id,
+            order_journal_id=new_stop_row_id,
+        )
+        log.info(
+            "thesis_coordinator.tp_added_to_stop_only_position",
+            extra={
+                "event": "thesis_coordinator.tp_added_to_stop_only_position",
+                "execution_id": execution_id,
+                "symbol": symbol,
+                "stop_price": stop_row.stop_price,
+                "new_tp_price": new_tp_price,
+                "old_stop_broker_order_id": stop_row.broker_order_id,
+                "new_stop_broker_order_id": stop_resp.broker_order_id,
+            },
+        )
+        self._reschedule(
+            execution_id,
+            when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS),
+            reason="adjust_take_profit",
+        )
+
+    def _broker_restore_stop(
+        self,
+        *,
+        execution_id: int,
+        symbol: str,
+        qty: int,
+        stop_row: OrderRow,
+        disposition: str,
+        client_order_id: str,
+    ) -> bool:
+        """Re-place a just-canceled stop at its prior price (plain GTC),
+        journal it, and rotate the ratchet pointer. Returns True when
+        protection is live again; False leaves the position naked — the
+        caller logs ERROR and the reconciler's `position.naked` tripwire
+        alerts the operator within one cycle."""
+        if stop_row.stop_price is None or stop_row.stop_price <= 0:
+            return False
+        try:
+            restored, _ = self._broker.submit_oco_sell(
+                symbol=symbol,
+                qty=qty,
+                stop_price=stop_row.stop_price or 0.0,
+                limit_price=None,
+                client_order_id=client_order_id,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.error(
+                "thesis_coordinator.protection_restore_failed",
+                extra={
+                    "event": "thesis_coordinator.protection_restore_failed",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "stop_price": stop_row.stop_price,
+                    "error": str(e),
+                },
+            )
+            return False
+        new_row_id = insert_order(
+            self._journal.db_path,
+            OrderRow(
+                execution_id=execution_id,
+                role=stop_row.role,
+                symbol=symbol,
+                side="sell",
+                order_type="stop",
+                qty=qty,
+                tif="gtc",
+                stop_price=stop_row.stop_price,
+                broker_order_id=restored.broker_order_id,
+                submitted_at=restored.submitted_at,
+                final_status=None,
+                notes=(
+                    "protection restored after failed adjust: re-placed "
+                    f"{stop_row.broker_order_id}"
+                ),
+            ),
+        )
+        self._record_order_outcome(
+            stop_row.id, disposition, fill_price=None, fill_qty=None, fill_at=None
+        )
+        set_stop_order_journal_id(
+            self._journal.db_path,
+            execution_id=execution_id,
+            order_journal_id=new_row_id,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Helpers

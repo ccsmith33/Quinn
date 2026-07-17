@@ -21,7 +21,6 @@ from broker.protocol import AccountSnapshot, OrderRequest, Position, Quote, Subm
 from config.loader import ReconcilerConfig
 from journal.models import OrderRow
 from reconciler.reconciler import (
-    ExplainedDiff,
     PositionDiff,
     Reconciler,
     ReconcileReport,
@@ -1555,3 +1554,154 @@ def test_positive_cash_never_alerts() -> None:
 
     assert alerter.calls == []
     assert ks.halts == []
+
+
+# ---------------------------------------------------------------------------
+# Naked-position tripwire (hotfix 2026-07-17, incident FEIM).
+#
+# An open position (qty > 0) with ZERO live protective sell orders at the
+# broker means an order-surgery path canceled the protection and re-placed
+# nothing (FEIM sat naked at +26% for two days). The reconciler — where
+# broker positions are already in hand every tick — WARNs `position.naked`
+# and alerts the operator, deduped per position per ET day. No halt.
+# ---------------------------------------------------------------------------
+
+from broker.protocol import OpenOrder  # noqa: E402
+
+
+class _FakeBrokerWithOpenOrders(_FakeBroker):
+    def __init__(
+        self,
+        *,
+        positions: list[Position] | None = None,
+        open_orders: list[OpenOrder] | None = None,
+    ) -> None:
+        super().__init__(positions=positions)
+        self.open_orders: list[OpenOrder] = list(open_orders or [])
+
+    def get_open_orders(self) -> list[OpenOrder]:
+        return list(self.open_orders)
+
+
+def _protective_sell(symbol: str, *, qty: int = 25) -> OpenOrder:
+    return OpenOrder(
+        symbol=symbol,
+        side="sell",
+        qty=qty,
+        order_type="stop",
+        status="accepted",
+        broker_order_id=f"stop-{symbol}",
+        client_order_id=f"cid-stop-{symbol}",
+    )
+
+
+def test_naked_position_fires_warning_and_alert_once_per_day() -> None:
+    """(c) qty>0 + zero live sell orders at the broker → one
+    `position.naked` WARNING + one operator alert; the next tick the
+    same day stays silent (dedupe per position per ET day). No halt."""
+    import logging
+
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record)
+
+    handler = _Capture(level=logging.WARNING)
+    named_logger = logging.getLogger("reconciler.reconciler")
+    named_logger.addHandler(handler)
+    try:
+        pos = [_position("FEIM", 19, 52.0)]
+        broker = _FakeBrokerWithOpenOrders(positions=pos, open_orders=[])
+        journal = _FakeJournal(expected_positions=pos)
+        ks = _FakeKillSwitch()
+        alerter = _FakeAlerter()
+        rec = Reconciler(
+            broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market
+        )
+
+        rec.reconcile_now()
+        rec.reconcile_now()  # same ET day → deduped, no second alert
+    finally:
+        named_logger.removeHandler(handler)
+
+    assert len(alerter.calls) == 1
+    assert "FEIM" in alerter.calls[0]
+    assert "NAKED" in alerter.calls[0]
+    warnings = [
+        r for r in captured if getattr(r, "event", None) == "position.naked"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0].levelno == logging.WARNING
+    assert ks.halts == []  # observational — never halts
+
+
+def test_naked_position_realerts_next_et_day() -> None:
+    """(c) The dedupe is per ET day: a position still naked on the next
+    trading day pages again."""
+    pos = [_position("FEIM", 19, 52.0)]
+    broker = _FakeBrokerWithOpenOrders(positions=pos, open_orders=[])
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    clock = {"now": _MARKET_OPEN_TIME}
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), alerter=alerter,
+        now_fn=lambda: clock["now"],
+    )
+
+    rec.reconcile_now()
+    assert len(alerter.calls) == 1
+
+    clock["now"] = _MARKET_OPEN_TIME + dt.timedelta(days=1)  # Wed, market hours
+    rec.reconcile_now()
+    assert len(alerter.calls) == 2
+
+
+def test_protected_position_never_alerts_and_rearms_dedupe() -> None:
+    """(c) A live protective sell order at the broker suppresses the
+    tripwire; protection reappearing clears the dedupe so a LATER
+    re-nakedness the same day pages again."""
+    pos = [_position("FEIM", 19, 52.0)]
+    broker = _FakeBrokerWithOpenOrders(
+        positions=pos, open_orders=[_protective_sell("FEIM", qty=19)]
+    )
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market
+    )
+
+    rec.reconcile_now()
+    assert alerter.calls == []  # protected — no noise
+
+    broker.open_orders = []  # protection vanished mid-day
+    rec.reconcile_now()
+    assert len(alerter.calls) == 1
+
+    broker.open_orders = [_protective_sell("FEIM", qty=19)]  # operator fixed it
+    rec.reconcile_now()
+    assert len(alerter.calls) == 1
+
+    broker.open_orders = []  # naked AGAIN the same day → fresh page
+    rec.reconcile_now()
+    assert len(alerter.calls) == 2
+
+
+def test_naked_check_inert_without_get_open_orders_surface() -> None:
+    """(c) Legacy adapters/fakes without `get_open_orders` leave the
+    tripwire inert (no crash, no alert)."""
+    pos = [_position("ACME", 25)]
+    broker = _FakeBroker(positions=pos)  # no get_open_orders
+    journal = _FakeJournal(expected_positions=pos)
+    ks = _FakeKillSwitch()
+    alerter = _FakeAlerter()
+    rec = Reconciler(
+        broker, journal, ks, _cfg(), alerter=alerter, now_fn=_now_market
+    )
+
+    report = rec.reconcile_now()
+
+    assert report.matched
+    assert alerter.calls == []

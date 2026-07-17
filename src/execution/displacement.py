@@ -22,9 +22,10 @@ cannot fund one share above the reserve floor). The engine then:
      displacement_proceeds_haircut × victim market value` — if even the
      credited size cannot fund one share, the displacement aborts BEFORE
      any order is submitted (never evict a position we cannot replace);
-  5. submits the victim's liquidation (market sell, then best-effort
-     cancel of its live GTC protective legs — the SAME order path the
-     thesis-review `close` decision uses) and journals the sale with a
+  5. submits the victim's liquidation (confirmed cancel of its live GTC
+     protective legs FIRST, then the market sell — the SAME
+     protection-preserving order path the thesis-review `close`
+     decision uses) and journals the sale with a
      `displacement:` notes prefix carrying victim, new symbol, and both
      convictions (the audit trail AND the daily-cap persistence);
   6. returns the pre-computed `SizingAccepted` so the loop submits the
@@ -55,6 +56,7 @@ from broker.protocol import (
 )
 from config.calendar import ET, is_market_open_day
 from config.loader import ExecutionConfig
+from execution.protection import cancel_protective_legs, restore_protection
 from execution.sizing import SizingAccepted, SizingEngine
 from journal.exit_policy import get_exit_policy_state
 from journal.models import OrderRow
@@ -365,8 +367,9 @@ class DisplacementEngine:
         return int(row["execution_id"]), (int(cv) if cv is not None else None)
 
     # ------------------------------------------------------------------
-    # Victim liquidation (mirrors thesis-review `close` — market sell
-    # first, then best-effort cancel of the live GTC protective legs)
+    # Victim liquidation (mirrors thesis-review `close` — confirmed
+    # cancel of the live GTC protective legs first, THEN the market
+    # sell; failure re-places the victim's protection)
     # ------------------------------------------------------------------
 
     def liquidate_victim(
@@ -376,14 +379,57 @@ class DisplacementEngine:
         new_symbol: str,
         new_conviction: int,
     ) -> bool:
-        """Submit the victim's market sell; True only after broker ack.
+        """Cancel the victim's live protective legs (confirmed), THEN
+        submit its market sell; True only after broker ack of the sell.
 
-        Same order path as `ThesisReviewCoordinator._apply_close`: plain
-        market sell (queues to the open when pre-market), journaled
-        against the victim's execution, then best-effort cancellation of
-        its live protective legs. Qty is the broker position's qty (full
-        liquidation of what is actually held).
+        Same protection-preserving sequence as the thesis-review `close`
+        (incident VRDN 2026-07-14..17: a sell submitted while GTC legs
+        hold the shares is rejected with Alpaca 40310000 `insufficient
+        qty available`). Any failure aborts the displacement with the
+        victim's protection re-placed — the victim must never end LESS
+        protected because a displacement half-ran. Qty is the broker
+        position's qty (full liquidation of what is actually held).
         """
+        outcome = cancel_protective_legs(
+            self._db, self._broker, victim.execution_id
+        )
+        if outcome.any_filled:
+            # A protective leg filled mid-flight — the victim is already
+            # exiting on its own; abort the displacement cleanly.
+            log.info(
+                "execution.displacement.victim_leg_filled",
+                extra={
+                    "event": "execution.displacement.victim_leg_filled",
+                    "victim_symbol": victim.symbol,
+                    "victim_execution_id": victim.execution_id,
+                },
+            )
+            return False
+        if not outcome.all_cleared:
+            if outcome.cleared:
+                restore_protection(
+                    self._db,
+                    self._broker,
+                    victim.execution_id,
+                    outcome.cleared,
+                    client_order_id=(
+                        f"displace-restore-exec-{victim.execution_id}"
+                    ),
+                    notes="displacement aborted: leg cancel failed; protection restored",
+                )
+            log.warning(
+                "execution.displacement.cancel_failed",
+                extra={
+                    "event": "execution.displacement.cancel_failed",
+                    "victim_execution_id": victim.execution_id,
+                    "victim_symbol": victim.symbol,
+                    "still_live_broker_order_ids": [
+                        o.broker_order_id for o in outcome.failed
+                    ],
+                },
+            )
+            return False
+
         req = OrderRequest(
             symbol=victim.symbol,
             side="sell",
@@ -395,6 +441,14 @@ class DisplacementEngine:
         try:
             submitted = self._broker.submit_order(req)
         except Exception as e:  # noqa: BLE001 — abort displacement entirely
+            restored = restore_protection(
+                self._db,
+                self._broker,
+                victim.execution_id,
+                outcome.cleared,
+                client_order_id=f"displace-restore-exec-{victim.execution_id}",
+                notes="displacement aborted: sell failed; protection restored",
+            )
             log.error(
                 "execution.displacement.sell_failed",
                 extra={
@@ -402,6 +456,7 @@ class DisplacementEngine:
                     "victim_symbol": victim.symbol,
                     "victim_execution_id": victim.execution_id,
                     "new_symbol": new_symbol,
+                    "protection_restored": restored is not None,
                     "error": str(e),
                     "error_class": type(e).__name__,
                 },
@@ -430,28 +485,6 @@ class DisplacementEngine:
                 ),
             ),
         )
-
-        # Cancel the live GTC protective legs, best effort (mirrors the
-        # thesis close). Failures are not fatal — the position is closing
-        # and a lingering leg on a zero-qty position cannot fill.
-        for o in get_orders_for_execution(self._db, victim.execution_id):
-            if (
-                o.role in ("stop", "take_profit", "trailing_stop")
-                and o.final_status is None
-            ):
-                try:
-                    self._broker.cancel_order(o.broker_order_id)
-                except Exception as e:  # noqa: BLE001
-                    log.warning(
-                        "execution.displacement.cancel_failed",
-                        extra={
-                            "event": "execution.displacement.cancel_failed",
-                            "victim_execution_id": victim.execution_id,
-                            "role": o.role,
-                            "broker_order_id": o.broker_order_id,
-                            "error": str(e),
-                        },
-                    )
         return True
 
 

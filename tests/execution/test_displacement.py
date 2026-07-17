@@ -66,19 +66,33 @@ def db(tmp_path: Path) -> str:
 
 
 class _RecordingBroker:
-    """submit_order / cancel_order recorder with a one-shot failure arm."""
+    """submit_order / cancel_order recorder with one-shot failure arms.
+    `call_log` records mutating ops in invocation order for the
+    cancel-before-sell safety assertions."""
 
     def __init__(self) -> None:
         self.submitted: list[OrderRequest] = []
         self.canceled: list[str] = []
+        self.submitted_oco: list[dict[str, Any]] = []
+        self.call_log: list[str] = []
         self.fail_next_submit = False
+        self.fail_next_cancel = False
+        self.orders_by_id: dict[str, SubmittedOrder] = {}
         self._n = 0
+
+    def seed_order(self, order: SubmittedOrder) -> None:
+        self.orders_by_id[order.broker_order_id] = order
+
+    def get_order_by_id(self, broker_order_id: str) -> SubmittedOrder | None:
+        return self.orders_by_id.get(broker_order_id)
 
     def submit_order(self, req: OrderRequest) -> SubmittedOrder:
         if self.fail_next_submit:
             self.fail_next_submit = False
+            self.call_log.append("submit_failed")
             raise RuntimeError("simulated broker outage")
         self.submitted.append(req)
+        self.call_log.append("submit")
         self._n += 1
         return SubmittedOrder(
             broker_order_id=f"disp-{self._n:04d}",
@@ -92,7 +106,44 @@ class _RecordingBroker:
         )
 
     def cancel_order(self, broker_order_id: str) -> None:
+        if self.fail_next_cancel:
+            self.fail_next_cancel = False
+            self.call_log.append("cancel_failed")
+            raise RuntimeError("simulated cancel failure")
         self.canceled.append(broker_order_id)
+        self.call_log.append("cancel")
+
+    def submit_oco_sell(
+        self,
+        *,
+        symbol: str,
+        qty: int,
+        stop_price: float,
+        limit_price: float | None,
+        client_order_id: str,
+    ) -> tuple[SubmittedOrder, SubmittedOrder | None]:
+        self.submitted_oco.append(
+            {
+                "symbol": symbol,
+                "qty": qty,
+                "stop_price": stop_price,
+                "limit_price": limit_price,
+            }
+        )
+        self.call_log.append("submit_oco")
+        self._n += 1
+        stop = SubmittedOrder(
+            broker_order_id=f"disp-oco-{self._n:04d}",
+            client_order_id=client_order_id,
+            symbol=symbol,
+            side="sell",
+            qty=qty,
+            order_type="stop",
+            status="accepted",
+            submitted_at=NOW,
+            stop_price=stop_price,
+        )
+        return stop, None
 
 
 def _cfg(**overrides: Any) -> ExecutionConfig:
@@ -469,8 +520,16 @@ def test_weakest_victim_chosen_sell_submitted_buy_sized_with_credit(
         20,
     )
     assert sell.client_order_id == f"displace-close-exec-{weakest_eid}"
-    # Live protective leg cancelled best-effort (same as thesis close).
+    # Live protective leg cancelled BEFORE the sell (incident VRDN: the
+    # resting leg holds the shares — a sell submitted first is rejected
+    # with Alpaca 40310000 `insufficient qty available`).
     assert broker.canceled == ["stop-WKST"]
+    cancel_idx = broker.call_log.index("cancel")
+    submit_idx = broker.call_log.index("submit")
+    assert cancel_idx < submit_idx, (
+        "displacement must cancel the victim's protective legs BEFORE "
+        "submitting its market sell"
+    )
 
     # Audit trail: distinct journal row with the displacement: prefix
     # carrying victim, new symbol, and both convictions.
@@ -570,7 +629,7 @@ def test_prior_day_displacement_does_not_block_today(db: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_broker_sell_failure_aborts_buy_and_leaves_no_trail(db: str) -> None:
+def test_broker_sell_failure_aborts_buy_and_restores_protection(db: str) -> None:
     broker = _RecordingBroker()
     _seed_victim(db, symbol="WIDG", entry_at=AGED)
     broker.fail_next_submit = True
@@ -581,12 +640,47 @@ def test_broker_sell_failure_aborts_buy_and_leaves_no_trail(db: str) -> None:
     )
     assert result is None  # the buy must never be sized/submitted
     assert broker.submitted == []
+    # Invariant (incident FEIM class): the sell failed AFTER the victim's
+    # stop was canceled — the abort must RE-PLACE the victim's protection,
+    # not leave it naked.
+    assert len(broker.submitted_oco) == 1
+    assert broker.submitted_oco[0]["symbol"] == "WIDG"
     with connect(db) as conn:
         rows = conn.execute(
             "SELECT 1 FROM orders WHERE notes LIKE ?",
             (f"{DISPLACEMENT_NOTES_PREFIX}%",),
         ).fetchall()
     assert rows == []  # no displacement journal row → daily cap unconsumed
+    assert not displaced_today(db, now=NOW)
+
+
+def test_leg_cancel_failure_aborts_displacement_before_sell(db: str) -> None:
+    """A protective-leg cancel that cannot be confirmed dead aborts the
+    displacement with NO sell submitted (the leg still holds the
+    victim's shares — the sell would be the VRDN 40310000 rejection)."""
+    broker = _RecordingBroker()
+    _seed_victim(db, symbol="WIDG", entry_at=AGED)
+    broker.fail_next_cancel = True
+    broker.seed_order(
+        SubmittedOrder(
+            broker_order_id="stop-WIDG",
+            client_order_id="cid-stop-WIDG",
+            symbol="WIDG",
+            side="sell",
+            qty=20,
+            order_type="stop",
+            status="accepted",  # confirmed STILL LIVE at the broker
+            submitted_at=NOW,
+            stop_price=90.0,
+        )
+    )
+    result = _attempt(
+        _engine(db, broker),
+        positions=[_position("WIDG", unrealized_pct=-8.0)],
+        cfg=_cfg(),
+    )
+    assert result is None
+    assert broker.submitted == []  # NO sell while the leg holds the shares
     assert not displaced_today(db, now=NOW)
 
 

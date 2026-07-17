@@ -138,6 +138,38 @@ class _FakeBroker:
         self.canceled.append(broker_order_id)
 
 
+class _FakeBrokerWithLookup(_FakeBroker):
+    """Adds the WS1 `get_order_by_id` surface + a `submit_order`
+    recorder — the self-heal paths interrogate the dead PATCH target and
+    place a FRESH stop via plain submit."""
+
+    def __init__(self, *, last: float = 100.0) -> None:
+        super().__init__(last=last)
+        self.orders_by_id: dict[str, SubmittedOrder] = {}
+        self.submitted: list[Any] = []
+
+    def seed_order(self, order: SubmittedOrder) -> None:
+        self.orders_by_id[order.broker_order_id] = order
+
+    def get_order_by_id(self, broker_order_id: str) -> SubmittedOrder | None:
+        return self.orders_by_id.get(broker_order_id)
+
+    def submit_order(self, req: Any) -> SubmittedOrder:
+        self.submitted.append(req)
+        self.next_id += 1
+        return SubmittedOrder(
+            broker_order_id=f"eps-heal-{self.next_id:06d}",
+            client_order_id=req.client_order_id,
+            symbol=req.symbol,
+            side=req.side,
+            qty=req.qty,
+            order_type=req.order_type,
+            status="accepted",
+            submitted_at=NOW,
+            stop_price=req.stop_price,
+        )
+
+
 class _OutcomeRecorder:
     def __init__(self) -> None:
         self.calls: list[tuple[int, str]] = []
@@ -772,6 +804,178 @@ def test_quote_failure_on_one_symbol_does_not_stop_others(db: str) -> None:
 
     assert len(broker.replaced) == 1
     assert broker.replaced[0]["old_id"] == "stop-eps-acc-2"
+
+
+# ---------------------------------------------------------------------------
+# Self-heal (incident FEIM 2026-07-16): trail-armed position whose stop
+# was canceled out from under the ratchet must get a FRESH stop.
+# ---------------------------------------------------------------------------
+
+
+def test_selfheal_places_fresh_stop_when_state_references_canceled_order(
+    db: str,
+) -> None:
+    """FEIM reconstruction, silent-blindness arm: fill ingestion has
+    recorded the stop's cancel (final_status='canceled'), so the row
+    left the live set and the ratchet's live-stop scan goes blind while
+    `exit_policy_state` is still trail-engaged — the position sat naked
+    for two days in prod. The heal pass must place a fresh GTC stop at
+    the computed trail floor on the very next tick and rotate the
+    pointer."""
+    eid, stop_id = _seed_position(
+        db, stop_final_status="canceled", trail_distance_pct=10.0
+    )
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=10.0,
+            trail_engaged=True,
+            high_water_mark=130.0,
+            stop_order_journal_id=stop_id,  # points at the CANCELED order
+        ),
+    )
+    broker = _FakeBrokerWithLookup(last=128.0)
+
+    _tick(db, broker)
+
+    # Fresh GTC stop at the trail floor: 130 * (1 - 10%) = 117.0.
+    assert len(broker.submitted) == 1
+    req = broker.submitted[0]
+    assert req.side == "sell"
+    assert req.order_type == "stop"
+    assert req.tif == "gtc"
+    assert req.qty == 100
+    assert req.stop_price == pytest.approx(117.0)
+    # No doomed PATCH attempts against the dead order.
+    assert broker.replaced == []
+
+    # Journal: live trailing_stop row; pointer rotated onto it.
+    trail_rows = [
+        o for o in get_orders_for_execution(db, eid)
+        if o.role == "trailing_stop" and o.final_status is None
+    ]
+    assert len(trail_rows) == 1
+    assert trail_rows[0].stop_price == pytest.approx(117.0)
+    assert "trail_selfheal" in (trail_rows[0].notes or "")
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.stop_order_journal_id == trail_rows[0].id
+
+    # Next tick: healed position is a normal ratchet citizen again — no
+    # second heal row.
+    _tick(db, broker)
+    assert len(broker.submitted) == 1
+
+
+def test_selfheal_after_patch_fails_against_dead_order(db: str) -> None:
+    """FEIM reconstruction, PATCH-failure arm: the journal row is still
+    live (`final_status` NULL) but the broker order is CANCELED — the
+    PATCH fails every tick forever. The ratchet must interrogate the
+    target, see it is dead, and submit a fresh stop at the computed
+    floor instead of retrying a doomed PATCH."""
+    eid, stop_id = _seed_position(db, trail_distance_pct=10.0)
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=10.0,
+            trail_engaged=True,
+            high_water_mark=120.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBrokerWithLookup(last=125.0)
+    broker.fail_next_replace()
+    broker.seed_order(
+        SubmittedOrder(
+            broker_order_id="stop-eps-acc-1",
+            client_order_id="cid-stop",
+            symbol="ACME",
+            side="sell",
+            qty=100,
+            order_type="stop",
+            status="canceled",  # canceled out from under the ratchet
+            submitted_at=NOW,
+            stop_price=90.0,
+        )
+    )
+    recorder = _OutcomeRecorder()
+
+    _tick(db, broker, recorder=recorder)
+
+    # Fresh stop at the computed floor: hwm=max(120,125)=125 → 112.5.
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == pytest.approx(112.5)
+    assert broker.replaced == []  # PATCH failed; no successful replace
+    # Dead row completed with the observed broker status.
+    assert recorder.calls == [(stop_id, "canceled")]
+    trail_rows = [
+        o for o in get_orders_for_execution(db, eid)
+        if o.role == "trailing_stop" and o.final_status is None
+    ]
+    assert len(trail_rows) == 1
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None
+    assert state.stop_order_journal_id == trail_rows[0].id
+
+
+def test_selfheal_not_triggered_when_patch_target_still_live(db: str) -> None:
+    """A transient PATCH failure against a still-live order keeps the
+    original contract: no fresh submit, no journal row, retry next
+    tick."""
+    eid, _ = _seed_position(db, trail_distance_pct=10.0)
+    broker = _FakeBrokerWithLookup(last=110.0)
+    broker.fail_next_replace()
+    broker.seed_order(
+        SubmittedOrder(
+            broker_order_id="stop-eps-acc-1",
+            client_order_id="cid-stop",
+            symbol="ACME",
+            side="sell",
+            qty=100,
+            order_type="stop",
+            status="accepted",  # still live — transient failure
+            submitted_at=NOW,
+            stop_price=90.0,
+        )
+    )
+
+    _tick(db, broker)
+
+    assert broker.submitted == []
+    trail_rows = [
+        o for o in get_orders_for_execution(db, eid) if o.role == "trailing_stop"
+    ]
+    assert trail_rows == []
+    state = get_exit_policy_state(db, execution_id=eid)
+    assert state is not None  # engaged this tick; hwm persisted for retry
+
+
+def test_selfheal_skips_closed_position(db: str) -> None:
+    """Engaged state + canceled stop but the position is closed in the
+    journal → nothing to protect; no fresh stop."""
+    eid, stop_id = _seed_position(
+        db, stop_final_status="canceled", position_open=False
+    )
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=10.0,
+            trail_engaged=True,
+            high_water_mark=130.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBrokerWithLookup(last=128.0)
+
+    _tick(db, broker)
+
+    assert broker.submitted == []
 
 
 # ---------------------------------------------------------------------------
