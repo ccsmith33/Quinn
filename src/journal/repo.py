@@ -1013,6 +1013,23 @@ def get_kill_switch_halts_since_last_resume(
     return [KillSwitchStateRow(**dict(r)) for r in rows]
 
 
+def get_recent_kill_switch_rows(
+    db_path: str, *, limit: int = 50
+) -> list[KillSwitchStateRow]:
+    """Newest-first slice of kill_switch_state history. Consumer: the
+    auto-halt evaluator's operator-resume re-fire suppression (2026-07-14
+    clay incident) needs to see the newest operator resume AND the halt
+    rows it resolved — `get_kill_switch_halts_since_last_resume` cannot,
+    by construction (it only returns rows NEWER than the last resume)."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM kill_switch_state "
+            "ORDER BY set_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [KillSwitchStateRow(**dict(r)) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # universe_snapshots + universe_members (append-only)
 # ---------------------------------------------------------------------------
@@ -1484,6 +1501,11 @@ class JournalRepo:
 
     def get_kill_switch_halts_since_last_resume(self) -> list[KillSwitchStateRow]:
         return get_kill_switch_halts_since_last_resume(self.db_path)
+
+    def get_recent_kill_switch_rows(
+        self, *, limit: int = 50
+    ) -> list[KillSwitchStateRow]:
+        return get_recent_kill_switch_rows(self.db_path, limit=limit)
 
     def get_latest_kill_switch_state(self) -> KillSwitchStateRow | None:
         try:
