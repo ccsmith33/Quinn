@@ -27,6 +27,7 @@ live at the broker.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -35,6 +36,12 @@ from journal.repo import connect, insert_order
 from observability.log_port import get_logger
 
 log = get_logger(__name__)
+
+# Delay in seconds after canceling orders to allow Alpaca's system to
+# release the shares before submitting new orders (hotfix for 40310000
+# "insufficient qty available" errors when shares are still "held_for_orders"
+# immediately after cancellation).
+_POST_CANCEL_DELAY_SECONDS = 0.15
 
 # Roles that constitute a position's broker-side protection.
 PROTECTIVE_ROLES = ("take_profit", "stop", "trailing_stop")
@@ -132,7 +139,8 @@ def cancel_protective_legs(
 ) -> LegCancelOutcome:
     """Cancel every live protective leg for the execution, confirming
     each. Stops early on the first unconfirmed cancel (the remaining
-    legs stay untouched and live)."""
+    legs stay untouched and live). Adds a small delay after all legs
+    are cleared to allow Alpaca's system to release the shares."""
     outcome = LegCancelOutcome()
     for row in get_live_protective_legs(db_path, execution_id):
         disposition = resolve_leg_cancel(broker, row)
@@ -140,6 +148,13 @@ def cancel_protective_legs(
             outcome.failed.append(row)
             break  # leave remaining legs untouched — they still protect
         outcome.cleared.append(ClearedLeg(row=row, disposition=disposition))
+
+    # If all legs were successfully cleared, wait a brief moment for
+    # Alpaca's system to release the shares before the caller attempts
+    # to submit new orders (hotfix for 40310000 errors).
+    if outcome.all_cleared and outcome.cleared:
+        time.sleep(_POST_CANCEL_DELAY_SECONDS)
+
     return outcome
 
 

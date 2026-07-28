@@ -478,7 +478,7 @@ class ThesisReviewCoordinator:
                     self._broker,
                     execution_id,
                     outcome.cleared,
-                    client_order_id=f"thesis-close-restore-{execution_id}",
+                    client_order_id=f"thesis-close-restore-{execution_id}-{now.timestamp():.0f}",
                     notes="thesis_review:close leg-cancel failed; protection restored",
                 )
             log.warning(
@@ -518,7 +518,7 @@ class ThesisReviewCoordinator:
                 self._broker,
                 execution_id,
                 outcome.cleared,
-                client_order_id=f"thesis-close-restore-{execution_id}",
+                client_order_id=f"thesis-close-restore-{execution_id}-{now.timestamp():.0f}",
                 notes="thesis_review:close sell failed; protection restored",
             )
             log.error(
@@ -1264,6 +1264,7 @@ class ThesisReviewCoordinator:
             )
             return
 
+        import time
         from execution.protection import resolve_leg_cancel
 
         disposition = resolve_leg_cancel(self._broker, stop_row)
@@ -1296,6 +1297,10 @@ class ThesisReviewCoordinator:
                 },
             )
             return
+
+        # Brief delay after cancel to allow Alpaca to release the shares
+        # (hotfix for 40310000 "insufficient qty available" errors).
+        time.sleep(0.15)
 
         try:
             stop_resp, tp_resp = self._broker.submit_oco_sell(
