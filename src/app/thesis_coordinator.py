@@ -251,6 +251,9 @@ class ThesisReviewCoordinator:
         )
         self._execution_config = execution_config
         self._capacity_target_slots = capacity_target_slots
+        # F5: latch so the "target above cap → clamped" warning is emitted
+        # at most once per process rather than on every swept tick.
+        self._capacity_clamp_warned = False
         self._get_live_protective_order = get_live_protective_order or (
             lambda *, execution_id, roles: _default_get_live_protective_order(
                 self._journal.db_path, execution_id=execution_id, roles=roles
@@ -1513,7 +1516,10 @@ class ThesisReviewCoordinator:
         slots are the UNIQUE symbols across (held positions ∪ pending entry
         BUYs), and the cap is the equity-tiered `ks5_effective_cap`. So
         `open_slots = effective_cap − len(held ∪ pending_entries)`. The
-        block is injected only while `open_slots < capacity_target_slots`.
+        block is injected only while `open_slots < effective_target`, where
+        `effective_target = min(capacity_target_slots, effective_cap)` — a
+        target above the cap is physically unsatisfiable and would nudge on
+        every sweep forever, so it is clamped to the cap (F5).
         """
         target = self._capacity_target_slots
         if target <= 0 or self._execution_config is None:
@@ -1554,25 +1560,57 @@ class ThesisReviewCoordinator:
                 )
                 pending_symbols = set()
 
+        # Slot accounting mirrors SizingEngine.size's KS-5 gate (sizing.py):
+        # used slots = unique symbols across held ∪ pending-entry BUYs, cap =
+        # ks5_effective_cap. F4: the two sites read from INDEPENDENTLY
+        # assembled inputs and agree today only because long-only makes
+        # `qty != 0` ≡ `qty > 0` (sizing filters neither sign). If short
+        # support is ever added, the held-symbol derivation must be
+        # reconciled in BOTH places or the counts silently diverge.
         held_symbols = {p.symbol for p in positions}
+        pending_only = pending_symbols - held_symbols
         cap = ks5_effective_cap(account.equity, self._execution_config)
         used = len(held_symbols | pending_symbols)
         open_slots = cap - used
-        if open_slots >= target:
+
+        # F5: a configured target above the effective cap can never be
+        # satisfied (open_slots maxes out at cap), so clamp it — otherwise
+        # the block would inject on every sweep in perpetuity. Warn ONCE per
+        # process when the clamp actually bites (an operator misconfig, not a
+        # per-tick event).
+        effective_target = min(target, cap)
+        if effective_target < target and not self._capacity_clamp_warned:
+            log.warning(
+                "event_reviews.capacity_target_clamped",
+                extra={
+                    "event": "event_reviews.capacity_target_clamped",
+                    "configured_target": target,
+                    "effective_cap": cap,
+                    "effective_target": effective_target,
+                },
+            )
+            self._capacity_clamp_warned = True
+
+        if open_slots >= effective_target:
             return None
 
         ranking = self._rank_open_positions(positions, now)
         block = _render_capacity_block(
-            open_slots=open_slots, target=target, cap=cap, ranking=ranking
+            open_slots=open_slots,
+            target=effective_target,
+            cap=cap,
+            pending_count=len(pending_only),
+            ranking=ranking,
         )
         log.info(
             "event_reviews.capacity_pressure",
             extra={
                 "event": "event_reviews.capacity_pressure",
                 "open_slots": open_slots,
-                "target": target,
+                "target": effective_target,
+                "configured_target": target,
                 "position_count": len(held_symbols),
-                "pending_entry_count": len(pending_symbols - held_symbols),
+                "pending_entry_count": len(pending_only),
                 "effective_cap": cap,
             },
         )
@@ -1815,6 +1853,7 @@ def _render_capacity_block(
     open_slots: int,
     target: int,
     cap: int,
+    pending_count: int,
     ranking: list[_WeaknessRow],
 ) -> str:
     """Render the capacity-pressure context block appended (block 3 only)
@@ -1825,11 +1864,21 @@ def _render_capacity_block(
     and its Exemptions (armed trail / Zone 3, dated catalyst ahead, fresh
     <5-trading-day positions) are authoritative; this block only tells the
     reviewer that capacity is tight and which positions are weakest.
+
+    F6: the holding line surfaces the pending-entry count so the reported
+    arithmetic reconciles — `open_slots` subtracts held ∪ pending, so a
+    held-only "N of C-cap" would look like free slots remain when they do
+    not. `held (+P pending) of C-cap` makes `C − held − P = open_slots`
+    visible to the reviewer.
     """
+    # `held` is the ranking length (the ranking is over held positions only;
+    # pending entries have no position to weigh yet).
+    held = len(ranking)
+    pending_note = f" (+{pending_count} pending)" if pending_count else ""
     lines = [
         "# Capacity pressure (daily sweep)",
         f"open_slots: {open_slots} (target {target}); portfolio holding "
-        f"{len(ranking)} of an effective {cap}-position cap.",
+        f"{held}{pending_note} of an effective {cap}-position cap.",
         "",
         "Quinn must keep the ABILITY to open at least "
         f"{target} new position(s) at the coming market open, and only "

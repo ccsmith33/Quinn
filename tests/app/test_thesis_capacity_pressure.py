@@ -385,6 +385,39 @@ def test_pending_entries_consume_slots(db: str) -> None:
     block = coord._compute_capacity_pressure_block(NOW)
     assert block is not None
     assert "open_slots: 0 (target 2)" in block
+    # F6: the holding line surfaces pending so the arithmetic reconciles —
+    # 3 held + 2 pending against a 5-cap == 0 open slots.
+    assert "holding 3 (+2 pending) of an effective 5-position cap" in block
+
+
+def test_target_above_effective_cap_is_clamped(db: str) -> None:
+    """F5: a target above the effective cap is physically unsatisfiable and
+    would nudge on every sweep forever. It is clamped to the cap: an empty
+    book (open_slots == cap) then yields NO block, and under real pressure
+    the rendered target shows the CLAMPED value, not the raw config."""
+    cfg = _exec_cfg(ks5_max_concurrent=3)  # effective cap 3 < target 5
+    # Empty book: open_slots 3 == clamped target 3 → no perpetual nudge.
+    empty_coord = _coordinator(
+        db, _FakeBroker(equity=100_000.0, positions=[]), _CapturingReviewer(),
+        capacity_target_slots=5, execution_config=cfg,
+    )
+    assert empty_coord._compute_capacity_pressure_block(NOW) is None
+    # The clamp was detected and the once-per-process warning latched.
+    assert empty_coord._capacity_clamp_warned is True
+
+    # Genuine pressure (2 held → open_slots 1 < clamped target 3): the block
+    # fires and reports the clamped target 3, never the configured 5.
+    for i in range(2):
+        _seed_entry(db, symbol=f"C{i}", conviction=7, entry_at=NOW - dt.timedelta(days=20))
+    positions = [_position(f"C{i}", qty=100, avg=100.0, unrealized=-50.0) for i in range(2)]
+    coord = _coordinator(
+        db, _FakeBroker(equity=100_000.0, positions=positions), _CapturingReviewer(),
+        capacity_target_slots=5, execution_config=cfg,
+    )
+    block = coord._compute_capacity_pressure_block(NOW)
+    assert block is not None
+    assert "open_slots: 1 (target 3)" in block
+    assert "target 5" not in block
 
 
 def test_effective_cap_uses_ks5_tiers(db: str) -> None:
