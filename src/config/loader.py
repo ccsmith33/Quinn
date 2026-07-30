@@ -240,6 +240,18 @@ class EventReviewsConfig(_Section):
     # vs entry). Empty (default) = derive from execution.trail_stages
     # gain_pcts plus the +10% arming line.
     gain_thresholds_pct: list[float] = Field(default_factory=list)
+    # Capacity-pressure sweep: when the daily pre-market sweep fires and
+    # the portfolio is within `capacity_target_slots` of its KS-5
+    # effective concurrent-position cap, every `event:daily_sweep` review
+    # that morning gets an extra context block ranking the open positions
+    # by weakness and biasing the reviewer (under the prompt's dead-money
+    # doctrine) toward freeing the weakest NON-EXEMPT slots — so Quinn
+    # keeps the ability to open new positions at the open. It is a nudge
+    # to the existing LLM review, NOT a mechanical evictor, and the
+    # doctrine's exemptions (armed trail, dated catalyst ahead, <5 trading
+    # days) remain binding. Only meaningful when `daily_sweep = true`.
+    # Range 0–5; 0 (the default) turns the capacity block off entirely.
+    capacity_target_slots: int = Field(default=0, ge=0, le=5)
 
     @model_validator(mode="after")
     def _check_gain_thresholds_monotonic(self) -> EventReviewsConfig:

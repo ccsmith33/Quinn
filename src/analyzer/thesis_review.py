@@ -112,6 +112,7 @@ class _PromptBuilderPort(Protocol):
         hwm_gain_pct: float | None = None,
         trigger_reason: str | None = None,
         trigger_detail: str | None = None,
+        capacity_pressure_block: str | None = None,
     ) -> ApiRequest: ...
 
 
@@ -148,6 +149,12 @@ class ThesisReviewContext:
     # event triggers (filing form/accession, headline text).
     trigger_reason: str | None = None
     trigger_detail: str | None = None
+    # Capacity-pressure sweep context (feature off / not a daily sweep /
+    # not under pressure → None). Set by the coordinator only on
+    # 'event:daily_sweep' reviews; appended to the per-call block 3 by the
+    # prompt builder so it never perturbs the cached system blocks. See
+    # EventReviewsConfig.capacity_target_slots.
+    capacity_pressure_block: str | None = None
 
 
 class ThesisReviewer:
@@ -186,6 +193,7 @@ class ThesisReviewer:
             hwm_gain_pct=ctx.hwm_gain_pct,
             trigger_reason=ctx.trigger_reason,
             trigger_detail=ctx.trigger_detail,
+            capacity_pressure_block=ctx.capacity_pressure_block,
         )
         # Build a unique decision_id per thesis-review schedule so llm_calls
         # rows stay distinct from proposal-review rows for the same proposal.

@@ -7,7 +7,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from config.loader import AppConfig, ConfigError, ExecutionConfig, load_config
+from config.loader import (
+    AppConfig,
+    ConfigError,
+    EventReviewsConfig,
+    ExecutionConfig,
+    load_config,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 EXAMPLE_TOML = REPO_ROOT / "config" / "quinn.example.toml"
@@ -69,6 +75,58 @@ rss_poll_seconds_market = 60
     p.write_text(minimal, encoding="utf-8")
     with pytest.raises(ConfigError):
         load_config(str(p))
+
+
+# ---------------------------------------------------------------------------
+# Capacity-pressure sweep — [event_reviews] capacity_target_slots.
+# ---------------------------------------------------------------------------
+
+
+def test_event_reviews_defaults_to_off() -> None:
+    """No [event_reviews] section → the feature is off (target 0)."""
+    cfg = EventReviewsConfig()
+    assert cfg.capacity_target_slots == 0
+
+
+def test_example_config_event_reviews_off_by_default() -> None:
+    """The example ships [event_reviews] commented out, so a config built
+    from it has the whole feature off — capacity_target_slots 0 included."""
+    cfg = load_config(str(EXAMPLE_TOML))
+    assert cfg.event_reviews.enabled is False
+    assert cfg.event_reviews.capacity_target_slots == 0
+
+
+def test_event_reviews_capacity_target_slots_parses_from_toml(tmp_path: Path) -> None:
+    """A live [event_reviews] table with capacity_target_slots parses onto
+    the existing section alongside the sweep flags."""
+    text = EXAMPLE_TOML.read_text(encoding="utf-8")
+    text += (
+        "\n[event_reviews]\n"
+        "enabled = true\n"
+        "daily_sweep = true\n"
+        "capacity_target_slots = 2\n"
+    )
+    p = tmp_path / "with_capacity.toml"
+    p.write_text(text, encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.event_reviews.capacity_target_slots == 2
+    assert cfg.event_reviews.daily_sweep is True
+
+
+@pytest.mark.parametrize("bad", [-1, 6, 100])
+def test_event_reviews_range_rejected(bad: int) -> None:
+    with pytest.raises(ValidationError):
+        EventReviewsConfig(capacity_target_slots=bad)
+
+
+@pytest.mark.parametrize("good", [0, 1, 2, 5])
+def test_event_reviews_range_accepted(good: int) -> None:
+    assert EventReviewsConfig(capacity_target_slots=good).capacity_target_slots == good
+
+
+def test_event_reviews_forbids_unknown_key() -> None:
+    with pytest.raises(ValidationError):
+        EventReviewsConfig(capacity_target_slots=2, bogus=1)  # type: ignore[call-arg]
 
 
 # ---------------------------------------------------------------------------

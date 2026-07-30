@@ -293,6 +293,12 @@ def compose_agent(
         # Jurisdiction zones: the first trail stage's gain_pct is the
         # Zone-3 line the review context reports (default +20%).
         trail_stages=config.execution.trail_stages,
+        # Capacity-pressure sweep (EventReviewsConfig). Off unless the
+        # operator sets `[event_reviews] capacity_target_slots` (and
+        # daily_sweep); the ExecutionConfig supplies the KS-5
+        # effective-cap curve.
+        execution_config=config.execution,
+        capacity_target_slots=config.event_reviews.capacity_target_slots,
     )
 
     # PDT-SUNSET-2026-06-04: ADR-009 §3.1 — activation gate. Read once

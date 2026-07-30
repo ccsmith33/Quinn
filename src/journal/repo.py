@@ -587,6 +587,59 @@ def find_accepted_executions_without_pending_thesis_review(
     return [(int(r["execution_id"]), str(r["symbol"])) for r in rows]
 
 
+def get_open_position_review_context(
+    db_path: str, symbols: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Entry-thesis + trailing-ratchet context for the given `symbols`,
+    keyed by symbol — powers the capacity-pressure weakness ranking.
+
+    For each symbol that has an `entry` order, the row is derived from the
+    MOST-RECENT entry order (highest order id), matching
+    `Journal.get_position_entry_context`'s entry-selection semantics.
+    Returns a dict of `{symbol: {execution_id, conviction,
+    entry_submitted_at, trail_engaged}}`. `entry_submitted_at` is a
+    `datetime` (naive UTC as SQLite stores it) or `None`; `trail_engaged`
+    is `False` when the execution has no `exit_policy_state` row.
+
+    Symbols with no entry order are omitted (the caller — the coordinator
+    — treats broker positions as the source of truth for what is open and
+    tolerates a missing journal join). An empty `symbols` list returns an
+    empty dict without touching the DB.
+    """
+    if not symbols:
+        return {}
+    placeholders = ",".join("?" for _ in symbols)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            SELECT o.symbol            AS symbol,
+                   o.execution_id      AS execution_id,
+                   o.submitted_at      AS entry_submitted_at,
+                   p.conviction        AS conviction,
+                   eps.trail_engaged   AS trail_engaged
+            FROM orders o
+            JOIN executions e ON e.id = o.execution_id
+            JOIN proposals  p ON p.id = e.proposal_id
+            LEFT JOIN exit_policy_state eps ON eps.execution_id = o.execution_id
+            WHERE o.role = 'entry' AND o.symbol IN ({placeholders})
+              AND o.id = (
+                  SELECT MAX(o2.id) FROM orders o2
+                  WHERE o2.symbol = o.symbol AND o2.role = 'entry'
+              )
+            """,
+            tuple(symbols),
+        ).fetchall()
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        out[str(r["symbol"])] = {
+            "execution_id": int(r["execution_id"]),
+            "conviction": r["conviction"],
+            "entry_submitted_at": r["entry_submitted_at"],
+            "trail_engaged": bool(r["trail_engaged"]) if r["trail_engaged"] is not None else False,
+        }
+    return out
+
+
 def insert_thesis_review(db_path: str, row: ThesisReviewRow) -> int:
     with connect(db_path) as conn:
         cur = _exec_write(

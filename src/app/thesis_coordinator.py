@@ -36,6 +36,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from analyzer.thesis_review import (
@@ -61,6 +62,7 @@ from journal.models import (
 from journal.repo import (
     connect,
     find_due_thesis_reviews,
+    get_open_position_review_context,
     get_orders_for_execution,
     get_proposal_by_id,
     has_open_position,
@@ -223,6 +225,14 @@ class ThesisReviewCoordinator:
         # Jurisdiction zones: the first stage's gain_pct is the Zone-3
         # line (falls back to +20% when no stages are configured).
         trail_stages: Sequence[TrailStage] = (),
+        # Capacity-pressure sweep (EventReviewsConfig). `execution_config`
+        # supplies the KS-5 effective-cap curve; `capacity_target_slots`
+        # is the free-slot target the sweep protects. Both default to the
+        # feature-off shape (0 / None) so legacy/test construction is
+        # unaffected — no block is ever injected unless BOTH are wired and
+        # the review is an `event:daily_sweep` one under pressure.
+        execution_config: Any | None = None,
+        capacity_target_slots: int = 0,
         # WS1 §7.4 ports — see the module-level defaults above.
         get_live_protective_order: (
             Callable[..., OrderRow | None] | None
@@ -239,6 +249,8 @@ class ThesisReviewCoordinator:
         self._zone3_gain_pct = (
             trail_stages[0].gain_pct if trail_stages else _DEFAULT_ZONE3_GAIN_PCT
         )
+        self._execution_config = execution_config
+        self._capacity_target_slots = capacity_target_slots
         self._get_live_protective_order = get_live_protective_order or (
             lambda *, execution_id, roles: _default_get_live_protective_order(
                 self._journal.db_path, execution_id=execution_id, roles=roles
@@ -264,9 +276,21 @@ class ThesisReviewCoordinator:
         due = find_due_thesis_reviews(self._journal.db_path, now=now)
         if not due:
             return
+        # Capacity-pressure sweep: the block rides ONLY the daily pre-market
+        # sweep reviews (`event:daily_sweep`) — that is the "would we buy
+        # this fresh?" pass whose whole job is to free slots for the open.
+        # Compute it ONCE per tick (a single self-consistent snapshot, so
+        # the appended text is byte-stable across every sweep review this
+        # tick) and only when a sweep review is actually due. `None` when
+        # the feature is off, no sweep is due, or the portfolio has room.
+        capacity_block: str | None = None
+        if any(_is_daily_sweep(s.scheduled_reason) for s in due):
+            capacity_block = self._compute_capacity_pressure_block(now)
         for schedule in due:
             try:
-                await self._process_schedule(schedule, now=now)
+                await self._process_schedule(
+                    schedule, now=now, capacity_block=capacity_block
+                )
             except Exception as e:  # noqa: BLE001
                 log.error(
                     "thesis_coordinator.process_error",
@@ -280,7 +304,11 @@ class ThesisReviewCoordinator:
                 )
 
     async def _process_schedule(
-        self, schedule: ThesisReviewScheduleRow, *, now: dt.datetime
+        self,
+        schedule: ThesisReviewScheduleRow,
+        *,
+        now: dt.datetime,
+        capacity_block: str | None = None,
     ) -> None:
         # Fetch the execution + proposal (proposal carries the original
         # thesis text, conviction, sizing, stops).
@@ -331,6 +359,7 @@ class ThesisReviewCoordinator:
                 execution=execution,
                 proposal=proposal,
                 now=now,
+                capacity_block=capacity_block,
             )
         except _BuildContextError as e:
             log.warning(
@@ -1472,6 +1501,114 @@ class ThesisReviewCoordinator:
         return True
 
     # ------------------------------------------------------------------
+    # Capacity-pressure sweep (EventReviewsConfig.capacity_target_slots)
+    # ------------------------------------------------------------------
+
+    def _compute_capacity_pressure_block(self, now: dt.datetime) -> str | None:
+        """Return the capacity-pressure context block for this tick, or
+        `None` when the feature is off / no broker snapshot / the portfolio
+        still has room.
+
+        Slot math mirrors the KS-5 gate in `sizing.py` exactly: the used
+        slots are the UNIQUE symbols across (held positions ∪ pending entry
+        BUYs), and the cap is the equity-tiered `ks5_effective_cap`. So
+        `open_slots = effective_cap − len(held ∪ pending_entries)`. The
+        block is injected only while `open_slots < capacity_target_slots`.
+        """
+        target = self._capacity_target_slots
+        if target <= 0 or self._execution_config is None:
+            return None
+        from execution.sizing import ks5_effective_cap
+
+        # Broker truth is the source for "what is open". Any snapshot
+        # failure just skips the block this tick — the review still runs,
+        # only without the capacity nudge (best-effort, never blocking).
+        try:
+            account = self._broker.get_account()
+            positions = [p for p in self._broker.get_positions() if p.qty != 0]
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "event_reviews.capacity_snapshot_failed",
+                extra={
+                    "event": "event_reviews.capacity_snapshot_failed",
+                    "error": str(e),
+                },
+            )
+            return None
+
+        # Pending entry BUYs consume capacity the same way sizing counts
+        # them (incident 2026-05-07: pre-market entries queue unfilled and
+        # don't show in get_positions()). Absent on pre-WS1 adapters/stubs.
+        pending_symbols: set[str] = set()
+        get_open_orders = getattr(self._broker, "get_open_orders", None)
+        if get_open_orders is not None:
+            try:
+                pending_symbols = {o.symbol for o in get_open_orders() if o.is_entry}
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "event_reviews.pending_orders_failed",
+                    extra={
+                        "event": "event_reviews.pending_orders_failed",
+                        "error": str(e),
+                    },
+                )
+                pending_symbols = set()
+
+        held_symbols = {p.symbol for p in positions}
+        cap = ks5_effective_cap(account.equity, self._execution_config)
+        used = len(held_symbols | pending_symbols)
+        open_slots = cap - used
+        if open_slots >= target:
+            return None
+
+        ranking = self._rank_open_positions(positions, now)
+        block = _render_capacity_block(
+            open_slots=open_slots, target=target, cap=cap, ranking=ranking
+        )
+        log.info(
+            "event_reviews.capacity_pressure",
+            extra={
+                "event": "event_reviews.capacity_pressure",
+                "open_slots": open_slots,
+                "target": target,
+                "position_count": len(held_symbols),
+                "pending_entry_count": len(pending_symbols - held_symbols),
+                "effective_cap": cap,
+            },
+        )
+        return block
+
+    def _rank_open_positions(
+        self, positions: list[Any], now: dt.datetime
+    ) -> list[_WeaknessRow]:
+        """Weakness ranking of the open positions, weakest first: lowest
+        unrealized gain %, ties broken by longest held. Merges broker P&L
+        with the journal's entry-thesis + trailing-ratchet context."""
+        symbols = [p.symbol for p in positions]
+        ctx = get_open_position_review_context(self._journal.db_path, symbols)
+        rows: list[_WeaknessRow] = []
+        for p in positions:
+            cost_basis = p.avg_entry_price * p.qty
+            gain_pct = (p.unrealized_pnl / cost_basis) if cost_basis else 0.0
+            c = ctx.get(p.symbol, {})
+            days_held: int | None = None
+            entry_at = _coerce_dt(c.get("entry_submitted_at"))
+            if entry_at is not None:
+                days_held = max(0, (now - _ensure_aware(entry_at)).days)
+            rows.append(
+                _WeaknessRow(
+                    symbol=p.symbol,
+                    days_held=days_held,
+                    gain_pct=gain_pct,
+                    trail_armed=bool(c.get("trail_engaged", False)),
+                    conviction=c.get("conviction"),
+                )
+            )
+        # Weakest first: gain ascending, then days-held descending.
+        rows.sort(key=lambda r: (r.gain_pct, -(r.days_held or 0)))
+        return rows
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -1498,6 +1635,7 @@ class ThesisReviewCoordinator:
         execution: Any,
         proposal: Any,
         now: dt.datetime,
+        capacity_block: str | None = None,
     ) -> ThesisReviewContext:
         # Days held: prefer the entry order's submitted_at, fall back to
         # `executions.decided_at`. Both come from the journal.
@@ -1563,6 +1701,16 @@ class ThesisReviewCoordinator:
             zone3_gain_pct=self._zone3_gain_pct,
         )
 
+        # The capacity block rides ONLY the daily pre-market sweep review —
+        # the doctrine's morning "buy-it-fresh" pass. Calendar/hold and the
+        # other event triggers (filing/news/gain-cross/anomaly) review on
+        # their own merits and never carry the capacity nudge.
+        sweep_block = (
+            capacity_block
+            if _is_daily_sweep(schedule.scheduled_reason)
+            else None
+        )
+
         return ThesisReviewContext(
             proposal=proposal,
             execution_id=execution.id,
@@ -1581,6 +1729,7 @@ class ThesisReviewCoordinator:
             hwm_gain_pct=hwm_gain_pct,
             trigger_reason=schedule.scheduled_reason,
             trigger_detail=self._trigger_detail(schedule.scheduled_reason),
+            capacity_pressure_block=sweep_block,
         )
 
     def _trigger_detail(self, reason: str) -> str | None:
@@ -1623,6 +1772,101 @@ class ThesisReviewCoordinator:
 class _BuildContextError(Exception):
     """Raised when the review context cannot be assembled (missing entry
     order, broker quote failure, malformed proposal payload)."""
+
+
+@dataclass(frozen=True)
+class _WeaknessRow:
+    """One row of the capacity-pressure weakness ranking."""
+
+    symbol: str
+    days_held: int | None
+    gain_pct: float
+    trail_armed: bool
+    conviction: int | None
+
+
+_DAILY_SWEEP_REASON = "event:daily_sweep"
+
+
+def _is_daily_sweep(reason: str | None) -> bool:
+    """True for the daily pre-market sweep's schedule reason — the only
+    review path the capacity block rides."""
+    return reason == _DAILY_SWEEP_REASON
+
+
+def _coerce_dt(value: Any) -> dt.datetime | None:
+    """Normalize a journal `submitted_at` to a datetime. PARSE_DECLTYPES
+    converts declared TIMESTAMP columns, but an aliased column in a raw
+    SELECT can arrive as the stored ISO string — handle both."""
+    if value is None:
+        return None
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return dt.datetime.fromisoformat(value.replace(" ", "T"))
+        except ValueError:
+            return None
+    return None
+
+
+def _render_capacity_block(
+    *,
+    open_slots: int,
+    target: int,
+    cap: int,
+    ranking: list[_WeaknessRow],
+) -> str:
+    """Render the capacity-pressure context block appended (block 3 only)
+    to a daily-sweep review under portfolio pressure. It carries a
+    weakest-first ranking of ALL open positions and POINTS AT the prompt's
+    own doctrine — it does not restate the rules. The "Dead money and
+    opportunity cost" section (the buy-it-fresh test + dead-money markers)
+    and its Exemptions (armed trail / Zone 3, dated catalyst ahead, fresh
+    <5-trading-day positions) are authoritative; this block only tells the
+    reviewer that capacity is tight and which positions are weakest.
+    """
+    lines = [
+        "# Capacity pressure (daily sweep)",
+        f"open_slots: {open_slots} (target {target}); portfolio holding "
+        f"{len(ranking)} of an effective {cap}-position cap.",
+        "",
+        "Quinn must keep the ABILITY to open at least "
+        f"{target} new position(s) at the coming market open, and only "
+        f"{open_slots} slot(s) are free. Apply the prompt's \"Dead money "
+        "and opportunity cost\" doctrine — the buy-it-fresh test — with an "
+        "added bias toward CLOSING the weakest positions in the ranking "
+        "below until at least the target slots would be free.",
+        "",
+        "This does NOT override the doctrine. Its Exemptions still bind in "
+        "full: do NOT close a position for capacity when it has an ARMED "
+        "trailing stop (Zone 3) absent a contradicting information event, "
+        "a DATED catalyst still ahead, or fewer than ~5 trading days held; "
+        "and do NOT close a position whose thesis is genuinely intact just "
+        "to free a slot. Capacity only tips genuinely borderline "
+        "dead-money calls toward `close`.",
+        "",
+        "Weakness ranking of ALL open positions "
+        "(weakest first — lowest unrealized gain, then longest held):",
+        "",
+        "| rank | symbol | days held | unrealized gain % | trail armed | conviction |",
+        "|------|--------|-----------|-------------------|-------------|------------|",
+    ]
+    for i, r in enumerate(ranking, start=1):
+        days = str(r.days_held) if r.days_held is not None else "?"
+        conv = str(r.conviction) if r.conviction is not None else "?"
+        trail = "yes" if r.trail_armed else "no"
+        lines.append(
+            f"| {i} | {r.symbol} | {days} | {r.gain_pct:+.1%} | {trail} | {conv} |"
+        )
+    lines.append("")
+    lines.append(
+        "The position you are reviewing is one row above. If it ranks among "
+        "the weakest positions, fails the buy-it-fresh test, and no "
+        "exemption applies to it, lean toward `close` to return the slot; "
+        "otherwise decide on its own merits as usual."
+    )
+    return "\n".join(lines)
 
 
 def _decision_string(result: Any) -> str:

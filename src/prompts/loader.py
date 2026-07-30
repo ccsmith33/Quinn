@@ -213,6 +213,7 @@ class PromptBuilder:
         hwm_gain_pct: float | None = None,
         trigger_reason: str | None = None,
         trigger_detail: str | None = None,
+        capacity_pressure_block: str | None = None,
     ) -> ApiRequest:
         """Feature A — compose the Opus thesis-review request for an open
         position whose horizon has elapsed (or an event trigger fired).
@@ -225,6 +226,12 @@ class PromptBuilder:
         jurisdiction" block the prompt's jurisdiction-zones doctrine
         governs by. They default to None so legacy call sites keep the
         pre-doctrine payload shape byte-identical.
+
+        `capacity_pressure_block`, when supplied (daily-sweep reviews under
+        portfolio pressure only), is appended to the END of block 3 (the
+        per-call user message) so it never perturbs the cached system
+        blocks (block 1 + 2). It carries the weakness ranking and points
+        the reviewer at the prompt's own dead-money doctrine + exemptions.
         """
         ctx_summary = (
             f"# Thesis-review context\n"
@@ -268,6 +275,8 @@ class PromptBuilder:
             f"# Filings since entry (for {proposal.symbol})\n"
             f"{filings_since_entry_summary}\n"
         )
+        if capacity_pressure_block:
+            block3 = f"{block3}---\n{capacity_pressure_block}\n"
         return self._build(
             name=ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
             block2_text=ctx_summary,

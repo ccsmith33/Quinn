@@ -680,3 +680,123 @@ def test_get_orders_since_filters_by_symbol_and_window(db: str) -> None:
     assert len(rows) == 1
     assert rows[0].id == in_window_id
     assert rows[0].symbol == "CXW"
+
+
+# ---------------------------------------------------------------------------
+# Capacity-pressure sweep — get_open_position_review_context
+# ---------------------------------------------------------------------------
+
+
+def _seed_entry_for_context(
+    db: str,
+    *,
+    symbol: str,
+    conviction: int,
+    entry_at: dt.datetime,
+    trail_engaged: bool | None = None,
+) -> int:
+    """Insert prompt → filing → proposal → execution(accepted) → entry
+    order (+ optional exit_policy_state). Returns execution_id."""
+    from journal.models import ExecutionRow, OrderRow
+    from journal.repo import insert_execution, insert_order
+
+    pv = f"pv-{symbol}@aabbccddeeff"
+    insert_prompt(
+        db,
+        PromptRow(
+            prompt_version=pv,
+            name=f"prompt-{symbol}",
+            file_path="/tmp/x",
+            content_hash=f"hash-{symbol}",
+        ),
+    )
+    fid = insert_filing(
+        db,
+        _filing(accession_number=f"acc-{symbol}", issuer_ticker=symbol, content_hash=f"c-{symbol}"),
+    )
+    pid = insert_proposal(
+        db,
+        ProposalRow(
+            filing_id=fid,
+            decision_id=f"dec-{symbol}",
+            model_id="claude-sonnet-4-6",
+            prompt_version=pv,
+            raw_response="{}",
+            kind="trade_proposal",
+            symbol=symbol,
+            direction="long",
+            conviction=conviction,
+            input_tokens=1,
+            output_tokens=1,
+            latency_ms=1,
+            cost_usd=0.0,
+        ),
+    )
+    eid = insert_execution(
+        db,
+        ExecutionRow(proposal_id=pid, decision="accepted", submitted_orders_json="[]"),
+    )
+    insert_order(
+        db,
+        OrderRow(
+            execution_id=eid,
+            role="entry",
+            symbol=symbol,
+            side="buy",
+            order_type="market",
+            qty=100,
+            tif="day",
+            broker_order_id=f"entry-{symbol}",
+            submitted_at=entry_at,
+            final_status="filled",
+        ),
+    )
+    if trail_engaged is not None:
+        from journal.exit_policy import ExitPolicyStateRow, upsert_exit_policy_state
+
+        upsert_exit_policy_state(
+            db,
+            ExitPolicyStateRow(
+                execution_id=eid,
+                symbol=symbol,
+                trail_distance_pct=0.05,
+                trail_engaged=trail_engaged,
+                high_water_mark=120.0,
+                stop_order_journal_id=None,
+            ),
+        )
+    return eid
+
+
+def test_get_open_position_review_context_returns_entry_and_trail(db: str) -> None:
+    from journal.repo import get_open_position_review_context
+
+    entry_a = dt.datetime(2026, 7, 1, 14, 0, 0)
+    entry_b = dt.datetime(2026, 7, 20, 14, 0, 0)
+    _seed_entry_for_context(db, symbol="ARMED", conviction=8, entry_at=entry_a, trail_engaged=True)
+    _seed_entry_for_context(db, symbol="PLAIN", conviction=6, entry_at=entry_b)
+
+    ctx = get_open_position_review_context(db, ["ARMED", "PLAIN"])
+    assert set(ctx) == {"ARMED", "PLAIN"}
+    assert ctx["ARMED"]["conviction"] == 8
+    assert ctx["ARMED"]["trail_engaged"] is True
+    assert ctx["ARMED"]["entry_submitted_at"] is not None
+    # No exit_policy_state row → trail defaults to False, not None.
+    assert ctx["PLAIN"]["conviction"] == 6
+    assert ctx["PLAIN"]["trail_engaged"] is False
+
+
+def test_get_open_position_review_context_empty_symbols_no_query(db: str) -> None:
+    from journal.repo import get_open_position_review_context
+
+    assert get_open_position_review_context(db, []) == {}
+
+
+def test_get_open_position_review_context_omits_unknown_symbols(db: str) -> None:
+    from journal.repo import get_open_position_review_context
+
+    _seed_entry_for_context(
+        db, symbol="KNOWN", conviction=7, entry_at=dt.datetime(2026, 7, 5, 14, 0, 0)
+    )
+    ctx = get_open_position_review_context(db, ["KNOWN", "NOPE"])
+    assert set(ctx) == {"KNOWN"}

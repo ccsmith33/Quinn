@@ -548,3 +548,58 @@ def test_thesis_review_v2_prompt_carries_jurisdiction_doctrine() -> None:
     assert "looks toppy" in text  # the ban is stated explicitly
     assert "ONE-DIRECTIONAL" in text
     assert "Information events pierce this exemption" in text
+
+
+# ---------------------------------------------------------------------------
+# Capacity-pressure sweep — block appended to thesis-review block 3 only.
+# ---------------------------------------------------------------------------
+
+_SRC_PROMPTS = Path(__file__).resolve().parents[2] / "src" / "prompts"
+
+
+def _thesis_kwargs(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = dict(
+        proposal=_proposal(prompt_version="sonnet_filing_analysis_v2@bbbbbbbbbbbb"),
+        execution_id=7,
+        days_held=20,
+        current_price=105.0,
+        pct_change_since_entry=0.05,
+        realized_fill_price=100.0,
+        realized_dollar_size=10_000.0,
+        time_horizon_days=14,
+        stop_loss_price=90.0,
+        take_profit_price=150.0,
+        filings_since_entry_summary="(no filings since entry)",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_thesis_review_has_no_capacity_block_by_default() -> None:
+    builder = PromptBuilder(_SRC_PROMPTS)
+    req = builder.build_opus_thesis_review(**_thesis_kwargs())  # type: ignore[arg-type]
+    user_text = req.messages[0].content[0].text
+    assert "CAPACITY PRESSURE" not in user_text
+
+
+def test_thesis_review_capacity_block_appended_after_stable_content() -> None:
+    builder = PromptBuilder(_SRC_PROMPTS)
+    block = "CAPACITY PRESSURE: 1 of target 2 slots free\n| rank | symbol |\n| 1 | ACME |"
+    base = builder.build_opus_thesis_review(**_thesis_kwargs())  # type: ignore[arg-type]
+    withb = builder.build_opus_thesis_review(
+        **_thesis_kwargs(capacity_pressure_block=block)  # type: ignore[arg-type]
+    )
+    base_user = base.messages[0].content[0].text
+    withb_user = withb.messages[0].content[0].text
+
+    # Block present, appended AFTER the existing per-call content (the
+    # stable prefix is preserved verbatim, block strictly follows it).
+    assert "CAPACITY PRESSURE" in withb_user
+    assert withb_user.startswith(base_user)
+    assert withb_user.index("# Position under review") < withb_user.index("CAPACITY PRESSURE")
+
+    # Cache-friendly: the cached system blocks (block 1 + block 2) are
+    # byte-identical whether or not the capacity block is present.
+    assert [b.text for b in base.system] == [b.text for b in withb.system]
+    # And the prompt version is unchanged (no .txt/schema perturbation).
+    assert base.prompt_version == withb.prompt_version

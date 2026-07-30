@@ -111,6 +111,14 @@ sizing_high_pct = 0.10
 # gain_thresholds_pct = [10.0, 20.0, 35.0]
 # daily_sweep = false
 # sweep_after_utc_hour = 11
+# Capacity-pressure sweep: when daily_sweep fires and the portfolio is
+# within this many free slots of its KS-5 effective concurrent-position
+# cap, every event:daily_sweep review that morning gets a weakness-ranked
+# capacity block biasing the reviewer (under the dead-money doctrine)
+# toward freeing the weakest NON-EXEMPT slots. Doctrine exemptions (armed
+# trail, dated catalyst ahead, <5 trading days) stay binding. Range 0–5;
+# 0 (default) = off. Only meaningful with daily_sweep = true.
+# capacity_target_slots = 2
 
 [reconciler]
 interval_seconds_market = 300
