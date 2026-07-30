@@ -266,6 +266,34 @@ def test_trail_stage_rejects_non_positive_fields() -> None:
         )
 
 
+def test_breakeven_floor_defaults_off() -> None:
+    """A config with no `breakeven_floor_gain_pct` (every existing prod
+    shape) must default to 0.0 — the breakeven floor is OFF, byte-identical
+    to pre-feature trailing behavior."""
+    cfg = ExecutionConfig(**_execution_kwargs())  # type: ignore[arg-type]
+    assert cfg.breakeven_floor_gain_pct == 0.0
+
+
+def test_breakeven_floor_parses_configured_value() -> None:
+    cfg = ExecutionConfig(
+        **_execution_kwargs(breakeven_floor_gain_pct=12.0)  # type: ignore[arg-type]
+    )
+    assert cfg.breakeven_floor_gain_pct == pytest.approx(12.0)
+
+
+def test_breakeven_floor_rejects_out_of_range() -> None:
+    """Valid band is 0–50; negative or >50 is an operator error rejected
+    at load time."""
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(breakeven_floor_gain_pct=-1.0)  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValidationError):
+        ExecutionConfig(
+            **_execution_kwargs(breakeven_floor_gain_pct=50.1)  # type: ignore[arg-type]
+        )
+
+
 def test_example_toml_disables_scaling_by_default() -> None:
     """The shipped example config must boot with the curve OFF so operators
     upgrade with zero behavior change until they explicitly opt in.

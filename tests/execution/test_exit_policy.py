@@ -391,12 +391,15 @@ def _tick(
     recorder: _OutcomeRecorder | None = None,
     now: dt.datetime = NOW,
     trail_stages: list[TrailStage] | None = None,
+    breakeven_floor_gain_pct: float | None = None,
 ) -> ExitPolicyTicker:
     kwargs: dict[str, Any] = {}
     if recorder is not None:
         kwargs["record_order_outcome"] = recorder
     if trail_stages is not None:
         kwargs["trail_stages"] = trail_stages
+    if breakeven_floor_gain_pct is not None:
+        kwargs["breakeven_floor_gain_pct"] = breakeven_floor_gain_pct
     ticker = ExitPolicyTicker(
         journal=_Journal(db),
         broker=broker,
@@ -767,6 +770,142 @@ def test_live_scenario_staged_floor(db: str) -> None:
 
     assert len(broker.replaced) == 1
     assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.71)
+
+
+# ---------------------------------------------------------------------------
+# §3.5 — breakeven floor (study policy E): once the high-water gain vs
+# entry clears the threshold, the stop never sits below entry. HWM-based,
+# never narrows the band — a lower bound applied AFTER the width math.
+# ---------------------------------------------------------------------------
+
+
+def test_breakeven_floor_inactive_below_threshold(db: str) -> None:
+    """entry=100, stop=90 (base 10%). last=110 → gain 10% < 12% threshold
+    → floor OFF: the trail-derived stop (99, BELOW entry) is submitted
+    unchanged. Proves the floor never engages before the peak clears the
+    threshold."""
+    _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(99.0)
+
+
+def test_breakeven_floor_binds_at_threshold_raises_stop_to_entry(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """entry=100, stop=85 (base 15% trail). last=115 = entry+1R → engage;
+    gain 15% >= 12% and the trail-derived stop (115×0.85 = 97.75) is BELOW
+    entry → the floor binds and raises the submitted stop to entry (100).
+    The binding is logged once."""
+    _seed_position(db, stop_price=85.0)
+    broker = _FakeBroker(last=115.0)
+
+    with caplog.at_level(logging.INFO, logger="execution.exit_policy"):
+        _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(100.0)
+    floored = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", "") == "exit_policy.breakeven_floor_applied"
+    ]
+    assert len(floored) == 1
+    assert floored[0].entry_price == pytest.approx(100.0)  # type: ignore[attr-defined]
+    assert floored[0].high_water_mark == pytest.approx(115.0)  # type: ignore[attr-defined]
+    assert floored[0].trail_stop == pytest.approx(97.75)  # type: ignore[attr-defined]
+    assert floored[0].floored_stop == pytest.approx(100.0)  # type: ignore[attr-defined]
+
+
+def test_breakeven_floor_does_not_narrow_staged_trail(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Compose with staged widths: entry=100, stop=85 (base 15%), stage
+    (gain 20% → 8%). last=130 → gain 30% ≥ 20 → width 8% → trail stop
+    130×0.92 = 119.6, ALREADY above entry. The floor is a lower bound: it
+    must NOT drag the staged stop down to entry, and must NOT log a
+    binding (it changed nothing)."""
+    _seed_position(db, stop_price=85.0)
+    broker = _FakeBroker(last=130.0)
+    stages = [TrailStage(gain_pct=20.0, trail_pct=8.0)]
+
+    with caplog.at_level(logging.INFO, logger="execution.exit_policy"):
+        _tick(db, broker, trail_stages=stages, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(119.6)
+    assert not [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", "") == "exit_policy.breakeven_floor_applied"
+    ]
+
+
+def test_breakeven_floor_preserves_ratchet_only_invariant(db: str) -> None:
+    """The floor never lowers a stop. Tick1 last=115 → floor to 100.
+    Tick2 price falls to 112 → HWM stays 115, floor still says 100 =
+    current stop → no replace. Tick3 last=140 → trail stop 119 (above
+    entry) → stop rises to 119. Every submitted stop strictly ascends."""
+    _seed_position(db, stop_price=85.0)
+    broker = _FakeBroker(last=115.0)
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+    assert broker.replaced[-1]["new_stop_price"] == pytest.approx(100.0)
+
+    broker.set_last("ACME", 112.0)
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+    assert len(broker.replaced) == 1  # floored stop already at entry
+
+    broker.set_last("ACME", 140.0)
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    prices = [r["new_stop_price"] for r in broker.replaced]
+    assert prices == sorted(prices)
+    assert prices[-1] == pytest.approx(119.0)  # 140×0.85, floor no longer binds
+
+
+def test_breakeven_floor_applies_to_preexisting_state_on_restart(db: str) -> None:
+    """Runtime derivation: a position whose trail engaged BEFORE the floor
+    existed (state row carries no floor) gets floored on the first tick
+    after the config change — the floor is derived from config + HWM every
+    tick, never frozen into state. Seeded HWM=115 (gain 15% ≥ 12), base
+    trail 15% → 97.75 → floored to entry 100."""
+    eid, stop_id = _seed_position(db, stop_price=85.0)
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=15.0,
+            trail_engaged=True,
+            high_water_mark=115.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBroker(last=113.0)
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(100.0)
+
+
+def test_breakeven_floor_respected_by_stateless_heal_engagement(db: str) -> None:
+    """The stateless-heal engagement path computes a fresh stop — the
+    floor must apply there too. Naked position, no state row, gain past
+    activation, wide (15%) trail: the healed trailing stop is floored to
+    entry (100) instead of 115×0.85 = 97.75."""
+    _seed_position(db, stop_price=85.0, stop_final_status="canceled")
+    broker = _FakeBrokerFull(last=115.0)
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == pytest.approx(100.0)
 
 
 # ---------------------------------------------------------------------------

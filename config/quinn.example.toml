@@ -85,6 +85,15 @@ sizing_high_pct = 0.10
 # [[execution.trail_stages]]
 # gain_pct = 35.0
 # trail_pct = 5.0
+# Breakeven floor (study policy E, default OFF). Once a position's high-water
+# gain vs entry crosses this percent, the trailing stop is never allowed to
+# sit below the entry price — a confirmed small winner can no longer round-trip
+# into a loser. HWM-based; applied as a lower bound AFTER the width/stage math,
+# so it never NARROWS the trail band (that would strangle big runners during
+# their early 8-12% wiggles — the whole reason a floor beats a tighter stage).
+# Derived at runtime, so a change applies to already-open positions on restart.
+# Omitted/0.0 = OFF (byte-identical to the pre-feature trail). Bounded [0, 50].
+# breakeven_floor_gain_pct = 12.0
 
 # Event-triggered, zone-aware thesis reviews (A/B feature, default OFF).
 # When enabled, held positions get an IMMEDIATE Opus thesis review when:

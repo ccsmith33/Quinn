@@ -137,6 +137,7 @@ class ExitPolicyTicker:
         trail_activation_r: float = 1.0,
         min_ratchet_step_pct: float = 0.25,
         trail_stages: Sequence[TrailStage] = (),
+        breakeven_floor_gain_pct: float = 0.0,
         now_fn: Callable[[], dt.datetime] = _utcnow,
         record_order_outcome: Callable[..., None] | None = None,
     ) -> None:
@@ -145,6 +146,7 @@ class ExitPolicyTicker:
         self._activation_r = trail_activation_r
         self._min_step_pct = min_ratchet_step_pct
         self._trail_stages = tuple(trail_stages)
+        self._breakeven_floor_gain_pct = breakeven_floor_gain_pct
         self._now_fn = now_fn
         self._record_order_outcome = record_order_outcome or (
             lambda order_id, final_status, *, fill_price, fill_qty, fill_at:
@@ -328,14 +330,20 @@ class ExitPolicyTicker:
         # already-open positions on restart. Crossing a milestone
         # tightens from the CURRENT high-water immediately — one large
         # upward PATCH is intended.
-        if self._trail_stages and entry_price is None:
+        if (
+            self._trail_stages or self._breakeven_floor_gain_pct > 0.0
+        ) and entry_price is None:
             entry_price = self._entry_price(execution_id)
         effective_pct, active_stage_gain = self._staged_trail_pct(
             state.trail_distance_pct,
             entry_price=entry_price,
             high_water=high_water,
         )
-        target = round(high_water * (1.0 - effective_pct / 100.0), 2)
+        trail_target = round(high_water * (1.0 - effective_pct / 100.0), 2)
+        target = self._breakeven_floor(
+            trail_target, entry_price=entry_price, high_water=high_water
+        )
+        floor_bound = target > trail_target
         current_stop = float(live_stop.stop_price)
 
         should_replace = (
@@ -447,6 +455,24 @@ class ExitPolicyTicker:
                 "new_broker_order_id": replaced.broker_order_id,
             },
         )
+        if floor_bound:
+            # The floor was the binding constraint — it raised the
+            # submitted stop above the trail-derived level. Logged once
+            # per ratchet it binds (the min_ratchet_step gate above means
+            # this only fires when the stop actually changed), not per
+            # tick.
+            log.info(
+                "exit_policy.breakeven_floor_applied",
+                extra={
+                    "event": "exit_policy.breakeven_floor_applied",
+                    "execution_id": execution_id,
+                    "symbol": symbol,
+                    "entry_price": entry_price,
+                    "high_water_mark": high_water,
+                    "trail_stop": trail_target,
+                    "floored_stop": target,
+                },
+            )
 
     # ------------------------------------------------------------------
     # Self-heal (incident FEIM 2026-07-16): a trail-armed position whose
@@ -554,7 +580,11 @@ class ExitPolicyTicker:
             entry_price=entry_price,
             high_water=high_water,
         )
-        target = round(high_water * (1.0 - effective_pct / 100.0), 2)
+        target = self._breakeven_floor(
+            round(high_water * (1.0 - effective_pct / 100.0), 2),
+            entry_price=entry_price,
+            high_water=high_water,
+        )
         log.warning(
             "exit_policy.naked_trail_detected",
             extra={
@@ -710,7 +740,11 @@ class ExitPolicyTicker:
             effective_pct, _ = self._staged_trail_pct(
                 trail_pct, entry_price=entry_price, high_water=last
             )
-            target = round(last * (1.0 - effective_pct / 100.0), 2)
+            target = self._breakeven_floor(
+                round(last * (1.0 - effective_pct / 100.0), 2),
+                entry_price=entry_price,
+                high_water=last,
+            )
             new_row_id = self._place_fresh_stop(
                 execution_id=execution_id,
                 symbol=pos.symbol,
@@ -940,6 +974,27 @@ class ExitPolicyTicker:
                 effective = stage.trail_pct
                 active = stage.gain_pct
         return effective, active
+
+    def _breakeven_floor(
+        self, target: float, *, entry_price: float | None, high_water: float
+    ) -> float:
+        """Breakeven floor (study policy E): once the high-water gain vs
+        entry clears `breakeven_floor_gain_pct`, the stop may never sit
+        below entry. Applied AFTER the width/stage math as a pure lower
+        bound — it only ever RAISES the target (never narrows the band,
+        never lowers a computed stop). HWM-based (peak gain), not current
+        price. Derived from config + current HWM every call, so a config
+        change applies to already-open positions. Off (returns `target`
+        unchanged) when the threshold is 0 or the entry price is unknown.
+        """
+        if self._breakeven_floor_gain_pct <= 0.0:
+            return target
+        if entry_price is None or entry_price <= 0:
+            return target
+        threshold = entry_price * (1.0 + self._breakeven_floor_gain_pct / 100.0)
+        if high_water < threshold:
+            return target
+        return max(target, entry_price)
 
     def _entry_price(self, execution_id: int) -> float | None:
         """Entry fill (or pre-submission last) for the staged-trail gain

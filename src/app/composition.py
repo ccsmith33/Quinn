@@ -360,6 +360,7 @@ def compose_agent(
         trail_activation_r=config.execution.trail_activation_r,
         min_ratchet_step_pct=config.execution.min_ratchet_step_pct,
         trail_stages=config.execution.trail_stages,
+        breakeven_floor_gain_pct=config.execution.breakeven_floor_gain_pct,
     )
 
     # Event-triggered thesis reviews ([event_reviews]) — constructed

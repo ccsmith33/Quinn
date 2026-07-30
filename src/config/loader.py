@@ -131,6 +131,15 @@ class ExecutionConfig(_Section):
     # already-open positions on restart. Empty (the default) = the flat
     # base-width trail, byte-identical to pre-feature behavior.
     trail_stages: list[TrailStage] = Field(default_factory=list)
+    # Breakeven floor (study policy E) — once a position's high-water gain
+    # vs entry clears this percent, the trailing stop is never allowed to
+    # sit below the entry price (small confirmed winners can no longer
+    # round-trip into losers). HWM-based, applied as a lower bound AFTER
+    # the width/stage math so it NEVER narrows the trail band. Derived at
+    # runtime each tick, so a config change applies to already-open
+    # positions on restart. 0.0 (the default) = feature OFF, byte-identical
+    # to the pre-feature trail. Bounded [0, 50].
+    breakeven_floor_gain_pct: float = Field(default=0.0, ge=0.0, le=50.0)
     # Feature A — cap the FIRST thesis-review interval. The analyzer's
     # declared catalyst horizon can run ~30d, which leaves a fresh position
     # un-re-evaluated for a month. This bounds the entry-time review so a
