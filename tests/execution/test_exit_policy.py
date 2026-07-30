@@ -908,6 +908,139 @@ def test_breakeven_floor_respected_by_stateless_heal_engagement(db: str) -> None
     assert broker.submitted[0].stop_price == pytest.approx(100.0)
 
 
+def test_breakeven_floor_does_not_submit_in_the_money_when_price_below_entry(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The floor's core promise, honestly bounded: HWM=115 (peak gain 15%
+    ≥ 12), but price has fallen to 98 (BELOW entry 100). The floored
+    target is entry (100), which sits ABOVE the market — the `target <
+    last` term in should_replace blocks the PATCH so the ratchet never
+    submits an instantly-firing stop. The prior stop is left untouched and
+    no floor-binding is logged (nothing changed)."""
+    eid, stop_id = _seed_position(db, stop_price=85.0)
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=15.0,
+            trail_engaged=True,
+            high_water_mark=115.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBroker(last=98.0)
+
+    with caplog.at_level(logging.INFO, logger="execution.exit_policy"):
+        _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert broker.replaced == []  # in-the-money floor stop suppressed
+    assert not [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", "") == "exit_policy.breakeven_floor_applied"
+    ]
+    # The original live stop row is untouched (no new trailing_stop row).
+    assert [
+        o for o in get_orders_for_execution(db, eid) if o.role == "trailing_stop"
+    ] == []
+
+
+def test_breakeven_floor_applies_and_logs_through_selfheal_replacement(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ratchet PATCH fails against a DEAD tracked stop: the self-heal arm
+    submits a FRESH stop at the floored target (entry 100, not the
+    trail-derived 97.75) AND the breakeven_floor_applied log fires on this
+    branch too (the observability gap the review flagged)."""
+    _seed_position(db, stop_price=85.0)
+    broker = _FakeBrokerWithLookup(last=115.0)
+    broker.fail_next_replace()
+    broker.seed_order(
+        SubmittedOrder(
+            broker_order_id="stop-eps-acc-1",
+            client_order_id="cid-stop",
+            symbol="ACME",
+            side="sell",
+            qty=100,
+            order_type="stop",
+            status="canceled",  # dead — PATCH is doomed, heal replaces
+            submitted_at=NOW,
+            stop_price=85.0,
+        )
+    )
+
+    with caplog.at_level(logging.INFO, logger="execution.exit_policy"):
+        _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == pytest.approx(100.0)
+    floored = [
+        rec
+        for rec in caplog.records
+        if getattr(rec, "event", "") == "exit_policy.breakeven_floor_applied"
+    ]
+    assert len(floored) == 1
+    assert floored[0].trail_stop == pytest.approx(97.75)  # type: ignore[attr-defined]
+    assert floored[0].floored_stop == pytest.approx(100.0)  # type: ignore[attr-defined]
+
+
+def test_breakeven_floor_respected_by_engaged_naked_heal(db: str) -> None:
+    """The engaged-state naked-heal arm (_heal_one_naked) computes a fresh
+    stop for a trail-armed position that lost its broker stop — the floor
+    must apply there too. Engaged state HWM=115 (≥12% gain), base 15%
+    trail, no live stop → healed stop floored to entry 100, not 97.75."""
+    eid, stop_id = _seed_position(
+        db, stop_price=85.0, stop_final_status="canceled"
+    )
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=15.0,
+            trail_engaged=True,
+            high_water_mark=115.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBrokerWithLookup(last=113.0)
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == pytest.approx(100.0)
+
+
+def test_breakeven_floor_never_submits_above_market_in_naked_heal(db: str) -> None:
+    """Pins the clamp interaction: in a heal path where the floored target
+    (entry 100) sits ABOVE the market (last 95), _place_fresh_stop's
+    below-quote clamp wins so the submitted stop lands under last —
+    NEVER an in-the-money submission. HWM=115 (≥12%), last=95."""
+    eid, stop_id = _seed_position(
+        db, stop_price=85.0, stop_final_status="canceled"
+    )
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=15.0,
+            trail_engaged=True,
+            high_water_mark=115.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBrokerWithLookup(last=95.0)
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    submitted = broker.submitted[0].stop_price
+    assert submitted < 95.0  # clamped below the quote, not in-the-money
+    assert submitted == pytest.approx(94.76)  # 95 × (1 − 0.25%)
+
+
 # ---------------------------------------------------------------------------
 # §3.5 — invariants
 # ---------------------------------------------------------------------------

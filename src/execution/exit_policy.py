@@ -391,6 +391,19 @@ class ExitPolicyTicker:
                 last=last,
                 replace_error=e,
             ):
+                # The fresh stop was submitted at the (possibly floored)
+                # target — mirror the normal-ratchet observability so the
+                # floor's binding is never silent just because the PATCH
+                # took the self-heal branch.
+                if floor_bound:
+                    self._log_breakeven_floor_applied(
+                        execution_id=execution_id,
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        high_water=high_water,
+                        trail_stop=trail_target,
+                        floored_stop=target,
+                    )
                 return
             log.error(
                 "exit_policy.ratchet_replace_failed",
@@ -461,17 +474,13 @@ class ExitPolicyTicker:
             # per ratchet it binds (the min_ratchet_step gate above means
             # this only fires when the stop actually changed), not per
             # tick.
-            log.info(
-                "exit_policy.breakeven_floor_applied",
-                extra={
-                    "event": "exit_policy.breakeven_floor_applied",
-                    "execution_id": execution_id,
-                    "symbol": symbol,
-                    "entry_price": entry_price,
-                    "high_water_mark": high_water,
-                    "trail_stop": trail_target,
-                    "floored_stop": target,
-                },
+            self._log_breakeven_floor_applied(
+                execution_id=execution_id,
+                symbol=symbol,
+                entry_price=entry_price,
+                high_water=high_water,
+                trail_stop=trail_target,
+                floored_stop=target,
             )
 
     # ------------------------------------------------------------------
@@ -995,6 +1004,29 @@ class ExitPolicyTicker:
         if high_water < threshold:
             return target
         return max(target, entry_price)
+
+    def _log_breakeven_floor_applied(
+        self,
+        *,
+        execution_id: int,
+        symbol: str,
+        entry_price: float | None,
+        high_water: float,
+        trail_stop: float,
+        floored_stop: float,
+    ) -> None:
+        log.info(
+            "exit_policy.breakeven_floor_applied",
+            extra={
+                "event": "exit_policy.breakeven_floor_applied",
+                "execution_id": execution_id,
+                "symbol": symbol,
+                "entry_price": entry_price,
+                "high_water_mark": high_water,
+                "trail_stop": trail_stop,
+                "floored_stop": floored_stop,
+            },
+        )
 
     def _entry_price(self, execution_id: int) -> float | None:
         """Entry fill (or pre-submission last) for the staged-trail gain
