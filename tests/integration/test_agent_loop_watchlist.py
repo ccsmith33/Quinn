@@ -1205,3 +1205,74 @@ async def test_dead_broker_entry_is_not_adopted_as_phantom_position(
     assert all(
         (o["notes"] or "") != "adopted_from_broker_on_recovery" for o in orders
     )
+
+
+@pytest.mark.asyncio
+async def test_partially_filled_canceled_entry_is_adopted_not_resubmitted(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """A2 follow-up (real-money edge): a crash-window prop-{id}-entry that
+    was CANCELED after a partial fill is REAL exposure — the retry must
+    ADOPT it (partial_no_stop path), never skip-it-as-dead and re-submit,
+    which would double the position."""
+    from broker.protocol import SubmittedOrder
+
+    loop_obj = await _enroll_via_ks7(
+        db_path=db_path,
+        fake_broker=fake_broker,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(),
+    )
+    row = get_pending_watchlist(db_path)[0]
+    cid = f"prop-{row.proposal_id}-entry"
+    fake_broker.preseeded_by_client_id[cid] = SubmittedOrder(
+        broker_order_id="partial-entry-1",
+        client_order_id=cid,
+        symbol="ACME",
+        side="buy",
+        qty=10,
+        order_type="market",
+        status="canceled",  # dead status...
+        submitted_at=dt.datetime.now(dt.UTC) - dt.timedelta(minutes=5),
+        filled_avg_price=100.0,
+        filled_qty=6,  # ...but 6 shares FILLED before the cancel
+        filled_at=dt.datetime.now(dt.UTC) - dt.timedelta(minutes=4),
+    )
+    _set_flush_account(fake_broker)
+    await loop_obj._process_watchlist(_market_now())
+
+    # NO re-submission of any kind — the exposure already exists.
+    assert fake_broker.submitted_brackets == []
+    assert fake_broker.submitted_orders == []
+    # The dead-but-filled entry was ADOPTED from broker truth: journal
+    # carries the adoption order row and (no stop found at the broker)
+    # the partial_no_stop execution decision + kill-switch halt.
+    with connect(db_path) as conn:
+        ex = conn.execute(
+            "SELECT decision FROM executions WHERE proposal_id = ? "
+            "ORDER BY id ASC",
+            (row.proposal_id,),
+        ).fetchall()
+        orders = conn.execute(
+            "SELECT broker_order_id, notes FROM orders"
+        ).fetchall()
+        ks = conn.execute(
+            "SELECT state, reason FROM kill_switch_state ORDER BY set_at DESC, rowid DESC"
+        ).fetchone()
+    assert [e["decision"] for e in ex] == ["rejected", "submission_partial_no_stop"]
+    assert len(orders) == 1
+    assert orders[0]["broker_order_id"] == "partial-entry-1"
+    assert orders[0]["notes"] == "adopted_from_broker_on_recovery"
+    assert ks["state"] == "halted"
+    assert ks["reason"] == "submission_partial_no_stop"
+    # Adoption counts as "entry exists" → the watchlist row resolves.
+    with connect(db_path) as conn:
+        r = conn.execute("SELECT status FROM watchlist").fetchone()
+    assert r["status"] == "entered"

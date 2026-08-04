@@ -61,12 +61,13 @@ log = get_logger(__name__)
 # than holding the loop in BOOTING for hours.
 _RECOVERY_SCAN_MAX_FILINGS = 500
 
-# Review A2 — broker order states that mean "this order is dead and
-# created no exposure": a `prop-{id}-entry` found in one of these states
-# is NOT a live orphan and must not be adopted as a phantom position.
-# Everything else (accepted/new/pending_*/partially_filled/filled/
-# replaced/held/...) is either live or actually executed and is adopted
-# as before.
+# Review A2 — broker order states in which an order can no longer fill.
+# A `prop-{id}-entry` in one of these states AND with zero filled_qty is
+# NOT a live orphan and must not be adopted as a phantom position. The
+# zero-fill condition is load-bearing: canceled/expired orders can carry
+# a PARTIAL fill, which is real unprotected exposure and MUST still be
+# adopted. Everything else (accepted/new/pending_*/partially_filled/
+# filled/replaced/held/...) is live or executed and is adopted as before.
 _TERMINAL_DEAD_ORDER_STATUSES = frozenset({"rejected", "canceled", "expired"})
 
 
@@ -1704,14 +1705,23 @@ class AgentLoop:
             return False
         # Review A2 — liveness check. The broker remembers TERMINAL-DEAD
         # orders under their client ids too: a crash-window entry that was
-        # rejected / canceled / expired must NOT be adopted as a phantom
-        # position (it created no exposure and never will). Only an order
-        # that is live or actually executed counts as an orphan; a dead
-        # one falls through to normal submission. (If the broker refuses
-        # the reused client_order_id, the submitter journals a
+        # rejected / canceled / expired WITHOUT any fill must NOT be
+        # adopted as a phantom position (it created no exposure and never
+        # will); it falls through to normal submission. (If the broker
+        # refuses the reused client_order_id, the submitter journals a
         # `submission_failed` and — on the watchlist path — the row stays
         # pending, bounded by expiry.)
-        if entry.status in _TERMINAL_DEAD_ORDER_STATUSES:
+        #
+        # A2 follow-up (real-money edge): "canceled" / "expired" can carry
+        # a PARTIAL fill — those shares are REAL exposure sitting without
+        # protective legs, so a dead order WITH fills must still be
+        # adopted (the partial_no_stop halt path below then flags it),
+        # never skipped-and-re-submitted, which would double the position.
+        # Only status-dead AND zero-filled means "safe to treat as absent".
+        if (
+            entry.status in _TERMINAL_DEAD_ORDER_STATUSES
+            and (entry.filled_qty or 0) == 0
+        ):
             log.info(
                 "agent.orphan_entry_dead",
                 extra={
