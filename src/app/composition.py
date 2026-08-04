@@ -30,6 +30,7 @@ from analyzer.opus import OpusReviewer
 from analyzer.sonnet import SonnetAnalyzer
 from analyzer.thesis_review import ThesisReviewer
 from app.memory_context import MemoryContextAssembler
+from app.memory_doctrine import register_doctrine
 from app.retro_fill import RetroFillCoordinator
 from app.thesis_coordinator import (
     ThesisReviewCoordinator,
@@ -229,6 +230,7 @@ def compose_agent(
     if config.memory.enabled:
         memory_assembler = MemoryContextAssembler()
         # provider registration lands here (per config.memory.*_enabled).
+        register_doctrine(memory_assembler, config.memory, journal)
 
     # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
     # lives in this constructor (D-047). Feature B: also wires the KS5
