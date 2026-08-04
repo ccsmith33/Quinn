@@ -343,6 +343,10 @@ class MemoryConfig(_Section):
     symbol_history_enabled: bool = True
     desk_journal_enabled: bool = True
     calibration_enabled: bool = True
+    # Desk journal: max post-mortems generated per day. A close backlog
+    # (boot on a journal with many historic closes) drains gradually at
+    # this rate instead of burning the budget in one tick.
+    postmortem_daily_cap: int = Field(default=10, ge=1, le=50)
 
 
 class ReconcilerConfig(_Section):

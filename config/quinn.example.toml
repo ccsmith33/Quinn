@@ -191,3 +191,6 @@ yfinance_min_interval_seconds = 0.2
 # symbol_history_enabled = true
 # desk_journal_enabled = true
 # calibration_enabled = true
+# Desk journal: max post-mortems generated per day (1-50). A backlog of
+# historic closes drains gradually at this rate.
+# postmortem_daily_cap = 10

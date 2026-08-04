@@ -133,6 +133,12 @@ _PROMPT_DEFS: dict[str, list[tuple[str, str]]] = {
         ("fragment", "rules_invariant"),
         ("schema", "thesis_review_v2"),
     ],
+    # Desk journal (LLM memory layer) — Haiku post-mortem writer + weekly
+    # synthesis. Self-contained top-level files, no shared fragments: the
+    # descriptive-only charter lives in the prompt text itself, and reusing
+    # the trading-role fragments would mis-frame a journaling task.
+    "desk_postmortem_v1": [],
+    "desk_synthesis_v1": [],
 }
 
 # Active prompt per pipeline stage — all stages run v2 (D-079).
@@ -299,6 +305,27 @@ class PromptBuilder:
             name=ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
             block2_text=ctx_summary,
             block3_text=block3,
+        )
+
+    def build_desk_postmortem(self, *, trade_context: str) -> ApiRequest:
+        """Desk journal — compose the Haiku post-mortem request for one
+        closed trade. `trade_context` is the code-rendered fact block
+        (thesis, prices, days held, exit mechanism, computed exit
+        quality); the prompt's descriptive-only charter is in the
+        top-level file."""
+        return self._build(
+            name="desk_postmortem_v1",
+            block2_text="# Desk journal — per-trade post-mortem\n",
+            block3_text=trade_context,
+        )
+
+    def build_desk_synthesis(self, *, postmortems_digest: str) -> ApiRequest:
+        """Desk journal — compose the weekly Haiku synthesis request over
+        the recent post-mortem digest (code-rendered, newest first)."""
+        return self._build(
+            name="desk_synthesis_v1",
+            block2_text="# Desk journal — weekly synthesis\n",
+            block3_text=postmortems_digest,
         )
 
     @staticmethod

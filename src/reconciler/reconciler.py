@@ -194,6 +194,12 @@ class Reconciler:
         # coordinator on the SAME tick. None (the default, and always
         # the case when the config flag is off) disables entirely.
         event_trigger_engine: Any | None = None,
+        # Desk journal (LLM memory layer, [memory] desk_journal_enabled) —
+        # daily post-mortems + weekly synthesis. Runs LAST, after every
+        # trading hook, on the same gated ticks: it is pure enrichment
+        # (journal + Haiku writes only, no orders). None (the default, and
+        # whenever the memory gates are off) disables entirely.
+        desk_journal_ticker: Any | None = None,
     ) -> None:
         self._broker = broker
         self._journal = journal
@@ -219,6 +225,7 @@ class Reconciler:
         self._fill_ingestor = fill_ingestor
         self._exit_policy_ticker = exit_policy_ticker
         self._event_triggers = event_trigger_engine
+        self._desk_journal_ticker = desk_journal_ticker
         self._external_miss: dict[str, int] = {}
         # Negative-cash tripwire edge detector (hotfix 2026-07-08): True
         # while the last observed broker cash was < 0, so a sustained
@@ -381,6 +388,30 @@ class Reconciler:
                         "reconciler.scanner_tick_error",
                         extra={
                             "event": "reconciler.scanner_tick_error",
+                            "error": str(e),
+                            "error_class": type(e).__name__,
+                        },
+                    )
+
+            # Desk journal (LLM memory layer) — post-mortems for trades
+            # whose closes this very tick just confirmed, plus the weekly
+            # synthesis. Deliberately LAST: pure enrichment, and the fill
+            # ingest + reconcile above have already journaled the exit
+            # fills the close-detection query keys on. Same protective
+            # shape as every sibling hook.
+            if (
+                self._desk_journal_ticker is not None
+                and report is not None
+                and not report.suppressed
+                and not report.deferred
+            ):
+                try:
+                    await self._desk_journal_ticker.run_tick()
+                except Exception as e:  # noqa: BLE001
+                    log.error(
+                        "reconciler.desk_journal_tick_error",
+                        extra={
+                            "event": "reconciler.desk_journal_tick_error",
                             "error": str(e),
                             "error_class": type(e).__name__,
                         },

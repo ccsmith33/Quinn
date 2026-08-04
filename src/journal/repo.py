@@ -1930,6 +1930,121 @@ def get_prior_engagements_for_symbol(
     return [engagement for _, _, _, engagement in items[: max(limit, 0)]]
 
 
+def deactivate_desk_memory(
+    db_path: str, kind: str, *, except_id: int
+) -> int:
+    """Soft-retire every `kind` row other than `except_id` (set active=0).
+
+    The desk-journal synthesis writer calls this right after inserting a
+    new version so exactly one row of the kind stays active; the retired
+    rows remain as append-only provenance (009 design note). Returns the
+    number of rows deactivated.
+    """
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "UPDATE desk_memory SET active = 0 "
+            "WHERE kind = ? AND active = 1 AND id != ?",
+            (kind, except_id),
+        )
+        return int(cur.rowcount)
+
+
+def count_postmortems_since(
+    db_path: str, since: _dt.datetime | None
+) -> int:
+    """Post-mortems created strictly after `since` (all rows when None)."""
+    with connect(db_path) as conn:
+        if since is None:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM trade_postmortems"
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM trade_postmortems "
+                "WHERE created_at > ?",
+                (since,),
+            ).fetchone()
+        return int(row["n"])
+
+
+def get_recent_postmortems(
+    db_path: str, *, limit: int
+) -> list[TradePostmortemRow]:
+    """The most recent `limit` post-mortems across ALL symbols, newest
+    first — the desk-journal synthesis window."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM trade_postmortems ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [TradePostmortemRow(**dict(r)) for r in rows]
+
+
+def find_closed_executions_without_postmortem(
+    db_path: str, *, limit: int
+) -> list[dict[str, Any]]:
+    """Closed accepted executions that still lack a `trade_postmortems`
+    row — the desk-journal generation queue, oldest close first.
+
+    "Closed" is journal truth for flat-at-broker, same definition as
+    `get_closed_trade_pnls_chronological`: the execution has a filled
+    entry AND a filled sell-side exit order (any exit role — stop,
+    trailing_stop, take_profit, thesis_close, displacement_close, future
+    roles). External closes absorbed by the reconciler still qualify once
+    the FillIngestor journals the closing sell; a tombstone without a
+    journaled sell does NOT (no exit price to post-mortem — deliberate).
+    Open positions (no filled exit) never match. Execution-scoped, so a
+    later re-entry in the same symbol cannot hide an older closed trade.
+
+    Each row carries everything the post-mortem writer needs:
+    `execution_id, symbol, thesis, conviction, entry_price, entry_at,
+    exit_price, exit_at, exit_role, high_water_mark` (None when the
+    execution never came under trailing management).
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT e.id                    AS execution_id,
+                   pr.symbol               AS symbol,
+                   pr.thesis               AS thesis,
+                   pr.conviction           AS conviction,
+                   en.realized_fill_price  AS entry_price,
+                   en.realized_fill_at     AS entry_at,
+                   ex.realized_fill_price  AS exit_price,
+                   ex.realized_fill_at     AS exit_at,
+                   ex.role                 AS exit_role,
+                   eps.high_water_mark     AS high_water_mark
+            FROM executions e
+            JOIN proposals pr ON pr.id = e.proposal_id
+            JOIN orders en ON en.id = (
+                SELECT MAX(o.id) FROM orders o
+                WHERE o.execution_id = e.id AND o.role = 'entry'
+                  AND o.final_status IN ('filled', 'partially_filled_closed')
+                  AND o.realized_fill_price IS NOT NULL
+            )
+            JOIN orders ex ON ex.id = (
+                SELECT MAX(o.id) FROM orders o
+                WHERE o.execution_id = e.id
+                  AND o.side = 'sell' AND o.role != 'entry'
+                  AND o.final_status IN ('filled', 'partially_filled_closed')
+                  AND o.realized_fill_price IS NOT NULL
+            )
+            LEFT JOIN exit_policy_state eps ON eps.execution_id = e.id
+            WHERE e.decision = 'accepted'
+              AND pr.symbol IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM trade_postmortems tp
+                  WHERE tp.execution_id = e.id
+              )
+            ORDER BY ex.realized_fill_at ASC, e.id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # JournalRepo — thin object facade over the module-level functions.
 #
@@ -2543,3 +2658,6 @@ class JournalRepo:
             limit=limit,
             exclude_execution_id=exclude_execution_id,
         )
+
+    def deactivate_desk_memory(self, kind: str, *, except_id: int) -> int:
+        return deactivate_desk_memory(self.db_path, kind, except_id=except_id)

@@ -85,6 +85,11 @@ _COMPOSED_PROMPT_NAMES: tuple[str, ...] = (
     "opus_proposal_review_v2",
     "opus_thesis_review_v1",
     "opus_thesis_review_v2",
+    # Desk journal (LLM memory layer) — Haiku post-mortem + synthesis.
+    # Registered unconditionally so llm_calls.prompt_version FK resolves
+    # whenever the [memory] gates are flipped on without a redeploy.
+    "desk_postmortem_v1",
+    "desk_synthesis_v1",
 )
 
 
@@ -224,9 +229,11 @@ def compose_agent(
     # None everywhere and every LLM context build is byte-identical to
     # the pre-memory system. When enabled, register providers here
     # (guarded by their per-provider bools in `config.memory`) before
-    # handing the assembler to the analyzer + thesis reviewer. No real
-    # provider is registered yet — this is the plug point.
+    # handing the assembler to the analyzer + thesis reviewer.
+    # Registration order IS render order (doctrine → calibration →
+    # symbol_history → desk_journal) — keep it stable across rebases.
     memory_assembler: MemoryContextAssembler | None = None
+    desk_journal_ticker = None
     if config.memory.enabled:
         memory_assembler = MemoryContextAssembler()
         # provider registration lands here (per config.memory.*_enabled).
@@ -242,6 +249,23 @@ def compose_agent(
 
             memory_assembler.register(
                 "symbol_history", make_symbol_history_provider(journal)
+            )
+        if config.memory.desk_journal_enabled:
+            from app.desk_journal import (
+                DeskJournalTicker,
+                make_desk_journal_provider,
+            )
+
+            memory_assembler.register(
+                "desk_journal", make_desk_journal_provider(journal.db_path)
+            )
+            # The write side (daily post-mortems + weekly synthesis) rides
+            # the reconciler tick; constructed here, wired below.
+            desk_journal_ticker = DeskJournalTicker(
+                journal=journal,
+                client=anthropic,
+                prompt_builder=prompt_builder,
+                daily_cap=config.memory.postmortem_daily_cap,
             )
 
     # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
@@ -481,6 +505,8 @@ def compose_agent(
         exit_policy_ticker=exit_policy_ticker,
         # [event_reviews] — None unless the config flag is on.
         event_trigger_engine=event_trigger_engine,
+        # Desk journal — None unless [memory] enabled + desk_journal_enabled.
+        desk_journal_ticker=desk_journal_ticker,
     )
 
     # AlertWatcher (S8.2) — must be constructed AFTER migrations have

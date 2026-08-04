@@ -30,7 +30,11 @@ from .pricing import compute_cost
 
 log = get_logger(__name__)
 
-Purpose = Literal["analyze", "review", "replay", "audit"]
+# "postmortem" / "synthesis" are the desk-journal Haiku calls (LLM memory
+# layer) — journaled through the same llm_calls telemetry as trading calls.
+Purpose = Literal[
+    "analyze", "review", "replay", "audit", "postmortem", "synthesis"
+]
 
 # Retry policy per S5.2 AC-3: full-jitter exponential backoff,
 # base 1s, cap 60s, max 5 attempts.
