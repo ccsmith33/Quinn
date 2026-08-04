@@ -26,11 +26,27 @@ breach fires normally, a DIFFERENT rule still fires the same day, and
 KS-3 (event-style: consecutive losses) is unaffected. Suppressions are
 logged as `killswitch.refire_suppressed` and still returned with
 `fired=False` so /status can surface the standing condition.
+
+KS-2 acknowledged-drawdown watermark (2026-08, live money): the 30-day
+peak decays slowly, so after a drawdown the KS-2 predicate stays true
+for DAYS — same-day suppression alone still forces a daily /resume
+ritual (and a forgotten resume kills the day's entries). When
+`killswitch.ks2_reack_margin_pct` > 0, an operator resume of an
+auto:KS-2 halt carries a durable watermark (drawdown pct + 30d peak at
+ack time, written by the Telegram bot into the resume row's notes JSON
+— see telegram_bot._resume_notes). KS-2 is then suppressed (logged as
+`killswitch.refire_suppressed` with mode=acked_watermark) until the
+drawdown deepens to acked_dd + margin (>= fires — new pain beyond what
+was acknowledged). A genuine new equity high above the acked peak
+expires the watermark permanently; a decaying rolling peak does not.
+Default margin 0.0 = feature off, behavior identical to the paragraph
+above. KS-1/KS-3 are untouched by the watermark.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
+import json
 from dataclasses import dataclass
 
 from config.calendar import ET
@@ -57,6 +73,18 @@ class Halt:
     reason: str  # "auto:KS-1" etc — written into kill_switch_state.reason
     detail: str
     fired: bool  # True if this evaluation appended a new halt row
+    # "acked_watermark" when the KS-2 acked-drawdown watermark suppressed
+    # this halt (feature `killswitch.ks2_reack_margin_pct`); None otherwise.
+    suppressed_by: str | None = None
+
+
+@dataclass(frozen=True)
+class _Ks2Ack:
+    """Parsed KS-2 acknowledgment watermark (see telegram_bot._resume_notes)."""
+
+    set_at: _dt.datetime
+    dd_pct: float
+    peak: float
 
 
 class AutoHaltEvaluator:
@@ -78,7 +106,28 @@ class AutoHaltEvaluator:
         for r in rules:
             if already_auto_halted:
                 out.append(
-                    Halt(rule=r.rule, reason=r.reason, detail=r.detail, fired=False)
+                    Halt(
+                        rule=r.rule,
+                        reason=r.reason,
+                        detail=r.detail,
+                        fired=False,
+                        suppressed_by=r.suppressed_by,
+                    )
+                )
+                continue
+            if r.suppressed_by is not None:
+                # KS-2 acked-drawdown watermark (checked + logged in
+                # _eval_ks2): the operator has acknowledged this depth of
+                # pain and the drawdown has not deepened past the re-ack
+                # margin — surface the condition but do not halt.
+                out.append(
+                    Halt(
+                        rule=r.rule,
+                        reason=r.reason,
+                        detail=r.detail,
+                        fired=False,
+                        suppressed_by=r.suppressed_by,
+                    )
                 )
                 continue
             if r.reason in suppressed_reasons:
@@ -145,7 +194,41 @@ class AutoHaltEvaluator:
                 f"peak30d={peak:.2f} current={snap.equity:.2f} "
                 f"dd_pct={dd_pct:.4f} threshold={cfg.ks2_trailing_dd_pct}"
             )
-            return [Halt(rule="KS-2", reason="auto:KS-2", detail=detail, fired=False)]
+            suppressed_by = None
+            ack = (
+                self._active_ks2_ack(journal)
+                if cfg.ks2_reack_margin_pct > 0.0
+                else None
+            )
+            if ack is not None:
+                # The margin is in PERCENTAGE POINTS (see KillSwitchConfig).
+                # Fire at exactly acked_dd + margin (>= fires): only a
+                # drawdown strictly inside the margin is acknowledged pain.
+                refire_dd = ack.dd_pct + cfg.ks2_reack_margin_pct / 100.0
+                if dd_pct < refire_dd:
+                    suppressed_by = "acked_watermark"
+                    log.info(
+                        "killswitch.refire_suppressed",
+                        extra={
+                            "event": "killswitch.refire_suppressed",
+                            "rule": "KS-2",
+                            "reason": "auto:KS-2",
+                            "mode": "acked_watermark",
+                            "acked_dd": ack.dd_pct,
+                            "current_dd": dd_pct,
+                            "refire_dd": refire_dd,
+                            "acked_peak": ack.peak,
+                        },
+                    )
+            return [
+                Halt(
+                    rule="KS-2",
+                    reason="auto:KS-2",
+                    detail=detail,
+                    fired=False,
+                    suppressed_by=suppressed_by,
+                )
+            ]
         return []
 
     # -- KS-3 -------------------------------------------------------------
@@ -166,6 +249,45 @@ class AutoHaltEvaluator:
         return []
 
     # -- helpers ----------------------------------------------------------
+
+    @staticmethod
+    def _active_ks2_ack(journal: JournalRepo) -> _Ks2Ack | None:
+        """The newest KS-2 acknowledgment watermark, or None when absent,
+        malformed, or EXPIRED.
+
+        Expiry: the ack dies once equity has made a genuine new high above
+        the peak stored at ack time (recovery resets the regime — a later
+        fresh drawdown from the new peak must halt normally). Implemented
+        as max(equity since ack) > acked_peak, which is sticky: the new
+        high expires the ack permanently even after it rolls out of the
+        30-day window. A decaying rolling peak never expires the ack.
+        """
+        get_row = getattr(journal, "get_latest_ks2_ack_row", None)
+        if get_row is None:  # legacy fake — feature inert
+            return None
+        row = get_row()
+        if row is None or not row.notes:
+            return None
+        try:
+            payload = json.loads(row.notes)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        ack = payload.get("ks2_ack")
+        if not isinstance(ack, dict):
+            return None
+        dd_pct = ack.get("dd_pct")
+        peak = ack.get("peak")
+        if not isinstance(dd_pct, int | float) or not isinstance(peak, int | float):
+            return None
+        set_at = row.set_at
+        if set_at.tzinfo is None:
+            set_at = set_at.replace(tzinfo=_dt.UTC)
+        peak_since_ack = journal.get_peak_equity_since(set_at)
+        if peak_since_ack is not None and peak_since_ack > float(peak):
+            return None  # expired: genuine new high above the acked peak
+        return _Ks2Ack(set_at=set_at, dd_pct=float(dd_pct), peak=float(peak))
 
     @staticmethod
     def _operator_resumed_today(

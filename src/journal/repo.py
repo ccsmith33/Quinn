@@ -1140,6 +1140,23 @@ def get_recent_kill_switch_rows(
     return [KillSwitchStateRow(**dict(r)) for r in rows]
 
 
+def get_latest_ks2_ack_row(db_path: str) -> KillSwitchStateRow | None:
+    """Newest OPERATOR resume row carrying a KS-2 acknowledged-drawdown
+    watermark (notes JSON with a "ks2_ack" key, written by the Telegram
+    bot when a resume resolves an auto:KS-2 halt). The LIKE is a cheap
+    prefilter; the consumer (auto_halts) parses and validates the JSON.
+    Append-only table → the watermark is durable across restarts and is
+    superseded by any newer ack row, never mutated."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM kill_switch_state "
+            "WHERE state = 'active' AND set_by = 'operator' "
+            "AND reason = 'resume' AND notes LIKE '%\"ks2_ack\"%' "
+            "ORDER BY set_at DESC LIMIT 1"
+        ).fetchone()
+    return KillSwitchStateRow(**dict(row)) if row is not None else None
+
+
 # ---------------------------------------------------------------------------
 # universe_snapshots + universe_members (append-only)
 # ---------------------------------------------------------------------------
@@ -1707,6 +1724,9 @@ class JournalRepo:
         self, *, limit: int = 50
     ) -> list[KillSwitchStateRow]:
         return get_recent_kill_switch_rows(self.db_path, limit=limit)
+
+    def get_latest_ks2_ack_row(self) -> KillSwitchStateRow | None:
+        return get_latest_ks2_ack_row(self.db_path)
 
     def get_latest_kill_switch_state(self) -> KillSwitchStateRow | None:
         try:

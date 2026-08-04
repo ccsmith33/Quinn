@@ -342,6 +342,15 @@ class KillSwitchConfig(_Section):
     ks1_daily_loss_pct: float = Field(ge=0.0, le=1.0)
     ks2_trailing_dd_pct: float = Field(ge=0.0, le=1.0)
     ks3_consecutive_losses: int = Field(ge=0)
+    # KS-2 acknowledged-drawdown watermark (2026-08 live-money daily-resume
+    # ritual). After an operator resume of an auto:KS-2 halt, KS-2 stays
+    # suppressed until the trailing drawdown deepens to acked_dd plus this
+    # margin, expressed in PERCENTAGE POINTS (3.0 → re-fire at acked_dd +
+    # 0.03) — unlike ks2_trailing_dd_pct, which is a 0–1 fraction. A new
+    # 30-day equity peak above the acked peak expires the watermark. 0.0
+    # (default) turns the feature OFF: same-day suppression only, behavior
+    # identical to configs without this key.
+    ks2_reack_margin_pct: float = Field(default=0.0, ge=0.0, le=10.0)
     # S7.3 — webhook fallback transport (ADR-004).
     webhook_port: int = Field(default=8443, ge=1, le=65535)
     webhook_counter_path: str = Field(default="/var/lib/quinn/state/webhook_counter")

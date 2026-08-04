@@ -162,6 +162,11 @@ expected_fill_window_minutes = 10080
 ks1_daily_loss_pct = 0.03
 ks2_trailing_dd_pct = 0.10
 ks3_consecutive_losses = 6
+# KS-2 acked-drawdown watermark: after an operator resume of an auto:KS-2
+# halt, suppress re-fires until the drawdown deepens by this many PERCENTAGE
+# POINTS beyond the acknowledged drawdown (a new 30d equity peak above the
+# acked peak expires the ack). 0.0 (default) = off: same-day suppression only.
+# ks2_reack_margin_pct = 3.0
 
 [observability]
 log_level = "INFO"

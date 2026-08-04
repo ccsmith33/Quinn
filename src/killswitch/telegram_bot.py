@@ -15,6 +15,7 @@ Recognized commands (operator chat ID only, allow-list of one):
 from __future__ import annotations
 
 import datetime as _dt
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -22,6 +23,7 @@ from journal.repo import JournalRepo
 from observability.log_port import get_logger
 
 from .api import KillSwitch, KillSwitchUninitialized
+from .auto_halts import KS_TRAILING_WINDOW_DAYS
 
 log = get_logger(__name__)
 
@@ -119,13 +121,44 @@ class BotCore:
                 chat_id=chat_id,
                 text="Resume confirm window expired. Send /resume again.",
             )
-        self._ks.resume(set_by="operator", notes="via /resume yes-confirm")
+        self._ks.resume(set_by="operator", notes=self._resume_notes())
         self._pending_resume_at = None
         now = self._clock().isoformat(timespec="seconds")
         return BotReply(
             chat_id=chat_id,
             text=f"Kill-switch resumed at {now}. State is now ACTIVE.",
         )
+
+    def _resume_notes(self) -> str:
+        """Notes for the operator resume row.
+
+        KS-2 acknowledged-drawdown watermark: when this resume resolves an
+        auto:KS-2 trailing-drawdown halt, embed the drawdown pct and 30-day
+        peak AT ACKNOWLEDGMENT TIME as JSON (`{"detail": ..., "ks2_ack":
+        {"dd_pct": ..., "peak": ...}}`) on the resume row itself — the
+        kill_switch_state table is append-only, so the watermark is durable
+        and needs no schema change. The bot recomputes dd/peak from the same
+        journal snapshots the auto-halt evaluator reads (both processes
+        share the DB), rather than parsing the halt row's free-text detail.
+
+        The watermark is written unconditionally (this process loads only
+        secrets, not quinn.toml); the FEATURE GATE lives in the evaluator
+        (`killswitch.ks2_reack_margin_pct`, default 0.0 = off). If journal
+        data is missing, fall back to the plain notes — same-day suppression
+        still covers the resume day, and re-fire behavior matches today.
+        """
+        base = "via /resume yes-confirm"
+        unresolved = self._journal.get_kill_switch_halts_since_last_resume()
+        if not any(r.reason == "auto:KS-2" for r in unresolved):
+            return base
+        now = self._clock()
+        since = now - _dt.timedelta(days=KS_TRAILING_WINDOW_DAYS)
+        peak = self._journal.get_peak_equity_since(since)
+        snap = self._journal.get_latest_account_snapshot()
+        if peak is None or snap is None or peak <= 0:
+            return base
+        dd_pct = (peak - snap.equity) / peak
+        return json.dumps({"detail": base, "ks2_ack": {"dd_pct": dd_pct, "peak": peak}})
 
     # -- /status ---------------------------------------------------------
 
