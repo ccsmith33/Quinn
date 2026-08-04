@@ -37,6 +37,7 @@ from .models import (
     UniverseMemberRow,
     UniverseSnapshotRow,
     VirtualExitRow,
+    WatchlistRow,
 )
 
 log = get_logger(__name__)
@@ -1468,6 +1469,97 @@ def mark_deferred_skipped(db_path: str, did: int, reason: str) -> None:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+
+# ---------------------------------------------------------------------------
+# watchlist (migration 008) — deferred-entry retry queue.
+#
+# NOT append-only: `status` / `resolved_at` / `notes` are resolved in
+# place (same operational-state posture as exit_policy_state; the audit
+# trail of the actual entry lives in the append-only executions/orders
+# chain). The partial unique index `idx_watchlist_pending_symbol`
+# enforces one PENDING row per symbol at the schema level.
+# ---------------------------------------------------------------------------
+
+
+class WatchlistDuplicatePending(Exception):
+    """A pending watchlist row already exists for this symbol."""
+
+
+def insert_watchlist_row(db_path: str, row: WatchlistRow) -> int:
+    """Insert a pending watchlist row; raise `WatchlistDuplicatePending`
+    when the symbol already has an active (pending) row."""
+    try:
+        with connect(db_path) as conn:
+            cur = _exec_write(
+                conn,
+                "INSERT INTO watchlist "
+                "(proposal_id, symbol, conviction, reference_price, "
+                "expires_at, status, notes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row.proposal_id,
+                    row.symbol,
+                    row.conviction,
+                    row.reference_price,
+                    row.expires_at,
+                    row.status,
+                    row.notes,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+    except sqlite3.IntegrityError as e:
+        # SQLite names the violated columns, not the partial index:
+        # "UNIQUE constraint failed: watchlist.symbol".
+        if "watchlist.symbol" in str(e):
+            raise WatchlistDuplicatePending(row.symbol) from e
+        raise
+
+
+def get_pending_watchlist(db_path: str) -> list[WatchlistRow]:
+    """All pending rows, oldest-first (retry priority order)."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM watchlist WHERE status = 'pending' "
+            "ORDER BY created_at ASC, id ASC"
+        ).fetchall()
+    return [WatchlistRow(**dict(r)) for r in rows]
+
+
+def has_pending_watchlist_for_symbol(db_path: str, symbol: str) -> bool:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM watchlist WHERE symbol = ? AND status = 'pending' "
+            "LIMIT 1",
+            (symbol,),
+        ).fetchone()
+    return row is not None
+
+
+def resolve_watchlist_row(
+    db_path: str,
+    watchlist_id: int,
+    *,
+    status: str,
+    notes: str | None = None,
+) -> bool:
+    """Move a PENDING row to a terminal status, stamping `resolved_at`.
+
+    Returns False when the row was not pending (already resolved by a
+    concurrent path) — callers treat that as a benign no-op.
+    """
+    if status not in ("entered", "expired", "skipped_chase", "skipped_held"):
+        raise ValueError(f"not a terminal watchlist status: {status!r}")
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "UPDATE watchlist SET status = ?, "
+            "resolved_at = CURRENT_TIMESTAMP, "
+            "notes = COALESCE(?, notes) "
+            "WHERE id = ? AND status = 'pending'",
+            (status, notes, watchlist_id),
+        )
+        return cur.rowcount > 0
 
 
 # ---------------------------------------------------------------------------

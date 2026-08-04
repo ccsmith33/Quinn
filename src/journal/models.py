@@ -255,6 +255,28 @@ class ChoppingBlockRow(_Row):
     created_at: dt.datetime | None = None
 
 
+class WatchlistRow(_Row):
+    """Deferred-entry watchlist row (migration 008).
+
+    A capital-blocked, approved, high-conviction proposal parked for a
+    bounded retry. `status` ∈ {"pending", "entered", "expired",
+    "skipped_chase", "skipped_held"}; terminal states set `resolved_at`.
+    `reference_price` is the decision-time broker NBBO `last` — the same
+    quote the SizingEngine sized against.
+    """
+
+    id: int | None = None
+    proposal_id: int
+    symbol: str
+    conviction: int
+    reference_price: float
+    created_at: dt.datetime | None = None
+    expires_at: dt.datetime
+    status: str = "pending"
+    resolved_at: dt.datetime | None = None
+    notes: str | None = None
+
+
 class BackupRow(_Row):
     id: int | None = None
     started_at: dt.datetime

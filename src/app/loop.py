@@ -90,6 +90,10 @@ class AgentLoop:
         self._auto_halt_task: _asyncio.Task | None = None
         self._discovery_task: _asyncio.Task | None = None
         self._detail_pump_task: _asyncio.Task | None = None
+        # WATCHLIST — per-row throttle for the retry-blocked log (at most
+        # one entry per ET day per row; process-local, so a restart may
+        # re-log once — accepted, the alternative is a schema column).
+        self._watchlist_retry_log_dates: dict[int, dt.date] = {}
 
     # -- Public surface ----------------------------------------------------
 
@@ -154,7 +158,9 @@ class AgentLoop:
             and self._config is not None
         )
         has_watcher = self._components.alert_watcher is not None
-        if has_evaluator or has_watcher:
+        # WATCHLIST — the deferred-entry retry pass rides the same tick.
+        has_watchlist = self._watchlist_feature_on()
+        if has_evaluator or has_watcher or has_watchlist:
             self._auto_halt_task = asyncio.create_task(
                 self._auto_halt_loop(), name="agent-tick"
             )
@@ -184,7 +190,11 @@ class AgentLoop:
         """
         evaluator = self._components.auto_halt_evaluator
         watcher = self._components.alert_watcher
-        if evaluator is None and watcher is None:
+        if (
+            evaluator is None
+            and watcher is None
+            and not self._watchlist_feature_on()
+        ):
             return
         while not self.shutdown_requested:
             try:
@@ -222,6 +232,18 @@ class AgentLoop:
                             "error": str(e),
                         },
                     )
+            # WATCHLIST — deferred-entry retry pass. Strictly AFTER the
+            # halt/alert work on the same tick; internally defers to any
+            # queued/in-flight day-0 pipeline work (fresh proposals keep
+            # priority) and is a no-op when the feature is off or the
+            # market is closed.
+            try:
+                await self._process_watchlist(now)
+            except Exception as e:  # noqa: BLE001 — never kill the tick
+                log.error(
+                    "watchlist.tick_error",
+                    extra={"event": "watchlist.tick_error", "error": str(e)},
+                )
 
     async def _detail_pump_loop(self) -> None:
         """Drain `discovered_queue` → `DetailFetcher` → `ingestion_queue`.
@@ -668,6 +690,41 @@ class AgentLoop:
             self._write_rejected_execution(proposal_id, "pending_capacity")
             return
 
+        # Run the validator → sizer → submitter chain. Day-0 semantics:
+        # the chain journals reject rows and (feature: watchlist) enrolls
+        # capital-class rejects for a bounded deferred retry.
+        await self._run_entry_chain(
+            proposal_id, proposal_row, review, day_zero=True
+        )
+
+    async def _run_entry_chain(
+        self,
+        proposal_id: int,
+        proposal_row: Any,
+        review: Any,
+        *,
+        day_zero: bool,
+    ) -> str | None:
+        """Validator → sizer → submitter chain, shared by the day-0 path
+        (`_execute`) and the watchlist deferred-retry path.
+
+        `day_zero=True` preserves the exact pre-watchlist behavior:
+        reject paths journal an `executions` row, the KS-7 displacement
+        escape hatch may run, and capital-class rejects enroll on the
+        watchlist (feature-gated). `day_zero=False` (watchlist retry)
+        journals NOTHING on reject from this seam — the day-0 rejection
+        row already exists and re-journaling every tick would spam the
+        audit trail (the submitter still writes its own rows if a
+        submission is actually attempted and fails) — and never
+        displaces or re-enrolls; the caller keeps the row pending,
+        bounded by expiry. The SUCCESS path is identical in both modes:
+        submitter journal writes, reconciler trigger, thesis-review
+        scheduling.
+
+        Returns None when the broker accepted the submission (or a
+        crashed prior submission was adopted from broker truth);
+        otherwise the reject-reason string.
+        """
         # Build TradeProposal pydantic model from row payload (raw_response).
         #
         # If Opus modified the proposal (decision='modify'), overlay the
@@ -698,8 +755,9 @@ class AgentLoop:
                     "error": str(e),
                 },
             )
-            self._write_rejected_execution(proposal_id, "schema")
-            return
+            if day_zero:
+                self._write_rejected_execution(proposal_id, "schema")
+            return "schema"
         if overlay:
             log.info(
                 "execution.reviewer_overlay_applied",
@@ -732,8 +790,16 @@ class AgentLoop:
                         "symbol": trade.symbol,
                     },
                 )
-            self._write_rejected_execution(proposal_id, validation.reason)
-            return
+            if day_zero:
+                self._write_rejected_execution(proposal_id, validation.reason)
+                # WATCHLIST — `insufficient_capital` (the validator's
+                # buying-power check) is the only capital-class reason
+                # this branch can produce; `_maybe_enroll_watchlist`
+                # filters everything else out.
+                self._maybe_enroll_watchlist(
+                    proposal_id, trade, validation.reason, quote_last=None
+                )
+            return validation.reason
 
         # Sizer. Hotfix 2026-05-07: also fetch pending broker orders so
         # KS-5 / KS-6 see queued pre-market entries (which haven't filled
@@ -780,7 +846,7 @@ class AgentLoop:
             # inside the displacement path — leaves the normal rejection
             # standing, journal reason unchanged.
             displaced = None
-            if sizing.reason == "ks7_cash_reserve":
+            if day_zero and sizing.reason == "ks7_cash_reserve":
                 displaced = self._attempt_displacement(
                     proposal_id=proposal_id,
                     trade=trade,
@@ -791,8 +857,15 @@ class AgentLoop:
                     pending_entry_spend=pending_entry_spend,
                 )
             if displaced is None:
-                self._write_rejected_execution(proposal_id, sizing.reason)
-                return
+                if day_zero:
+                    self._write_rejected_execution(proposal_id, sizing.reason)
+                    # WATCHLIST — ks5_concurrent_limit / ks7_cash_reserve
+                    # are the sizer's capital-class reasons; the enroll
+                    # helper filters the rest (ks6, conviction, one-share).
+                    self._maybe_enroll_watchlist(
+                        proposal_id, trade, sizing.reason, quote_last=quote.last
+                    )
+                return sizing.reason
             # The victim's sell is already ACCEPTED at the broker; the
             # buy below is sized against the haircut proceeds credit.
             sizing = displaced
@@ -813,7 +886,7 @@ class AgentLoop:
         # would create a duplicate. Reconstruct the journal rows from
         # broker truth and short-circuit re-submission.
         if self._adopt_orphan_orders(accepted_proposal):
-            return
+            return None
 
         try:
             result = self._components.submitter.submit(
@@ -846,17 +919,20 @@ class AgentLoop:
             # record so the auditor sees it. A `pending_capacity`
             # placeholder doesn't count as "the submitter wrote a row"
             # — we still need a broker_unavailable row in that case.
-            with connect(self._components.journal.db_path) as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM executions "
-                    "WHERE proposal_id = ? "
-                    "AND (reject_reason IS NULL OR reject_reason != 'pending_capacity') "
-                    "LIMIT 1",
-                    (proposal_id,),
-                ).fetchone()
-            if row is None:
-                self._write_rejected_execution(proposal_id, "broker_unavailable")
-            return
+            # (Day-0 only: a watchlist retry always has its day-0 reject
+            # row already, and the retry stays pending regardless.)
+            if day_zero:
+                with connect(self._components.journal.db_path) as conn:
+                    row = conn.execute(
+                        "SELECT 1 FROM executions "
+                        "WHERE proposal_id = ? "
+                        "AND (reject_reason IS NULL OR reject_reason != 'pending_capacity') "
+                        "LIMIT 1",
+                        (proposal_id,),
+                    ).fetchone()
+                if row is None:
+                    self._write_rejected_execution(proposal_id, "broker_unavailable")
+            return "broker_unavailable"
 
         # S5.6 carry-fwd S6.5 reviewer M-2 (HIGH): trigger the position
         # reconciler after a SUCCESSFUL submission so the operator's
@@ -903,6 +979,349 @@ class AgentLoop:
                         "error": str(e),
                     },
                 )
+            return None
+
+        # SubmissionFailed — the submitter journaled its own row (and
+        # halted the kill-switch on stop-leg failures); just surface the
+        # outcome to callers (watchlist retry keeps the row pending).
+        return "submission_failed"
+
+    # -- Watchlist (deferred entry) ----------------------------------------
+
+    def _watchlist_feature_on(self) -> bool:
+        from app.watchlist import watchlist_enabled
+
+        cfg = getattr(self._config, "execution", None)
+        return cfg is not None and watchlist_enabled(cfg)
+
+    def _maybe_enroll_watchlist(
+        self,
+        proposal_id: int,
+        trade: Any,
+        reason: str,
+        *,
+        quote_last: float | None,
+    ) -> None:
+        """WATCHLIST enrollment — park an approved, capital-blocked,
+        high-conviction proposal for a bounded deferred retry.
+
+        Called ONLY from the day-0 reject paths of `_run_entry_chain`,
+        which sits after the Opus-reject and pending_capacity guards —
+        so every candidate here is an approved proposal. The reason
+        filter narrows to the CAPITAL class only
+        (`app.watchlist.CAPITAL_REJECT_REASONS`): validator rejects
+        other than `insufficient_capital`, Opus rejects and kill-switch
+        halts never reach an insert. Best-effort: any error degrades to
+        "not enrolled" and never disturbs the journaled rejection.
+
+        `quote_last` is the decision-time NBBO last the sizer used
+        (loop fetches it right before sizing); None on the
+        validator-stage `insufficient_capital` path, where the same
+        quote source is fetched here instead — either way
+        `reference_price` documents the best available decision-time
+        price for the chase guard.
+        """
+        try:
+            from app.watchlist import (
+                CAPITAL_REJECT_REASONS,
+                compute_expiry,
+                watchlist_enabled,
+            )
+
+            cfg = getattr(self._config, "execution", None)
+            if cfg is None or not watchlist_enabled(cfg):
+                return
+            if reason not in CAPITAL_REJECT_REASONS:
+                return
+            if trade.conviction < cfg.watchlist_min_conviction:
+                return
+            # Symbol-not-held guard, using the same effective-symbol view
+            # the sizer's KS-5/KS-6 checks use (broker positions plus
+            # queued pre-market entry buys).
+            held = {
+                p.symbol
+                for p in self._components.broker.get_positions()
+                if p.qty != 0
+            }
+            try:
+                held |= {
+                    o.symbol
+                    for o in self._components.broker.get_open_orders()
+                    if o.is_entry
+                }
+            except Exception:  # noqa: BLE001 — positions are the hard gate
+                pass
+            if trade.symbol in held:
+                return
+            from journal.models import WatchlistRow
+            from journal.repo import (
+                WatchlistDuplicatePending,
+                has_pending_watchlist_for_symbol,
+                insert_watchlist_row,
+            )
+
+            db = self._components.journal.db_path
+            if has_pending_watchlist_for_symbol(db, trade.symbol):
+                return  # one active row per symbol
+            if quote_last is None:
+                quote_last = self._components.broker.get_quote(trade.symbol).last
+            now = dt.datetime.now(dt.UTC)
+            expires_at = compute_expiry(now, cfg.watchlist_expiry_trading_days)
+            try:
+                watchlist_id = insert_watchlist_row(
+                    db,
+                    WatchlistRow(
+                        proposal_id=proposal_id,
+                        symbol=trade.symbol,
+                        conviction=trade.conviction,
+                        reference_price=quote_last,
+                        expires_at=expires_at,
+                        notes=f"reject_reason={reason}",
+                    ),
+                )
+            except WatchlistDuplicatePending:
+                return  # lost a race with a concurrent enrollment — benign
+            log.info(
+                "watchlist.added",
+                extra={
+                    "event": "watchlist.added",
+                    "watchlist_id": watchlist_id,
+                    "proposal_id": proposal_id,
+                    "symbol": trade.symbol,
+                    "conviction": trade.conviction,
+                    "reference_price": quote_last,
+                    "expires_at": expires_at.isoformat(),
+                    "reject_reason": reason,
+                },
+            )
+        except Exception as e:  # noqa: BLE001 — the rejection must stand
+            log.error(
+                "watchlist.enroll_error",
+                extra={
+                    "event": "watchlist.enroll_error",
+                    "proposal_id": proposal_id,
+                    "error": str(e),
+                },
+            )
+
+    async def _process_watchlist(self, now: dt.datetime) -> None:
+        """WATCHLIST — one deferred-entry retry pass (oldest row first).
+
+        Ordering / safety contract:
+          - feature off (`watchlist_min_conviction = 0`) → return before
+            any journal read: no table writes, no tick work;
+          - regular market hours only (entries are day orders — retrying
+            off-hours would queue stale-priced entries);
+          - PRIORITY: if the consumer has queued or in-flight day-0
+            pipeline work, the whole pass defers to the next tick so
+            fresh same-day signals are always processed first;
+          - per row: expiry (trading days, stamped at enrollment) →
+            held-symbol skip → chase guard (strictly above the ceiling
+            skips; exactly AT the ceiling is allowed) → entry through
+            the NORMAL execution chain. A failed entry leaves the row
+            pending — no status change, and the retry-blocked log fires
+            at most once per ET day per row.
+        """
+        from app.watchlist import chase_exceeded, ensure_utc, watchlist_enabled
+        from config.calendar import ET, is_market_hours
+        from execution.displacement import trading_days_held
+
+        cfg = getattr(self._config, "execution", None)
+        if cfg is None or not watchlist_enabled(cfg):
+            return
+        if not is_market_hours(now):
+            return
+        if (
+            not self._components.ingestion_queue.empty()
+            or self._state == AgentState.PROCESSING
+        ):
+            return
+
+        from journal.repo import get_pending_watchlist, resolve_watchlist_row
+
+        db = self._components.journal.db_path
+        rows = get_pending_watchlist(db)
+        if not rows:
+            return
+        try:
+            held = {
+                p.symbol
+                for p in self._components.broker.get_positions()
+                if p.qty != 0
+            }
+        except Exception as e:  # noqa: BLE001 — broker glitch: retry next tick
+            log.warning(
+                "watchlist.positions_unavailable",
+                extra={
+                    "event": "watchlist.positions_unavailable",
+                    "error": str(e),
+                },
+            )
+            return
+
+        for row in rows:
+            if row.id is None:  # pragma: no cover — SELECT always has ids
+                continue
+            if now >= ensure_utc(row.expires_at):
+                resolve_watchlist_row(db, row.id, status="expired")
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                log.info(
+                    "watchlist.expired",
+                    extra={
+                        "event": "watchlist.expired",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                    },
+                )
+                continue
+            if row.symbol in held:
+                resolve_watchlist_row(db, row.id, status="skipped_held")
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                log.info(
+                    "watchlist.skipped_held",
+                    extra={
+                        "event": "watchlist.skipped_held",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                    },
+                )
+                continue
+            try:
+                quote = self._components.broker.get_quote(row.symbol)
+            except Exception as e:  # noqa: BLE001 — leave pending, next tick
+                log.warning(
+                    "watchlist.quote_unavailable",
+                    extra={
+                        "event": "watchlist.quote_unavailable",
+                        "watchlist_id": row.id,
+                        "symbol": row.symbol,
+                        "error": str(e),
+                    },
+                )
+                continue
+            ceiling = row.reference_price * (
+                1.0 + cfg.watchlist_max_chase_pct / 100.0
+            )
+            if chase_exceeded(
+                quote.last, row.reference_price, cfg.watchlist_max_chase_pct
+            ):
+                resolve_watchlist_row(
+                    db,
+                    row.id,
+                    status="skipped_chase",
+                    notes=(
+                        f"last={quote.last:.4f} ref={row.reference_price:.4f} "
+                        f"ceiling={ceiling:.4f}"
+                    ),
+                )
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                log.info(
+                    "watchlist.skipped_chase",
+                    extra={
+                        "event": "watchlist.skipped_chase",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                        "reference_price": row.reference_price,
+                        "current_last": quote.last,
+                        "chase_ceiling": ceiling,
+                        "max_chase_pct": cfg.watchlist_max_chase_pct,
+                    },
+                )
+                continue
+
+            reason = await self._attempt_watchlist_entry(row)
+            if reason is None:
+                created = ensure_utc(row.created_at) if row.created_at else now
+                lag_days = trading_days_held(
+                    created.astimezone(ET).date(), now.astimezone(ET).date()
+                )
+                delta_pct = (
+                    (quote.last - row.reference_price)
+                    / row.reference_price
+                    * 100.0
+                )
+                resolve_watchlist_row(
+                    db,
+                    row.id,
+                    status="entered",
+                    notes=(
+                        f"lag_trading_days={lag_days} "
+                        f"entry_last={quote.last:.4f} "
+                        f"delta_pct={delta_pct:+.2f}"
+                    ),
+                )
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                held.add(row.symbol)
+                log.info(
+                    "watchlist.entered",
+                    extra={
+                        "event": "watchlist.entered",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                        "lag_trading_days": lag_days,
+                        "reference_price": row.reference_price,
+                        "entry_last": quote.last,
+                        "price_delta_pct": delta_pct,
+                    },
+                )
+            else:
+                # Still blocked (usually capital again) — leave pending
+                # with NO status change; throttle the log to once per ET
+                # day per row so a full book doesn't spam every tick.
+                today_et = now.astimezone(ET).date()
+                if self._watchlist_retry_log_dates.get(row.id) != today_et:
+                    self._watchlist_retry_log_dates[row.id] = today_et
+                    log.info(
+                        "watchlist.retry_blocked",
+                        extra={
+                            "event": "watchlist.retry_blocked",
+                            "watchlist_id": row.id,
+                            "proposal_id": row.proposal_id,
+                            "symbol": row.symbol,
+                            "reason": reason,
+                        },
+                    )
+
+    async def _attempt_watchlist_entry(self, row: Any) -> str | None:
+        """Retry a parked proposal through the NORMAL execution chain.
+
+        DETERMINISTIC — no LLM calls anywhere on this path: the Opus
+        review already happened on day 0 (enrollment only ever follows
+        an approved proposal), and the chain is validator + sizer +
+        submitter only. The validator IS re-run — it is pure, cheap
+        (one quote + one account snapshot, zero LLM) and deterministic —
+        so kill-switch, universe, price-floor and exit-geometry are all
+        re-checked at retry-time prices; the sizer re-runs every
+        KS-4/5/6/7 cap, including symbol-not-held (KS-6, on the
+        positions ∪ pending-entries view).
+
+        Returns None on an accepted submission; a reason string on any
+        failure — the caller leaves the row pending (bounded by expiry).
+        """
+        db = self._components.journal.db_path
+        proposal_row = get_proposal_by_id(db, row.proposal_id)
+        if proposal_row is None:
+            return "proposal_missing"
+        # Never double-enter: any non-rejected execution row (accepted /
+        # partial / adopted-from-broker) means the entry already exists.
+        with connect(db) as conn:
+            existing = conn.execute(
+                "SELECT 1 FROM executions WHERE proposal_id = ? "
+                "AND decision != 'rejected' LIMIT 1",
+                (row.proposal_id,),
+            ).fetchone()
+        if existing is not None:
+            return "already_executed"
+        review = get_proposal_review_by_proposal_id(db, row.proposal_id)
+        if review is not None and review.decision in ("reject", "malformed"):
+            return "opus_reject"  # defensive; enrollment never follows these
+        return await self._run_entry_chain(
+            row.proposal_id, proposal_row, review, day_zero=False
+        )
 
     # -- Helpers -----------------------------------------------------------
 

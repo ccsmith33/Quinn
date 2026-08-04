@@ -73,6 +73,20 @@ sizing_high_pct = 0.10
 # displacement_min_conviction = 8        # bounds [6, 10]
 # displacement_proceeds_haircut = 0.90   # fraction of victim market value credited; (0, 1]
 # displacement_victim_max_gain_pct = 5.0 # base-tier victim gain cutoff (% vs cost)
+# WATCHLIST / deferred entry (default OFF). An APPROVED proposal rejected for
+# CAPITAL reasons only (ks5_concurrent_limit / ks7_cash_reserve /
+# insufficient_capital) with conviction >= watchlist_min_conviction is parked
+# in the `watchlist` table and retried through the NORMAL execution path
+# (validator + sizing + every KS gate; zero LLM calls) each agent tick during
+# market hours once capital frees. Study basis: eventual big winners are only
+# ~+1% median at day-1 close, so day+1/+2 entry retains ~98% of their P&L
+# (quinn-catalyst-study/results/big_winner_day1_study.md). The chase guard
+# skips names that already ran: never pay above
+# reference_price * (1 + watchlist_max_chase_pct/100); exactly AT the ceiling
+# is still allowed. One active row per symbol; day-0 signals keep priority.
+# watchlist_min_conviction = 6      # 0 = off; bounds [0, 10]
+# watchlist_expiry_trading_days = 3 # TRADING days, not calendar; bounds [1, 10]
+# watchlist_max_chase_pct = 8.0     # bounds [0, 25]
 # Staged trail tightening (opt-in). As the position's high-water gain vs
 # entry (% of entry) crosses each gain_pct milestone, the effective trail
 # width becomes min(current width, trail_pct) — the trail only ever

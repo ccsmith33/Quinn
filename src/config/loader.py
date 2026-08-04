@@ -184,6 +184,26 @@ class ExecutionConfig(_Section):
     # Any other value must be in [6, 10]; the operator sets 8 or 9
     # explicitly. Requires displacement_use_chopping_block.
     displacement_young_victim_min_conviction: int = Field(default=0)
+    # WATCHLIST / deferred entry (default OFF). An approved proposal
+    # whose execution was rejected for CAPITAL reasons only
+    # (ks5_concurrent_limit / ks7_cash_reserve / insufficient_capital)
+    # with conviction >= watchlist_min_conviction is parked in the
+    # `watchlist` table and retried through the NORMAL execution path
+    # (validator + sizing + every KS gate) each agent tick during market
+    # hours once capital frees. The 33k-event day-1 study
+    # (big_winner_day1_study.md) shows day+1/+2 entry retains ~98% of
+    # eventual big-winner P&L, so nearly all the day-0 value survives a
+    # short deferral. 0 (the default) disables the feature entirely: no
+    # table writes, no tick work — byte-identical to pre-feature.
+    watchlist_min_conviction: int = Field(default=0, ge=0, le=10)
+    # How long a parked proposal stays retryable, in TRADING days (the
+    # study's edge decays fast — a name not entered within a couple of
+    # sessions has usually either run or gone stale).
+    watchlist_expiry_trading_days: int = Field(default=3, ge=1, le=10)
+    # Chase guard (the study's slippage/momentum caveat): never pay more
+    # than reference_price * (1 + this/100). Exactly AT the ceiling is
+    # still allowed; strictly above resolves the row `skipped_chase`.
+    watchlist_max_chase_pct: float = Field(default=8.0, ge=0.0, le=25.0)
 
     @model_validator(mode="after")
     def _check_young_victim_conviction_band(self) -> ExecutionConfig:

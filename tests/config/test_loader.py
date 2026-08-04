@@ -413,3 +413,74 @@ def test_event_reviews_rejects_non_ascending_gain_thresholds() -> None:
         EventReviewsConfig(gain_thresholds_pct=[20.0, 10.0])
     with pytest.raises(ValidationError):
         EventReviewsConfig(gain_thresholds_pct=[-5.0, 10.0])
+
+
+# ---------------------------------------------------------------------------
+# Watchlist / deferred entry — [execution] watchlist_* keys.
+# ---------------------------------------------------------------------------
+
+
+def test_watchlist_defaults_off() -> None:
+    """Keys absent → feature OFF (min_conviction 0) with documented
+    defaults for the other two knobs — legacy configs parse and behave
+    byte-identically."""
+    cfg = ExecutionConfig(**_execution_kwargs())
+    assert cfg.watchlist_min_conviction == 0
+    assert cfg.watchlist_expiry_trading_days == 3
+    assert cfg.watchlist_max_chase_pct == 8.0
+
+
+def test_example_toml_watchlist_off_by_default() -> None:
+    """The example ships the watchlist keys commented out → OFF."""
+    cfg = load_config(str(EXAMPLE_TOML))
+    assert cfg.execution.watchlist_min_conviction == 0
+    assert cfg.execution.watchlist_expiry_trading_days == 3
+    assert cfg.execution.watchlist_max_chase_pct == 8.0
+
+
+def test_watchlist_parses_from_toml(tmp_path: Path) -> None:
+    toml = EXAMPLE_TOML.read_text(encoding="utf-8").replace(
+        "sizing_high_pct = 0.10",
+        "sizing_high_pct = 0.10\n"
+        "watchlist_min_conviction = 6\n"
+        "watchlist_expiry_trading_days = 2\n"
+        "watchlist_max_chase_pct = 5.5\n",
+    )
+    p = tmp_path / "watchlist.toml"
+    p.write_text(toml, encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.execution.watchlist_min_conviction == 6
+    assert cfg.execution.watchlist_expiry_trading_days == 2
+    assert cfg.execution.watchlist_max_chase_pct == 5.5
+
+
+@pytest.mark.parametrize(
+    "field,bad",
+    [
+        ("watchlist_min_conviction", -1),
+        ("watchlist_min_conviction", 11),
+        ("watchlist_expiry_trading_days", 0),
+        ("watchlist_expiry_trading_days", 11),
+        ("watchlist_max_chase_pct", -0.1),
+        ("watchlist_max_chase_pct", 25.1),
+    ],
+)
+def test_watchlist_rejects_out_of_range(field: str, bad: object) -> None:
+    with pytest.raises(ValidationError):
+        ExecutionConfig(**_execution_kwargs(**{field: bad}))
+
+
+@pytest.mark.parametrize(
+    "field,good",
+    [
+        ("watchlist_min_conviction", 0),
+        ("watchlist_min_conviction", 10),
+        ("watchlist_expiry_trading_days", 1),
+        ("watchlist_expiry_trading_days", 10),
+        ("watchlist_max_chase_pct", 0.0),
+        ("watchlist_max_chase_pct", 25.0),
+    ],
+)
+def test_watchlist_accepts_bounds(field: str, good: object) -> None:
+    cfg = ExecutionConfig(**_execution_kwargs(**{field: good}))
+    assert getattr(cfg, field) == good
