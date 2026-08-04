@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import sqlite3
+import statistics
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -1648,6 +1649,117 @@ def get_postmortems_for_symbol(
     return [TradePostmortemRow(**dict(r)) for r in rows]
 
 
+# Conviction bands served by the CALIBRATION memory provider. The tuple
+# order IS the report order — deterministic by construction.
+_CALIBRATION_BANDS: tuple[tuple[str, int, int], ...] = (
+    ("2-3", 2, 3),
+    ("4-5", 4, 5),
+    ("6-7", 6, 7),
+    ("8-10", 8, 10),
+)
+
+
+def get_conviction_calibration(db_path: str) -> dict[str, Any]:
+    """Realized outcomes of CLOSED trades grouped by conviction band —
+    the data behind the CALIBRATION memory provider.
+
+    Closed-trade definition (aligned with
+    `get_closed_trade_pnls_chronological`'s fill-truth reading): an
+    `accepted` execution whose FILLED orders — `final_status` in
+    ('filled', 'partially_filled_closed') with non-NULL
+    `realized_fill_qty` / `realized_fill_price` — include at least one
+    entry buy AND net flat (total filled sell qty == total filled buy
+    qty). Open and partially-closed positions are thereby excluded
+    entirely; unfilled orders never close a trade.
+
+    Realized % per trade is fee-inclusive on entry notional:
+    `(sell_notional - buy_notional - fees) / buy_notional * 100`
+    (long-only, architecture §5). Trades whose proposal conviction is
+    NULL or below 2 fall outside every band and are excluded (conviction
+    is scored 1-10; sub-2 conviction never survives to execution in
+    practice).
+
+    Returns `{"total_n": int, "bands": [...]}` where `bands` holds one
+    dict per band in fixed `_CALIBRATION_BANDS` order: `band`, `n`,
+    `win_rate_pct` (share with realized > 0), `mean_realized_pct`,
+    `median_realized_pct` — the three stats rounded to 1dp, or None when
+    the band is empty. `total_n` is the sum of banded trades.
+    """
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT p.conviction AS conviction,
+                   SUM(CASE WHEN o.side = 'buy'
+                       THEN o.realized_fill_qty ELSE 0 END) AS buy_qty,
+                   SUM(CASE WHEN o.side = 'sell'
+                       THEN o.realized_fill_qty ELSE 0 END) AS sell_qty,
+                   SUM(CASE WHEN o.side = 'buy'
+                       THEN o.realized_fill_qty * o.realized_fill_price
+                       ELSE 0.0 END) AS buy_notional,
+                   SUM(CASE WHEN o.side = 'sell'
+                       THEN o.realized_fill_qty * o.realized_fill_price
+                       ELSE 0.0 END) AS sell_notional,
+                   SUM(COALESCE(o.realized_fee, 0.0)) AS fees,
+                   SUM(CASE WHEN o.role = 'entry' AND o.side = 'buy'
+                       THEN 1 ELSE 0 END) AS entry_fills
+            FROM executions e
+            JOIN proposals p ON p.id = e.proposal_id
+            JOIN orders o ON o.execution_id = e.id
+            WHERE e.decision = 'accepted'
+              AND p.conviction IS NOT NULL
+              AND o.final_status IN ('filled', 'partially_filled_closed')
+              AND o.realized_fill_qty IS NOT NULL
+              AND o.realized_fill_price IS NOT NULL
+            GROUP BY e.id
+            HAVING entry_fills > 0 AND buy_qty > 0 AND buy_qty = sell_qty
+            ORDER BY e.id ASC
+            """
+        ).fetchall()
+
+    by_band: dict[str, list[float]] = {name: [] for name, _, _ in _CALIBRATION_BANDS}
+    for r in rows:
+        conviction = int(r["conviction"])
+        buy_notional = float(r["buy_notional"])
+        realized_pct = (
+            (float(r["sell_notional"]) - buy_notional - float(r["fees"]))
+            / buy_notional
+            * 100.0
+        )
+        for name, lo, hi in _CALIBRATION_BANDS:
+            if lo <= conviction <= hi:
+                by_band[name].append(realized_pct)
+                break
+
+    bands: list[dict[str, Any]] = []
+    total_n = 0
+    for name, _, _ in _CALIBRATION_BANDS:
+        pcts = by_band[name]
+        n = len(pcts)
+        total_n += n
+        if n == 0:
+            bands.append(
+                {
+                    "band": name,
+                    "n": 0,
+                    "win_rate_pct": None,
+                    "mean_realized_pct": None,
+                    "median_realized_pct": None,
+                }
+            )
+            continue
+        wins = sum(1 for p in pcts if p > 0.0)
+        bands.append(
+            {
+                "band": name,
+                "n": n,
+                "win_rate_pct": round(wins / n * 100.0, 1),
+                "mean_realized_pct": round(sum(pcts) / n, 1),
+                "median_realized_pct": round(statistics.median(pcts), 1),
+            }
+        )
+    return {"total_n": total_n, "bands": bands}
+
+
 # ---------------------------------------------------------------------------
 # JournalRepo — thin object facade over the module-level functions.
 #
@@ -2244,3 +2356,6 @@ class JournalRepo:
         self, symbol: str
     ) -> list[TradePostmortemRow]:
         return get_postmortems_for_symbol(self.db_path, symbol)
+
+    def get_conviction_calibration(self) -> dict[str, Any]:
+        return get_conviction_calibration(self.db_path)

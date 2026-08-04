@@ -231,6 +231,12 @@ def compose_agent(
         memory_assembler = MemoryContextAssembler()
         # provider registration lands here (per config.memory.*_enabled).
         register_doctrine(memory_assembler, config.memory, journal)
+        if config.memory.calibration_enabled:
+            from app.memory_calibration import CalibrationMemoryProvider
+
+            memory_assembler.register(
+                "calibration", CalibrationMemoryProvider(journal)
+            )
 
     # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
     # lives in this constructor (D-047). Feature B: also wires the KS5
