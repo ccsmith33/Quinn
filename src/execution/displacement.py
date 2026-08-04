@@ -43,8 +43,9 @@ Deterministic only: no LLM calls anywhere in this path.
 from __future__ import annotations
 
 import datetime as dt
+import sqlite3
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from broker.protocol import (
     AccountSnapshot,
@@ -60,7 +61,12 @@ from execution.protection import cancel_protective_legs, restore_protection
 from execution.sizing import SizingAccepted, SizingEngine
 from journal.exit_policy import get_exit_policy_state
 from journal.models import OrderRow
-from journal.repo import connect, get_orders_for_execution, insert_order
+from journal.repo import (
+    connect,
+    get_latest_chopping_block,
+    get_orders_for_execution,
+    insert_order,
+)
 from observability.log_port import get_logger
 from proposal.schemas import TradeProposal
 
@@ -95,6 +101,11 @@ class DisplacementVictim:
     qty: int
     market_value: float
     unrealized_pct: float  # percent gain/loss vs cost basis
+    days_held: int  # ET trading days held since entry
+    # True when this victim was selected via the young-victim AGE OVERRIDE
+    # (younger than MIN_HOLD_TRADING_DAYS, admissible only from the
+    # chopping block for a conviction >= displacement_young_victim_min_conviction).
+    via_override: bool = False
 
 
 def _ensure_aware(d: dt.datetime) -> dt.datetime:
@@ -267,6 +278,8 @@ class DisplacementEngine:
                 "victim_conviction": victim.conviction,
                 "victim_unrealized_pct": victim.unrealized_pct,
                 "victim_market_value": victim.market_value,
+                "victim_days_held": victim.days_held,
+                "override": victim.via_override,
                 "proceeds_credit": credit,
                 "realized_dollar_size": sizing.realized_dollar_size,
                 "qty": sizing.qty,
@@ -286,62 +299,153 @@ class DisplacementEngine:
         conviction: int,
         cfg: ExecutionConfig,
     ) -> DisplacementVictim | None:
-        """Deterministic victim pick: qualify, then lowest unrealized %
-        wins (symbol tie-break for stable ordering)."""
+        """Pick the victim to evict.
+
+        With no chopping block (feature off / no block persisted yet), this
+        is the original deterministic pick: qualify (unarmed, aged >= 5
+        trading days, not entered today, sub-cutoff) then lowest unrealized
+        % wins (symbol tie-break). When a block EXISTS and
+        `displacement_use_chopping_block` is on, the SAME eligibility gates
+        apply but the ORDER becomes the block's thesis-sanctioned rank
+        (rank 1 = most expendable first). When no age-eligible victim
+        exists at all, the AGE OVERRIDE may reach a younger victim — but
+        only one on the block, and only for a proposal at/above
+        `displacement_young_victim_min_conviction`.
+        """
         today_et = self._now_fn().astimezone(ET).date()
         ignore_gain_cutoff = conviction >= GAIN_CUTOFF_EXEMPT_CONVICTION
-        candidates: list[DisplacementVictim] = []
+        block_ranks = self._load_chopping_block_ranks(cfg)
+
+        qualified: list[DisplacementVictim] = []
         for pos in open_positions:
-            if pos.qty <= 0 or pos.symbol == new_symbol:
-                continue
-            lineage = self._latest_accepted_execution(pos.symbol)
-            if lineage is None:
-                # No journal lineage (operator-manual position, foreign
-                # box state): unauditable age/armed status → not evictable.
-                continue
-            execution_id, victim_conviction = lineage
-            state = get_exit_policy_state(self._db, execution_id=execution_id)
-            if state is not None and state.trail_engaged:
-                continue  # trail armed — untouchable at every conviction
-            entry = next(
-                (
-                    o
-                    for o in get_orders_for_execution(self._db, execution_id)
-                    if o.role == "entry"
-                ),
-                None,
+            victim = self._qualify_victim(
+                pos,
+                new_symbol=new_symbol,
+                today_et=today_et,
+                ignore_gain_cutoff=ignore_gain_cutoff,
+                cfg=cfg,
             )
-            if entry is None:
-                continue
-            entry_date_et = (
-                _ensure_aware(entry.submitted_at).astimezone(ET).date()
-            )
-            if entry_date_et == today_et:
-                continue  # entered today — never displace a same-day entry
-            if trading_days_held(entry_date_et, today_et) < MIN_HOLD_TRADING_DAYS:
-                continue
-            cost = pos.avg_entry_price * pos.qty
-            if cost <= 0:
-                continue
-            unrealized_pct = pos.unrealized_pnl / cost * 100.0
-            if (
-                not ignore_gain_cutoff
-                and unrealized_pct >= cfg.displacement_victim_max_gain_pct
-            ):
-                continue
-            candidates.append(
-                DisplacementVictim(
-                    execution_id=execution_id,
-                    conviction=victim_conviction,
-                    symbol=pos.symbol,
-                    qty=pos.qty,
-                    market_value=pos.market_value,
-                    unrealized_pct=unrealized_pct,
-                )
-            )
-        if not candidates:
+            if victim is not None:
+                qualified.append(victim)
+        if not qualified:
             return None
-        return min(candidates, key=lambda v: (v.unrealized_pct, v.symbol))
+
+        aged = [v for v in qualified if v.days_held >= MIN_HOLD_TRADING_DAYS]
+
+        if block_ranks is not None:
+            # Block present: iterate age-eligible victims in block-rank
+            # order (already revalidated open/unarmed/qty>0 by qualify).
+            aged_in_block = [v for v in aged if v.execution_id in block_ranks]
+            if aged_in_block:
+                return min(
+                    aged_in_block, key=lambda v: block_ranks[v.execution_id]
+                )
+            if aged:
+                # Block exists but none of the aged victims are on it
+                # (entered after the sweep, or the sweep didn't rank them):
+                # fall back to the deterministic weakest-first pick rather
+                # than strand a legitimate displacement.
+                return min(aged, key=lambda v: (v.unrealized_pct, v.symbol))
+            # No age-eligible victim at all → AGE OVERRIDE, chopping-block
+            # only: evict the weakest-rank YOUNG victim on the block when
+            # the proposal clears the override conviction gate.
+            min_conv = cfg.displacement_young_victim_min_conviction
+            if min_conv and conviction >= min_conv:
+                young_in_block = [
+                    v
+                    for v in qualified
+                    if v.days_held < MIN_HOLD_TRADING_DAYS
+                    and v.execution_id in block_ranks
+                ]
+                if young_in_block:
+                    chosen = min(
+                        young_in_block,
+                        key=lambda v: block_ranks[v.execution_id],
+                    )
+                    return replace(chosen, via_override=True)
+            return None
+
+        # No block (or feature off): original deterministic behavior —
+        # weakest age-eligible victim, byte-identical to pre-feature.
+        if not aged:
+            return None
+        return min(aged, key=lambda v: (v.unrealized_pct, v.symbol))
+
+    def _qualify_victim(
+        self,
+        pos: Position,
+        *,
+        new_symbol: str,
+        today_et: dt.date,
+        ignore_gain_cutoff: bool,
+        cfg: ExecutionConfig,
+    ) -> DisplacementVictim | None:
+        """Apply every eviction gate EXCEPT the age gate (the caller decides
+        whether the normal >= 5-trading-day rule or the age override
+        applies). Returns a victim carrying its `days_held`, or None when
+        the position can never be a victim (wrong symbol, qty<=0, no
+        lineage, armed, entered today, no entry order, zero cost, or a gain
+        at/above the cutoff at the base tier)."""
+        if pos.qty <= 0 or pos.symbol == new_symbol:
+            return None
+        lineage = self._latest_accepted_execution(pos.symbol)
+        if lineage is None:
+            # No journal lineage (operator-manual position, foreign box
+            # state): unauditable age/armed status → not evictable.
+            return None
+        execution_id, victim_conviction = lineage
+        state = get_exit_policy_state(self._db, execution_id=execution_id)
+        if state is not None and state.trail_engaged:
+            return None  # trail armed — untouchable at every conviction
+        entry = next(
+            (
+                o
+                for o in get_orders_for_execution(self._db, execution_id)
+                if o.role == "entry"
+            ),
+            None,
+        )
+        if entry is None:
+            return None
+        entry_date_et = _ensure_aware(entry.submitted_at).astimezone(ET).date()
+        if entry_date_et == today_et:
+            return None  # entered today — never displace a same-day entry
+        cost = pos.avg_entry_price * pos.qty
+        if cost <= 0:
+            return None
+        unrealized_pct = pos.unrealized_pnl / cost * 100.0
+        if (
+            not ignore_gain_cutoff
+            and unrealized_pct >= cfg.displacement_victim_max_gain_pct
+        ):
+            return None
+        return DisplacementVictim(
+            execution_id=execution_id,
+            conviction=victim_conviction,
+            symbol=pos.symbol,
+            qty=pos.qty,
+            market_value=pos.market_value,
+            unrealized_pct=unrealized_pct,
+            days_held=trading_days_held(entry_date_et, today_et),
+        )
+
+    def _load_chopping_block_ranks(
+        self, cfg: ExecutionConfig
+    ) -> dict[int, int] | None:
+        """execution_id -> rank for the most recent chopping block, or None
+        when the feature is off / no block has been persisted. A missing
+        `chopping_block` table (a DB migrated before this feature) is
+        treated the same as an empty block — displacement then falls back
+        to the deterministic ranking."""
+        if not cfg.displacement_use_chopping_block:
+            return None
+        try:
+            rows = get_latest_chopping_block(self._db)
+        except sqlite3.OperationalError:
+            return None
+        if not rows:
+            return None
+        return {r.execution_id: r.rank for r in rows}
 
     def _latest_accepted_execution(
         self, symbol: str
@@ -480,8 +584,10 @@ class DisplacementEngine:
                     f"{DISPLACEMENT_NOTES_PREFIX} evicted {victim.symbol} "
                     f"(execution {victim.execution_id}, "
                     f"unrealized {victim.unrealized_pct:+.2f}%, "
+                    f"held {victim.days_held}d, "
                     f"conviction {victim.conviction}) "
                     f"to fund {new_symbol} (conviction {new_conviction})"
+                    + (" [young-victim age override]" if victim.via_override else "")
                 ),
             ),
         )

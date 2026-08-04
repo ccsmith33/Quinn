@@ -25,6 +25,7 @@ from broker.protocol import (
     Quote,
     SubmittedOrder,
 )
+from config.calendar import ET
 from config.loader import ExecutionConfig
 from execution.displacement import (
     DISPLACEMENT_NOTES_PREFIX,
@@ -36,6 +37,7 @@ from execution.sizing import SizingAccepted, SizingEngine, SizingRejected
 from journal.exit_policy import ExitPolicyStateRow, upsert_exit_policy_state
 from journal.migrate import apply_migrations
 from journal.models import (
+    ChoppingBlockRow,
     ExecutionRow,
     FilingRow,
     OrderRow,
@@ -49,6 +51,7 @@ from journal.repo import (
     insert_order,
     insert_prompt,
     insert_proposal,
+    replace_chopping_block,
 )
 from proposal.schemas import TradeProposal
 
@@ -747,3 +750,241 @@ def test_trading_days_held_counts_market_open_days_only() -> None:
     # Wed 2026-06-17 → Mon 2026-06-22 spans Juneteenth (Fri 06-19, NYSE
     # holiday): Thu 06-18 + Mon 06-22 = 2 trading days.
     assert trading_days_held(dt.date(2026, 6, 17), dt.date(2026, 6, 22)) == 2
+
+
+# ---------------------------------------------------------------------------
+# CHOPPING BLOCK — block-ordered victim selection + young-victim age override
+# ---------------------------------------------------------------------------
+
+
+def _write_block(db: str, ranked_eids: list[tuple[int, str]], *, exp: int = 4) -> None:
+    """Persist a chopping block for NOW's ET date. `ranked_eids` is
+    [(execution_id, symbol), ...] in rank order (rank 1 first)."""
+    block_date = NOW.astimezone(ET).date().isoformat()
+    rows = [
+        ChoppingBlockRow(
+            block_date=block_date, execution_id=eid, symbol=sym,
+            rank=i, expendability=exp, reason=f"chop-{sym}",
+        )
+        for i, (eid, sym) in enumerate(ranked_eids, start=1)
+    ]
+    replace_chopping_block(db, block_date, rows)
+
+
+def test_block_reorders_victim_away_from_deterministic_weakest(db: str) -> None:
+    """With a block, the thesis-sanctioned rank wins over the deterministic
+    lowest-unrealized-% pick."""
+    broker = _RecordingBroker()
+    low_eid = _seed_victim(db, symbol="LOWG", entry_at=AGED)
+    high_eid = _seed_victim(db, symbol="HIGHG", entry_at=AGED)
+    positions = [
+        _position("LOWG", unrealized_pct=-8.0),  # deterministic weakest
+        _position("HIGHG", unrealized_pct=+2.0),
+    ]
+    # Block ranks HIGHG most-expendable (rank 1) despite its better P&L.
+    _write_block(db, [(high_eid, "HIGHG"), (low_eid, "LOWG")])
+    victim = _engine(db, broker).find_victim(
+        positions, new_symbol="ACME", conviction=8, cfg=_cfg()
+    )
+    assert victim is not None
+    assert victim.symbol == "HIGHG"
+    assert victim.via_override is False
+    # Feature off → the deterministic weakest (LOWG) is chosen instead.
+    victim_off = _engine(db, broker).find_victim(
+        positions, new_symbol="ACME", conviction=8,
+        cfg=_cfg(displacement_use_chopping_block=False),
+    )
+    assert victim_off is not None
+    assert victim_off.symbol == "LOWG"
+
+
+def test_no_block_default_is_deterministic_and_identical(db: str) -> None:
+    """Default config (use_chopping_block=True) with NO block persisted →
+    byte-identical deterministic weakest-first pick."""
+    broker = _RecordingBroker()
+    _seed_victim(db, symbol="A", entry_at=AGED)
+    _seed_victim(db, symbol="B", entry_at=AGED)
+    positions = [
+        _position("A", unrealized_pct=-3.0),
+        _position("B", unrealized_pct=-9.0),  # weakest
+    ]
+    victim = _engine(db, broker).find_victim(
+        positions, new_symbol="ACME", conviction=8, cfg=_cfg()
+    )
+    assert victim is not None and victim.symbol == "B"
+
+
+def test_block_row_for_closed_or_armed_position_is_skipped(db: str) -> None:
+    """Fire-time revalidation: a block row whose position closed overnight
+    (absent from open_positions) or is now armed is skipped; the next
+    still-open, unarmed, age-eligible block member wins."""
+    broker = _RecordingBroker()
+    ghost_eid = _seed_victim(db, symbol="GHOST", entry_at=AGED)
+    armed_eid = _seed_victim(db, symbol="ARMED", entry_at=AGED, armed=True)
+    good_eid = _seed_victim(db, symbol="GOOD", entry_at=AGED)
+    # GHOST is not in open_positions (closed overnight); ARMED is armed now.
+    positions = [
+        _position("ARMED", unrealized_pct=-9.0),
+        _position("GOOD", unrealized_pct=-1.0),
+    ]
+    _write_block(db, [(ghost_eid, "GHOST"), (armed_eid, "ARMED"), (good_eid, "GOOD")])
+    victim = _engine(db, broker).find_victim(
+        positions, new_symbol="ACME", conviction=8, cfg=_cfg()
+    )
+    assert victim is not None
+    assert victim.symbol == "GOOD"
+    assert victim.via_override is False
+
+
+def test_age_override_fires_for_high_conviction_young_block_victim(db: str) -> None:
+    """No age-eligible victim, but a YOUNG victim on the block + a proposal
+    clearing the override gate → the young victim is evicted (override)."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)  # 2 trading days
+    positions = [_position("YNG", unrealized_pct=-4.0)]
+    _write_block(db, [(young_eid, "YNG")])
+    cfg = _cfg(displacement_young_victim_min_conviction=9)
+    victim = _engine(db, broker).find_victim(
+        positions, new_symbol="ACME", conviction=9, cfg=cfg
+    )
+    assert victim is not None
+    assert victim.symbol == "YNG"
+    assert victim.via_override is True
+    assert victim.days_held < 5
+
+
+def test_age_override_disabled_by_default_zero(db: str) -> None:
+    """Default young_victim_min_conviction=0 → override never fires; a
+    young-only book still blocks displacement."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)
+    _write_block(db, [(young_eid, "YNG")])
+    victim = _engine(db, broker).find_victim(
+        [_position("YNG", unrealized_pct=-4.0)],
+        new_symbol="ACME", conviction=9, cfg=_cfg(),
+    )
+    assert victim is None
+
+
+def test_age_override_requires_conviction_gate(db: str) -> None:
+    """Override gate 9, proposal conviction 8 → no override."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)
+    _write_block(db, [(young_eid, "YNG")])
+    victim = _engine(db, broker).find_victim(
+        [_position("YNG", unrealized_pct=-4.0)],
+        new_symbol="ACME", conviction=8,
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+    )
+    assert victim is None
+
+
+def test_age_override_only_from_block(db: str) -> None:
+    """A young victim NOT on the block is never reachable by the override,
+    even with the gate met."""
+    broker = _RecordingBroker()
+    _seed_victim(db, symbol="YNG", entry_at=YOUNG)  # seeded but not on block
+    # Empty block for today (a different, unrelated symbol would also do).
+    victim = _engine(db, broker).find_victim(
+        [_position("YNG", unrealized_pct=-4.0)],
+        new_symbol="ACME", conviction=9,
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+    )
+    assert victim is None
+
+
+def test_age_override_never_touches_armed_young(db: str) -> None:
+    """An armed young victim on the block is still untouchable."""
+    broker = _RecordingBroker()
+    armed_eid = _seed_victim(db, symbol="YARM", entry_at=YOUNG, armed=True)
+    _write_block(db, [(armed_eid, "YARM")])
+    victim = _engine(db, broker).find_victim(
+        [_position("YARM", unrealized_pct=-9.0)],
+        new_symbol="ACME", conviction=9,
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+    )
+    assert victim is None
+
+
+def test_age_override_end_to_end_journals_override_marker(db: str) -> None:
+    """Full attempt(): the override sell is submitted and the journal note
+    carries the override marker + victim age."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)
+    _write_block(db, [(young_eid, "YNG")])
+    result = _engine(db, broker).attempt(
+        proposal=_proposal(conviction=9),
+        proposal_id=999,
+        account=_account(),
+        open_positions=[_position("YNG", unrealized_pct=-4.0)],
+        quote=_quote(),
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+        sizer=SizingEngine(),
+    )
+    assert isinstance(result, SizingAccepted)
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].symbol == "YNG"
+    with connect(db) as conn:
+        row = conn.execute(
+            "SELECT notes FROM orders WHERE notes LIKE ?",
+            (f"{DISPLACEMENT_NOTES_PREFIX}%",),
+        ).fetchone()
+    assert row is not None
+    assert "young-victim age override" in row["notes"]
+
+
+def test_age_override_respects_daily_cap(db: str) -> None:
+    """A displacement already done today blocks the override path too."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)
+    _write_block(db, [(young_eid, "YNG")])
+    # A displacement row from earlier today trips the hard cap.
+    insert_order(
+        db,
+        OrderRow(
+            execution_id=young_eid, role="displacement_close", symbol="EARLY",
+            side="sell", order_type="market", qty=5, tif="day",
+            broker_order_id="disp-early", submitted_at=NOW - dt.timedelta(hours=1),
+            final_status="accepted",
+            notes=f"{DISPLACEMENT_NOTES_PREFIX} evicted EARLY earlier today",
+        ),
+    )
+    result = _engine(db, broker).attempt(
+        proposal=_proposal(conviction=9),
+        proposal_id=999,
+        account=_account(),
+        open_positions=[_position("YNG", unrealized_pct=-4.0)],
+        quote=_quote(),
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+        sizer=SizingEngine(),
+    )
+    assert result is None
+    assert broker.submitted == []
+
+
+# ---------------------------------------------------------------------------
+# config validation for the new knobs
+# ---------------------------------------------------------------------------
+
+
+def test_chopping_block_config_defaults() -> None:
+    cfg = ExecutionConfig(
+        broker_mode="paper", ks4_pct_cap=0.20, ks4_absolute_cap_usd=1000.0,
+        ks5_max_concurrent=5, ks7_cash_reserve_pct=0.05, sizing_mid_pct=0.05,
+        sizing_high_pct=0.10,
+    )
+    # Old quinn.toml (without the new keys) parses; override disabled by default.
+    assert cfg.displacement_use_chopping_block is True
+    assert cfg.displacement_young_victim_min_conviction == 0
+
+
+@pytest.mark.parametrize("value", [1, 5, 11, -1])
+def test_young_victim_conviction_out_of_band_rejected(value: int) -> None:
+    with pytest.raises(ValidationError):
+        _cfg(displacement_young_victim_min_conviction=value)
+
+
+@pytest.mark.parametrize("value", [0, 6, 8, 9, 10])
+def test_young_victim_conviction_valid_values(value: int) -> None:
+    cfg = _cfg(displacement_young_victim_min_conviction=value)
+    assert cfg.displacement_young_victim_min_conviction == value

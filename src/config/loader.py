@@ -170,6 +170,33 @@ class ExecutionConfig(_Section):
     # eligibility: proposals with conviction >= 9 ignore this cutoff —
     # armed positions stay untouchable at every conviction.
     displacement_victim_max_gain_pct: float = Field(default=5.0)
+    # CHOPPING BLOCK — consume the daily pre-market sweep's pre-ranked
+    # sacrifice list for victim selection. When on (default) and a block
+    # exists, displacement iterates victims in thesis-sanctioned block-rank
+    # order instead of the deterministic weakest-price order; with no block
+    # (feature not producing one) behavior is byte-identical to before.
+    displacement_use_chopping_block: bool = Field(default=True)
+    # AGE OVERRIDE — when a proposal's conviction is at/above this, and NO
+    # normally age-eligible (>= 5 trading days) victim exists, displacement
+    # may evict a YOUNGER victim, but ONLY one on the chopping block
+    # (thesis-sanctioned), still unarmed-only, weakest-rank-first. 0 =
+    # DISABLED (the default — the young-victim age gate is never relaxed).
+    # Any other value must be in [6, 10]; the operator sets 8 or 9
+    # explicitly. Requires displacement_use_chopping_block.
+    displacement_young_victim_min_conviction: int = Field(default=0)
+
+    @model_validator(mode="after")
+    def _check_young_victim_conviction_band(self) -> ExecutionConfig:
+        """0 disables the age override; any other value must sit in the
+        same [6, 10] conviction band as the other displacement knobs so it
+        can't reach into the mid tier. Rejected at load time otherwise."""
+        v = self.displacement_young_victim_min_conviction
+        if v != 0 and not (6 <= v <= 10):
+            raise ValueError(
+                "displacement_young_victim_min_conviction must be 0 "
+                f"(disabled) or in [6, 10]; got {v}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_ks5_tiers_monotonic(self) -> ExecutionConfig:
