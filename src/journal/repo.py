@@ -19,6 +19,7 @@ from observability.log_port import get_logger
 from .models import (
     AccountSnapshotRow,
     BackupRow,
+    ChoppingBlockRow,
     DeferredSellRow,
     ExecutionRow,
     FilingRow,
@@ -668,6 +669,61 @@ def insert_thesis_review(db_path: str, row: ThesisReviewRow) -> int:
             ),
         )
         return int(cur.lastrowid or 0)
+
+
+# ---------------------------------------------------------------------------
+# chopping_block (rewritten atomically per block_date)
+# ---------------------------------------------------------------------------
+
+def replace_chopping_block(
+    db_path: str, block_date: str, rows: list[ChoppingBlockRow]
+) -> None:
+    """Atomically replace the chopping block for `block_date`: delete any
+    existing rows for that date, then insert `rows` (already ranked). A
+    mid-morning re-sweep therefore overwrites rather than duplicates.
+    `rows` may be empty (a sweep that found only armed positions), which
+    simply clears the date."""
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                "DELETE FROM chopping_block WHERE block_date = ?", (block_date,)
+            )
+            for r in rows:
+                conn.execute(
+                    "INSERT INTO chopping_block "
+                    "(block_date, execution_id, symbol, rank, expendability, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        block_date,
+                        r.execution_id,
+                        r.symbol,
+                        r.rank,
+                        r.expendability,
+                        r.reason,
+                    ),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def get_latest_chopping_block(db_path: str) -> list[ChoppingBlockRow]:
+    """Return the most recent day's chopping block in rank order (rank 1
+    first). Empty when the table has no rows. The displacement engine reads
+    this to pick victims in thesis-sanctioned order."""
+    with connect(db_path) as conn:
+        latest = conn.execute(
+            "SELECT MAX(block_date) AS d FROM chopping_block"
+        ).fetchone()
+        if latest is None or latest["d"] is None:
+            return []
+        rows = conn.execute(
+            "SELECT * FROM chopping_block WHERE block_date = ? ORDER BY rank ASC",
+            (latest["d"],),
+        ).fetchall()
+    return [ChoppingBlockRow(**dict(r)) for r in rows]
 
 
 # ---------------------------------------------------------------------------

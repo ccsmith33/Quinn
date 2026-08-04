@@ -49,6 +49,7 @@ from analyzer.thesis_review import (
     ThesisReviewMalformed,
 )
 from broker.protocol import BrokerAdapter, OrderRequest
+from config.calendar import ET
 from config.loader import TrailStage
 from execution.protection import (
     cancel_protective_legs,
@@ -56,6 +57,7 @@ from execution.protection import (
 )
 from journal.exit_policy import get_exit_policy_state, set_stop_order_journal_id
 from journal.models import (
+    ChoppingBlockRow,
     OrderRow,
     ThesisReviewScheduleRow,
 )
@@ -68,6 +70,7 @@ from journal.repo import (
     has_open_position,
     insert_order,
     insert_thesis_review_schedule,
+    replace_chopping_block,
 )
 from observability.log_port import get_logger
 
@@ -287,13 +290,19 @@ class ThesisReviewCoordinator:
         # tick) and only when a sweep review is actually due. `None` when
         # the feature is off, no sweep is due, or the portfolio has room.
         capacity_block: str | None = None
-        if any(_is_daily_sweep(s.scheduled_reason) for s in due):
+        sweep_due = any(_is_daily_sweep(s.scheduled_reason) for s in due)
+        if sweep_due:
             capacity_block = self._compute_capacity_pressure_block(now)
+        # Chopping-block candidates emitted by this tick's daily-sweep
+        # reviews (unarmed positions the reviewer scored for expendability).
+        sweep_candidates: list[_ChoppingBlockCandidate] = []
         for schedule in due:
             try:
-                await self._process_schedule(
+                candidate = await self._process_schedule(
                     schedule, now=now, capacity_block=capacity_block
                 )
+                if candidate is not None:
+                    sweep_candidates.append(candidate)
             except Exception as e:  # noqa: BLE001
                 log.error(
                     "thesis_coordinator.process_error",
@@ -305,6 +314,13 @@ class ThesisReviewCoordinator:
                         "error_class": type(e).__name__,
                     },
                 )
+        # The daily sweep put every held position through the buy-it-fresh
+        # test this tick; persist the pre-ranked chopping block so
+        # displacement never has to improvise victim selection. Written
+        # whenever a sweep was due (even to an empty list — an all-armed
+        # book has no choppable slots), so the block reflects today.
+        if sweep_due:
+            self._write_chopping_block(sweep_candidates, now=now)
 
     async def _process_schedule(
         self,
@@ -312,7 +328,11 @@ class ThesisReviewCoordinator:
         *,
         now: dt.datetime,
         capacity_block: str | None = None,
-    ) -> None:
+    ) -> _ChoppingBlockCandidate | None:
+        """Process one due schedule. Returns a chopping-block candidate when
+        this was a daily-sweep review of an UNARMED position that the
+        reviewer scored for expendability; None otherwise (armed position,
+        non-sweep review, missing expendability, or an early return)."""
         # Fetch the execution + proposal (proposal carries the original
         # thesis text, conviction, sizing, stops).
         execution = _get_execution(self._journal.db_path, schedule.execution_id)
@@ -325,7 +345,7 @@ class ThesisReviewCoordinator:
                     "execution_id": schedule.execution_id,
                 },
             )
-            return
+            return None
         proposal = get_proposal_by_id(self._journal.db_path, execution.proposal_id)
         if proposal is None:
             log.warning(
@@ -336,9 +356,9 @@ class ThesisReviewCoordinator:
                     "proposal_id": execution.proposal_id,
                 },
             )
-            return
+            return None
         if proposal.symbol is None:
-            return  # defensive: trade_proposal rows always have a symbol
+            return None  # defensive: trade_proposal rows always have a symbol
 
         # Position-still-open guard. AC: if stop/TP fired between the
         # last reconcile and now, the schedule should be discarded
@@ -353,7 +373,7 @@ class ThesisReviewCoordinator:
                     "symbol": proposal.symbol,
                 },
             )
-            return
+            return None
 
         # Build review context.
         try:
@@ -373,7 +393,7 @@ class ThesisReviewCoordinator:
                     "error": str(e),
                 },
             )
-            return
+            return None
 
         log.info(
             "thesis_coordinator.review_starting",
@@ -402,6 +422,26 @@ class ThesisReviewCoordinator:
         )
 
         # Apply decision.
+        self._apply_decision(
+            result, execution=execution, proposal=proposal, ctx=ctx,
+            schedule=schedule, now=now,
+        )
+        # Chopping block: a daily-sweep review of an UNARMED position that
+        # carried an expendability score becomes a sacrifice candidate. The
+        # decision (hold/close/...) is orthogonal — expendability is a
+        # relative sacrifice priority, so even a `hold` can be choppable.
+        return self._sweep_candidate(schedule, execution, proposal, ctx, result)
+
+    def _apply_decision(
+        self,
+        result: Any,
+        *,
+        execution: Any,
+        proposal: Any,
+        ctx: ThesisReviewContext,
+        schedule: ThesisReviewScheduleRow,
+        now: dt.datetime,
+    ) -> None:
         if isinstance(result, ThesisHold):
             self._reschedule(execution.id, when=now + dt.timedelta(days=HOLD_RESCHEDULE_DAYS), reason="hold")
             return
@@ -438,6 +478,80 @@ class ThesisReviewCoordinator:
                 reason="hold",
             )
             return
+
+    def _sweep_candidate(
+        self,
+        schedule: ThesisReviewScheduleRow,
+        execution: Any,
+        proposal: Any,
+        ctx: ThesisReviewContext,
+        result: Any,
+    ) -> _ChoppingBlockCandidate | None:
+        """Build a chopping-block candidate from a completed review, or None.
+
+        Only daily-sweep reviews contribute. ARMED positions are excluded
+        entirely (untouchable by displacement at every conviction — never on
+        the block). A review that returned no expendability (malformed
+        response, or the model omitted it) contributes nothing."""
+        if not _is_daily_sweep(schedule.scheduled_reason):
+            return None
+        if ctx.trail_armed:
+            return None
+        expendability = getattr(result, "expendability", None)
+        if expendability is None:
+            return None
+        return _ChoppingBlockCandidate(
+            execution_id=execution.id,
+            symbol=proposal.symbol,
+            expendability=expendability,
+            reason=getattr(result, "expendability_reason", None),
+            unrealized_gain_pct=ctx.pct_change_since_entry,
+            days_held=ctx.days_held,
+        )
+
+    def _write_chopping_block(
+        self, candidates: list[_ChoppingBlockCandidate], *, now: dt.datetime
+    ) -> None:
+        """Rank the sweep's candidates and persist the day's chopping block.
+
+        Rank ordering (rank 1 = first to sell): expendability DESC, then
+        unrealized gain ASC, then days held DESC. `block_date` is the ET
+        calendar date (matching displacement's ET daily-cap convention).
+        Written via delete-then-insert so a re-sweep replaces the day."""
+        block_date = now.astimezone(ET).date().isoformat()
+        ranked = sorted(
+            candidates,
+            key=lambda c: (-c.expendability, c.unrealized_gain_pct, -c.days_held),
+        )
+        rows = [
+            ChoppingBlockRow(
+                block_date=block_date,
+                execution_id=c.execution_id,
+                symbol=c.symbol,
+                rank=i,
+                expendability=c.expendability,
+                reason=c.reason,
+            )
+            for i, c in enumerate(ranked, start=1)
+        ]
+        replace_chopping_block(self._journal.db_path, block_date, rows)
+        log.info(
+            "event_reviews.chopping_block",
+            extra={
+                "event": "event_reviews.chopping_block",
+                "block_date": block_date,
+                "count": len(rows),
+                "ranking": [
+                    {
+                        "rank": r.rank,
+                        "symbol": r.symbol,
+                        "execution_id": r.execution_id,
+                        "expendability": r.expendability,
+                    }
+                    for r in rows
+                ],
+            },
+        )
 
     # ------------------------------------------------------------------
     # Action handlers
@@ -1810,6 +1924,21 @@ class ThesisReviewCoordinator:
 class _BuildContextError(Exception):
     """Raised when the review context cannot be assembled (missing entry
     order, broker quote failure, malformed proposal payload)."""
+
+
+@dataclass(frozen=True)
+class _ChoppingBlockCandidate:
+    """One unarmed, sweep-reviewed position eligible for the chopping block,
+    before the day's ranking is assigned. `unrealized_gain_pct` is the
+    fraction gain since entry (ties break gain-ascending); `days_held`
+    breaks remaining ties (older first)."""
+
+    execution_id: int
+    symbol: str
+    expendability: int
+    reason: str | None
+    unrealized_gain_pct: float
+    days_held: int
 
 
 @dataclass(frozen=True)

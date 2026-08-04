@@ -21,6 +21,16 @@
         "new_tp_price": { "type": "number", "exclusiveMinimum": 0 }
       },
       "additionalProperties": false
+    },
+    "expendability": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5,
+      "description": "Daily-sweep reviews ONLY (review_trigger == 'event:daily_sweep'): how expendable this slot is relative to the rest of the book. 1 = last to sacrifice (thesis intact, dated catalyst ahead); 5 = first to sacrifice (thesis weak/stale). Omit entirely on non-sweep reviews."
+    },
+    "expendability_reason": {
+      "type": "string",
+      "description": "Daily-sweep reviews ONLY: one line justifying the expendability score. Omit on non-sweep reviews."
     }
   },
   "allOf": [

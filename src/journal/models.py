@@ -238,6 +238,23 @@ class ThesisReviewRow(_Row):
     created_at: dt.datetime | None = None
 
 
+class ChoppingBlockRow(_Row):
+    """Chopping block — one pre-ranked displacement sacrifice candidate for
+    a given block_date. Written after the daily pre-market sweep; consumed
+    by execution/displacement.py in rank order. `rank` is 1-based (1 =
+    first to sell / most expendable); `expendability` is the reviewer's
+    1..5 score (5 = first to sacrifice). Armed positions are never here."""
+
+    id: int | None = None
+    block_date: str
+    execution_id: int
+    symbol: str
+    rank: int
+    expendability: int
+    reason: str | None = None
+    created_at: dt.datetime | None = None
+
+
 class BackupRow(_Row):
     id: int | None = None
     started_at: dt.datetime

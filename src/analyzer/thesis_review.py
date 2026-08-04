@@ -34,20 +34,33 @@ _DECISION_ID_PREFIX = "thesis-"
 # Result types
 # ---------------------------------------------------------------------------
 
+# Expendability (chopping block, daily-sweep reviews only): every decision
+# type carries an OPTIONAL 1..5 sacrifice-priority score plus a one-line
+# reason. Absent (None) on non-sweep reviews and on any response that
+# omits or malforms the field — the decision itself is never lost to a
+# missing/bad expendability. 1 = last to sacrifice, 5 = first.
+
+
 @dataclass(frozen=True)
 class ThesisHold:
     rationale: str
+    expendability: int | None = None
+    expendability_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class ThesisClose:
     rationale: str
+    expendability: int | None = None
+    expendability_reason: str | None = None
 
 
 @dataclass(frozen=True)
 class ThesisAdjustStop:
     rationale: str
     new_stop_price: float
+    expendability: int | None = None
+    expendability_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +72,8 @@ class ThesisAdjustTakeProfit:
 
     rationale: str
     new_tp_price: float
+    expendability: int | None = None
+    expendability_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -285,10 +300,15 @@ def _parse(raw: str) -> ThesisReviewResult:
         return ThesisReviewMalformed(
             raw_response=raw, error="rationale missing or length outside [50, 4000]"
         )
+    exp, exp_reason = _parse_expendability(payload)
     if decision == "hold":
-        return ThesisHold(rationale=rationale)
+        return ThesisHold(
+            rationale=rationale, expendability=exp, expendability_reason=exp_reason
+        )
     if decision == "close":
-        return ThesisClose(rationale=rationale)
+        return ThesisClose(
+            rationale=rationale, expendability=exp, expendability_reason=exp_reason
+        )
     # adjust_stop / adjust_take_profit both require a modifications object
     # carrying their own price key — the actions must not cross wires.
     mods = payload.get("modifications")
@@ -304,7 +324,12 @@ def _parse(raw: str) -> ThesisReviewResult:
                 raw_response=raw,
                 error=f"new_stop_price must be positive number, got {new_stop!r}",
             )
-        return ThesisAdjustStop(rationale=rationale, new_stop_price=float(new_stop))
+        return ThesisAdjustStop(
+            rationale=rationale,
+            new_stop_price=float(new_stop),
+            expendability=exp,
+            expendability_reason=exp_reason,
+        )
     # adjust_take_profit (D-079 §3.4)
     new_tp = mods.get("new_tp_price")
     if not isinstance(new_tp, (int, float)) or new_tp <= 0:
@@ -312,7 +337,30 @@ def _parse(raw: str) -> ThesisReviewResult:
             raw_response=raw,
             error=f"new_tp_price must be positive number, got {new_tp!r}",
         )
-    return ThesisAdjustTakeProfit(rationale=rationale, new_tp_price=float(new_tp))
+    return ThesisAdjustTakeProfit(
+        rationale=rationale,
+        new_tp_price=float(new_tp),
+        expendability=exp,
+        expendability_reason=exp_reason,
+    )
+
+
+def _parse_expendability(payload: dict[str, Any]) -> tuple[int | None, str | None]:
+    """Extract the optional chopping-block expendability (1..5) + reason.
+
+    Tolerant by design: the field is present only on daily-sweep reviews
+    and absent on everything else and on older responses. A missing,
+    non-integer, out-of-range, or otherwise malformed value yields
+    `(None, None)` — the decision must never be lost because expendability
+    was bad. `bool` is rejected explicitly (a stray `true` is not a 1)."""
+    raw = payload.get("expendability")
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return None, None
+    if not (1 <= raw <= 5):
+        return None, None
+    reason = payload.get("expendability_reason")
+    reason = reason if isinstance(reason, str) and reason.strip() else None
+    return raw, reason
 
 
 def _decision_string(result: ThesisReviewResult) -> str:

@@ -186,7 +186,7 @@ def _stage_db_at_version(db_path: str, target_version: int) -> None:
     """Apply migration files up to `target_version` and mark them in `meta`,
     leaving later migrations unapplied. Used to set up the "what does the
     prod droplet look like just before a new migration runs" state."""
-    from journal.migrate import _discover_migrations
+    from journal.migrate import _discover_migrations, _split_sql_statements
 
     discovered = _discover_migrations()
     with sqlite3.connect(db_path, isolation_level=None) as conn:
@@ -195,15 +195,10 @@ def _stage_db_at_version(db_path: str, target_version: int) -> None:
             if version > target_version:
                 continue
             sql = path.read_text(encoding="utf-8")
-            for stmt in sql.split(";"):
-                stmt = stmt.strip()
-                # Strip line comments to mirror the runner's splitter.
-                clean_lines = [
-                    line.split("--", 1)[0] for line in stmt.splitlines()
-                ]
-                cleaned = "\n".join(clean_lines).strip()
-                if cleaned:
-                    conn.execute(cleaned)
+            # Reuse the runner's own comment-strip-then-split so a ';'
+            # inside a `--` comment can't shear a statement in two.
+            for stmt in _split_sql_statements(sql):
+                conn.execute(stmt)
         for version, _ in discovered:
             if version <= target_version:
                 conn.execute(
@@ -323,3 +318,38 @@ def test_migration_runner_raises_on_post_commit_fk_violation(
 
     with pytest.raises(SchemaMismatch, match="FK violations after migration 999"):
         apply_migrations(str(db))
+
+
+def test_migration_007_applies_on_existing_schema(tmp_path: Path) -> None:
+    """The chopping_block migration lands cleanly on a prod-like DB already
+    staged at the prior version (schema 006), with executions rows present
+    so the FK reference resolves, and is idempotent on a second run."""
+    db = tmp_path / "journal.db"
+    _stage_db_at_version(str(db), target_version=6)
+    # Seed an execution so the chopping_block FK has a live parent id.
+    pid = _seed_orders_referencing_executions(str(db))
+    assert pid is not None
+
+    final_version = apply_migrations(str(db))
+    assert final_version >= 7
+    assert "chopping_block" in _table_names(str(db))
+    assert "idx_chopping_block_date" in _index_names(str(db))
+
+    # A row inserts and reads back; the FK to executions is enforced.
+    with sqlite3.connect(str(db)) as conn:
+        conn.execute("PRAGMA foreign_keys=ON")
+        eid = conn.execute("SELECT id FROM executions LIMIT 1").fetchone()[0]
+        conn.execute(
+            "INSERT INTO chopping_block "
+            "(block_date, execution_id, symbol, rank, expendability, reason) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("2026-08-03", eid, "AAA", 1, 5, "stale"),
+        )
+        n = conn.execute("SELECT COUNT(*) FROM chopping_block").fetchone()[0]
+        assert n == 1
+
+    # Idempotent: re-running applies nothing new and leaves the row intact.
+    assert apply_migrations(str(db)) >= 7
+    verify_schema(str(db))
+    with sqlite3.connect(str(db)) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM chopping_block").fetchone()[0] == 1

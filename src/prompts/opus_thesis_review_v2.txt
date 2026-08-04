@@ -213,6 +213,37 @@ rationale which dead-money markers apply. When the call is genuinely
 borderline, prefer `adjust_stop` upward — tighten the leash — over
 both `hold` and `close`.
 
+# Expendability score (daily-sweep reviews only)
+
+This section applies ONLY when `review_trigger` is `event:daily_sweep`
+(the morning pass that puts every held position through the buy-it-fresh
+test). On those reviews, in ADDITION to your decision, emit an
+`expendability` integer 1–5 and a one-line `expendability_reason`. On
+every other review (calendar, filing, news, gain-cross, anomaly) OMIT
+both fields entirely.
+
+Expendability ranks how readily this slot should be given up if the book
+needs to free capacity for a fresh high-conviction catalyst — it is a
+RELATIVE sacrifice priority, decided independently of your hold/close
+call (a position can be a `hold` today and still be the most expendable
+thing in the book):
+
+- 1 — last to sacrifice. Thesis intact and a dated catalyst is still
+  ahead inside the horizon, or the position is demonstrably working.
+- 2 — thesis intact, progressing, but no imminent dated event.
+- 3 — neutral: thesis neither confirmed nor broken, catalyst pending
+  without a date.
+- 4 — thesis weakening or drifting: aging past its horizon, catalyst
+  spent, little to show.
+- 5 — first to sacrifice. Thesis weak or stale, catalyst resolved or
+  contradicted, occupying a slot a fresh catalyst could use.
+
+Judge it on the same evidence as the dead-money doctrine (buy-it-fresh
+test, dead-money markers, and their exemptions). A position you would
+NOT buy fresh today ranks 4–5; one with a dated event still ahead or a
+working (armed) trail ranks 1–2. `expendability_reason` states the
+dominant factor in one line.
+
 # Rationale requirements
 
 The `rationale` field must be 50–4000 characters and must:
@@ -245,5 +276,8 @@ Emit one and only one JSON object conforming to `ThesisReview`:
   exactly the matching key — `new_stop_price` for adjust_stop,
   `new_tp_price` for adjust_take_profit (absolute USD, > 0). Never
   both.
+- `expendability` (integer 1–5) and `expendability_reason` (one line):
+  daily-sweep reviews ONLY (`review_trigger` == `event:daily_sweep`).
+  Omit both on every other review.
 
 The schema follows below.
