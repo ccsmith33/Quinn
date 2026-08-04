@@ -165,6 +165,30 @@ def test_seed_never_overwrites_existing_active_doctrine(
     assert rows[0][2] == 3
 
 
+def test_seed_race_is_swallowed_not_raised(
+    journal: JournalRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """N1: two racing seeders both read no-active-doctrine, both INSERT;
+    the loser's IntegrityError (009 one-active-per-kind index) must be
+    treated as "already seeded" — never a boot failure. Simulated by
+    making the check read stale-None while an active row already exists."""
+    journal.insert_desk_memory(
+        DeskMemoryRow(kind="doctrine", content="winner's doctrine", version=1)
+    )
+    monkeypatch.setattr(
+        JournalRepo,
+        "get_active_desk_memory",
+        lambda self, kind: None,
+    )
+
+    assert seed_doctrine_v1(journal) is False  # no raise
+
+    monkeypatch.undo()
+    rows = _doctrine_rows(journal)
+    assert len(rows) == 1
+    assert rows[0][1] == "winner's doctrine"  # winner never overwritten
+
+
 def test_seed_ignores_inactive_synthesis_and_deactivated_rows(
     journal: JournalRepo,
 ) -> None:

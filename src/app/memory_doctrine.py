@@ -27,6 +27,7 @@ seeds, and registers — keeping the composition diff minimal.
 
 from __future__ import annotations
 
+import sqlite3
 from typing import TYPE_CHECKING
 
 from app.memory_context import (
@@ -81,9 +82,25 @@ def seed_doctrine_v1(journal: JournalRepo) -> bool:
     """
     if journal.get_active_desk_memory("doctrine") is not None:
         return False
-    row_id = journal.insert_desk_memory(
-        DeskMemoryRow(kind="doctrine", content=DOCTRINE_V1, version=1, active=1)
-    )
+    try:
+        row_id = journal.insert_desk_memory(
+            DeskMemoryRow(
+                kind="doctrine", content=DOCTRINE_V1, version=1, active=1
+            )
+        )
+    except sqlite3.IntegrityError:
+        # N1: check-then-insert race — another seeder inserted between our
+        # read and our INSERT, and the 009 one-active-per-kind unique
+        # index rejected ours. That row IS the seed (or an operator's
+        # version — either way ours must not land): treat as already
+        # seeded. Deliberately NOT insert_desk_memory_replacing_active,
+        # which would overwrite an operator-published doctrine and break
+        # the never-overwrite invariant.
+        log.info(
+            "memory.doctrine_seed_race",
+            extra={"event": "memory.doctrine_seed_race"},
+        )
+        return False
     log.info(
         "memory.doctrine_seeded",
         extra={
