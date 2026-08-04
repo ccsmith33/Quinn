@@ -20,3 +20,16 @@ CREATE TABLE desk_memory (
     active      INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX idx_desk_memory_active_kind ON desk_memory(kind, active);
+
+-- Hardening (review advisory #9): at most ONE active row per kind. This
+-- makes the "the active doctrine/synthesis" read unambiguous at the
+-- schema level, not just by provider convention.
+--
+-- ORDERING CONSTRAINT for version publishers (desk-journal synthesis
+-- writer + any future doctrine updater): within the single publish
+-- transaction, DEACTIVATE the old row(s) BEFORE inserting the new
+-- active row — insert-first trips this index while the prior version is
+-- still active. (SQLite enforces the unique index per statement; there
+-- is no deferred mode.)
+CREATE UNIQUE INDEX idx_desk_memory_one_active
+    ON desk_memory(kind) WHERE active = 1;

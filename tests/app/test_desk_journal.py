@@ -731,11 +731,16 @@ def test_synthesis_same_week_restart_proof(
 
 
 def test_insert_desk_memory_replacing_active_atomic_swap(db: str) -> None:
-    """Review advisory #7: the version swap is one transaction. The
-    helper also self-heals a pre-existing two-active state — after any
-    call exactly ONE row of the kind is active."""
+    """Review advisory #7: the version swap is one transaction — after
+    any call exactly ONE row of the kind is active. (The original
+    two-active self-heal setup is now unrepresentable: advisory #9's
+    partial unique index idx_desk_memory_one_active rejects a second
+    active row at the schema level, so the swap starts from the only
+    legal state — a single active prior version.)"""
     insert_desk_memory(db, DeskMemoryRow(kind="synthesis", content="v1", version=1))
-    insert_desk_memory(db, DeskMemoryRow(kind="synthesis", content="v2", version=2))
+    insert_desk_memory(
+        db, DeskMemoryRow(kind="synthesis", content="v2", version=2, active=0)
+    )
     new_id = insert_desk_memory_replacing_active(
         db, DeskMemoryRow(kind="synthesis", content="v3", version=3)
     )
@@ -744,7 +749,11 @@ def test_insert_desk_memory_replacing_active_atomic_swap(db: str) -> None:
             "SELECT id, content FROM desk_memory "
             "WHERE kind = 'synthesis' AND active = 1"
         ).fetchall()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM desk_memory WHERE kind = 'synthesis'"
+        ).fetchone()[0]
     assert [(r[0], r[1]) for r in active] == [(new_id, "v3")]
+    assert total == 3  # retired rows survive as provenance
 
 
 # ---------------------------------------------------------------------------

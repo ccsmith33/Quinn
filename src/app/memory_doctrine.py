@@ -47,21 +47,29 @@ log = get_logger(__name__)
 _PROVIDER_NAME = "doctrine"
 _SECTION_TITLE = "Desk doctrine (study-derived priors)"
 
-# Distilled by the orchestrator from the eight offline studies. Stored
-# verbatim in `desk_memory` by the seeder; served verbatim by the
-# provider. Content changes ship as a NEW version row (operator /
-# orchestrator action), never by editing this constant in place — v1 is
-# frozen so already-seeded journals and this source never disagree.
+# Distilled by the orchestrator from the eight offline studies, then
+# trimmed to terse fragments for the LLM reader (review advisory #5:
+# this text rides UNCACHED in block-3 on every call, so it is budgeted
+# <= ~300 tokens by the chars/4 estimate — every study number and
+# finding retained, connective prose cut). Stored verbatim in
+# `desk_memory` by the seeder; served verbatim by the provider. Content
+# changes ship as a NEW version row (operator / orchestrator action),
+# never by editing this constant in place — v1 is frozen so
+# already-seeded journals and this source never disagree.
+#
+# Future optimization (deliberately NOT done now): move static memory
+# like this into a prompt-cached segment so its per-call cost drops to
+# the cache-read rate instead of riding uncached.
 DOCTRINE_V1 = """\
-QUINN DESK DOCTRINE v1 (distilled from 33,851-event catalyst studies, 2026-07/08)
-- EDGE CONCENTRATION: names reaching >=+50% MFE are 14% of events but 130% of net P&L (the rest nets negative); >=+100% names are 5% of events, 64% of P&L. The entire business is not capping winners. TPs only as far cap-lifters (~2x), never tight.
-- SLOW BLOOMERS: the median eventual big winner is up only +1.0% at day-1 close; 45% are flat-or-down. A quiet first days is NOT thesis failure. Entering 1-2 days late retains ~98% of big-winner P&L.
-- WIGGLE TOLERANCE: eventual runners routinely draw down 8-12% below their pre-peak highs at low altitude. Tightening trails below +12% peak gain was tested three ways and strangled more runners than it saved. The breakeven floor at +12% peak (stop never below entry) cuts winner-to-loser from 27.6% to 8.9% at ~zero runner cost — fade-to-loss is 0.0% in every cohort once the floor arms.
-- VELOCITY IS VARIANCE, NOT EV: fast day-0 +8% poppers fade more often (median -5.7% from the tag) BUT hold 28% of all eventual >=+50% monsters (mean MFE 58% vs 31% for slow builders). Do not harvest speed; the floor absorbs the fade risk.
-- EVICTION: every day-3 and day-5 price-state bucket (including down >10%) is NEGATIVE-EV to evict against average redeployment (~2.1%/trade over ~29 days, ~0.056%/slot-day net of friction) — 45% of beaten-down young names tag +10% above their low again. Eviction on price alone destroys value; eviction on THESIS BREAK (catalyst resolved against us, thesis invalidated) is the valid trigger. Demand-driven swaps into conviction>=8 signals (~+8.4%/trade historically) ARE strongly +EV.
-- PEAKS AND EXITS: ~47% of day-0 session highs print in the first 30 minutes, but real winners typically peak day 3-7+; staged trail tightening (+20% gain -> 8% band, +35% -> 5%) preserved runners for +163% counterfactual vs +29% for harvest-at-+5%.
-- CONDITIONAL ODDS: P(reach +30% | reached +10%) = 43% (59% for high conviction); P(+50 | +30) = 54%; P(double | +50) = 38%. A position at +10% is closer to its beginning than its end.
-- CAVEATS: all figures are backtest (daily-bar conservative fills, survivorship-lite universe, single-regime tape). They set priors, not certainties; deterministic safety (stops, kill switches, exemptions) always outranks this doctrine."""
+QUINN DESK DOCTRINE v1 (33,851 catalyst events 2026-07/08, backtest priors)
+- EDGE: >=+50% MFE: 14% of events, 130% net P&L (rest negative); >=+100%: 5%, 64%. Never cap winners; TPs = far ~2x cap-lifters.
+- SLOW BLOOMERS: median big winner +1.0% day-1 close, 45% flat/down; quiet != failure; 1-2d-late entry keeps ~98% P&L.
+- WIGGLE: 8-12% dips off pre-peak highs normal early; sub-+12% trails strangle (3 tests); floor-to-entry @+12% peak: 27.6%->8.9% winner->loser, ~0 runner-cost, 0.0% fade-to-loss armed.
+- VELOCITY=VARIANCE: day-0 +8% poppers fade more (med -5.7%) yet hold 28% of >=+50% monsters (MFE 58%/31%); no speed-harvest; floor absorbs fade.
+- EVICTION: day-3/5 buckets all -EV vs redeploy even down>10% (~2.1%/trade/29d, ~0.056%/slot-day); 45% beaten-down young retag +10%; thesis-break evicts, price never; conv>=8 swaps ~+8.4%/trade +EV.
+- PEAKS: ~47% day-0 highs 1st 30min; peaks day 3-7+; trails +20%->8%, +35%->5%: +163% vs +29% +5%-harvest.
+- ODDS: P(+30|+10)=43% (hi-conv 59%); P(+50|+30)=54%; P(2x|+50)=38%; +10% = nearer start.
+- CAVEATS: daily-bar conservative fills, survivorship-lite, single regime; priors not certainties; hard safety (stops/KS/exemptions) outranks."""
 
 
 def seed_doctrine_v1(journal: JournalRepo) -> bool:

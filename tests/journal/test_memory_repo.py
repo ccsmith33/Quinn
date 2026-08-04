@@ -76,6 +76,7 @@ def test_migrations_009_010_apply_and_verify(db: str) -> None:
 
     indexes = _index_names(db)
     assert "idx_desk_memory_active_kind" in indexes
+    assert "idx_desk_memory_one_active" in indexes
     assert "idx_trade_postmortems_symbol" in indexes
 
     verify_schema(db)  # no raise → on-disk set matches meta
@@ -111,9 +112,15 @@ def test_get_active_desk_memory_none_when_absent(db: str) -> None:
 
 
 def test_get_active_desk_memory_picks_highest_version(db: str) -> None:
-    insert_desk_memory(db, DeskMemoryRow(kind="doctrine", content="v1", version=1))
+    # Retired history plus ONE active row — the 009 partial unique index
+    # (idx_desk_memory_one_active) forbids concurrent active versions.
+    insert_desk_memory(
+        db, DeskMemoryRow(kind="doctrine", content="v1", version=1, active=0)
+    )
     insert_desk_memory(db, DeskMemoryRow(kind="doctrine", content="v3", version=3))
-    insert_desk_memory(db, DeskMemoryRow(kind="doctrine", content="v2", version=2))
+    insert_desk_memory(
+        db, DeskMemoryRow(kind="doctrine", content="v2", version=2, active=0)
+    )
     got = get_active_desk_memory(db, "doctrine")
     assert got is not None
     assert got.content == "v3"

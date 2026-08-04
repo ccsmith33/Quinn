@@ -60,21 +60,69 @@ def _q(
 def test_doctrine_v1_content_shape() -> None:
     assert DOCTRINE_V1.startswith(
         "QUINN DESK DOCTRINE v1 "
-        "(distilled from 33,851-event catalyst studies, 2026-07/08)"
+        "(33,851 catalyst events 2026-07/08, backtest priors)"
     )
     # Every distilled finding is present, and the safety caveat closes it.
     for heading in (
-        "- EDGE CONCENTRATION:",
+        "- EDGE:",
         "- SLOW BLOOMERS:",
-        "- WIGGLE TOLERANCE:",
-        "- VELOCITY IS VARIANCE, NOT EV:",
+        "- WIGGLE:",
+        "- VELOCITY=VARIANCE:",
         "- EVICTION:",
-        "- PEAKS AND EXITS:",
-        "- CONDITIONAL ODDS:",
+        "- PEAKS:",
+        "- ODDS:",
         "- CAVEATS:",
     ):
         assert heading in DOCTRINE_V1
-    assert DOCTRINE_V1.endswith("always outranks this doctrine.")
+    assert DOCTRINE_V1.endswith("(stops/KS/exemptions) outranks.")
+
+
+def test_doctrine_v1_token_budget() -> None:
+    """Review advisory #5: the doctrine rides UNCACHED on every LLM call,
+    so it must stay <= ~300 tokens (chars/4 estimate)."""
+    assert len(DOCTRINE_V1) / 4 <= 300
+
+
+def test_doctrine_v1_keeps_every_study_number() -> None:
+    """The trim cut prose, never data — every figure from the eight
+    studies survives."""
+    for figure in (
+        "33,851",
+        ">=+50% MFE",
+        "14%",
+        "130%",
+        ">=+100%",
+        "64%",
+        "~2x",
+        "+1.0%",
+        "45% flat/down",
+        "1-2d",
+        "~98%",
+        "8-12%",
+        "27.6%->8.9%",
+        "0.0% fade-to-loss",
+        "-5.7%",
+        "28%",
+        "58%/31%",
+        "day-3/5",
+        "down>10%",
+        "~2.1%/trade",
+        "~0.056%/slot-day",
+        "conv>=8",
+        "~+8.4%/trade",
+        "~47%",
+        "30min",
+        "day 3-7+",
+        "+20%->8%",
+        "+35%->5%",
+        "+163%",
+        "+29%",
+        "P(+30|+10)=43%",
+        "59%",
+        "P(+50|+30)=54%",
+        "P(2x|+50)=38%",
+    ):
+        assert figure in DOCTRINE_V1, figure
 
 
 # ---------------------------------------------------------------------------
@@ -184,13 +232,53 @@ def test_provider_serves_latest_active_version_from_db(
     journal: JournalRepo,
 ) -> None:
     seed_doctrine_v1(journal)
-    journal.insert_desk_memory(
+    # Publish v2 via the atomic swap helper — the canonical way to
+    # replace the active version under the 009 one-active-per-kind index.
+    journal.insert_desk_memory_replacing_active(
         DeskMemoryRow(kind="doctrine", content="DOCTRINE v2", version=2)
     )
 
     section = make_doctrine_provider(journal)(_q())
     assert section is not None
     assert section.body == "DOCTRINE v2"
+
+
+# ---------------------------------------------------------------------------
+# one-active-per-kind invariant (009 partial unique index, advisory #9)
+# ---------------------------------------------------------------------------
+
+
+def test_second_active_doctrine_row_is_rejected(
+    journal: JournalRepo,
+) -> None:
+    seed_doctrine_v1(journal)
+    with pytest.raises(sqlite3.IntegrityError):
+        journal.insert_desk_memory(
+            DeskMemoryRow(kind="doctrine", content="rogue v2", version=2)
+        )
+    # The active row is untouched.
+    active = journal.get_active_desk_memory("doctrine")
+    assert active is not None
+    assert active.content == DOCTRINE_V1
+
+
+def test_one_active_per_kind_allows_other_kinds_and_inactive_rows(
+    journal: JournalRepo,
+) -> None:
+    seed_doctrine_v1(journal)
+    # An active synthesis coexists with the active doctrine...
+    journal.insert_desk_memory(
+        DeskMemoryRow(kind="synthesis", content="patterns", version=1)
+    )
+    # ...and any number of retired rows of either kind are fine.
+    journal.insert_desk_memory(
+        DeskMemoryRow(kind="doctrine", content="old", version=0, active=0)
+    )
+    journal.insert_desk_memory(
+        DeskMemoryRow(kind="doctrine", content="older", version=0, active=0)
+    )
+    assert journal.get_active_desk_memory("doctrine") is not None
+    assert journal.get_active_desk_memory("synthesis") is not None
 
 
 def test_provider_is_deterministic(journal: JournalRepo) -> None:
