@@ -13,7 +13,8 @@ import sqlite3
 import statistics
 from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 from observability.log_port import get_logger
 
@@ -1761,6 +1762,175 @@ def get_conviction_calibration(db_path: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# symbol_history provider support — prior engagements for a symbol.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SymbolEngagement:
+    """One prior engagement with a symbol, as served to the
+    symbol_history memory provider.
+
+    `date` is the engagement's ordering/render date: the exit-fill date
+    for a closed trade, the proposal's created_at date for an
+    analyzed-but-not-traded engagement. Closed-trade fields
+    (`execution_id`, `entry_date`, `entry_price`, `exit_price`,
+    `realized_pct`, `days_held`) are None on 'analyzed_no_trade' rows;
+    `conviction` / `reject_reason` are None on 'closed_trade' rows.
+    """
+
+    kind: Literal["closed_trade", "analyzed_no_trade"]
+    date: _dt.date
+    execution_id: int | None = None
+    entry_date: _dt.date | None = None
+    entry_price: float | None = None
+    exit_price: float | None = None
+    realized_pct: float | None = None
+    days_held: int | None = None
+    conviction: int | None = None
+    reject_reason: str | None = None
+
+
+_FILL_STATUSES = ("filled", "partially_filled_closed")
+
+
+def get_prior_engagements_for_symbol(
+    db_path: str,
+    symbol: str,
+    *,
+    limit: int = 3,
+    exclude_execution_id: int | None = None,
+) -> list[SymbolEngagement]:
+    """The most recent `limit` PRIOR engagements with `symbol`, newest
+    first. Two kinds are derived from existing tables (no new schema):
+
+    Closed trades — an execution (joined to `proposals` on
+    `p.symbol = symbol`) is CLOSED when its recorded fills show the
+    position flat again: it has at least one filled buy-side order (the
+    entry) AND total filled sell qty >= total filled buy qty (long-only
+    per architecture §5, so qty-balance means flat). "Filled" means
+    `final_status IN ('filled', 'partially_filled_closed')` with
+    realized fill price/qty/at recorded. The ENTRY is the earliest buy
+    fill (`realized_fill_at` ASC, id ASC); the EXIT PRICE is the
+    `realized_fill_price` of the LAST sell fill (`realized_fill_at`
+    DESC, id DESC) — the fill that took the position to flat, whether
+    stop, take-profit, or manual close. `realized_pct` is
+    (exit − entry) / entry × 100 on those two fill prices; `days_held`
+    is CALENDAR days between the entry and exit fill dates.
+    Still-open executions (buy fills not yet matched by equal sell qty)
+    are excluded by construction; `exclude_execution_id` — the caller's
+    CURRENT engagement (thesis_review) — is excluded explicitly.
+
+    Analyzed-but-not-traded — trade proposals for the symbol whose
+    LATEST `executions` row (MAX id — migration 003 allows several) has
+    `decision = 'rejected'`: Quinn analyzed the filing and the trade was
+    turned away (opus_reject / insufficient_capital / validator reasons
+    / a pending_capacity placeholder that never retro-filled). Dated by
+    `proposals.created_at`.
+
+    Ordering: engagements sort newest-first on their full timestamp
+    (closed → last sell `realized_fill_at`; analyzed → `created_at`),
+    tie-broken by kind (closed first) then row id — deterministic.
+    """
+    with connect(db_path) as conn:
+        fill_rows = conn.execute(
+            f"""
+            SELECT e.id AS execution_id, o.id AS order_id, o.side AS side,
+                   o.realized_fill_qty   AS qty,
+                   o.realized_fill_price AS price,
+                   o.realized_fill_at    AS fill_at
+            FROM executions e
+            JOIN proposals p ON p.id = e.proposal_id
+            JOIN orders o ON o.execution_id = e.id
+            WHERE p.symbol = ?
+              AND o.symbol = ?
+              AND o.final_status IN ({",".join("?" for _ in _FILL_STATUSES)})
+              AND o.realized_fill_qty IS NOT NULL
+              AND o.realized_fill_price IS NOT NULL
+              AND o.realized_fill_at IS NOT NULL
+            ORDER BY e.id ASC, o.realized_fill_at ASC, o.id ASC
+            """,
+            (symbol, symbol, *_FILL_STATUSES),
+        ).fetchall()
+        rejected_rows = conn.execute(
+            """
+            SELECT p.id AS proposal_id, p.created_at AS created_at,
+                   p.conviction AS conviction, e.reject_reason AS reject_reason
+            FROM proposals p
+            JOIN executions e ON e.proposal_id = p.id
+              AND e.id = (
+                  SELECT MAX(e2.id) FROM executions e2
+                  WHERE e2.proposal_id = p.id
+              )
+            WHERE p.symbol = ?
+              AND p.kind = 'trade_proposal'
+              AND e.decision = 'rejected'
+            """,
+            (symbol,),
+        ).fetchall()
+
+    # (sort timestamp, kind rank, row id, engagement) — newest first.
+    items: list[tuple[_dt.datetime, int, int, SymbolEngagement]] = []
+
+    fills_by_execution: dict[int, list[sqlite3.Row]] = {}
+    for r in fill_rows:
+        fills_by_execution.setdefault(int(r["execution_id"]), []).append(r)
+    for eid, fills in fills_by_execution.items():
+        if eid == exclude_execution_id:
+            continue
+        buys = [f for f in fills if f["side"] == "buy"]
+        sells = [f for f in fills if f["side"] == "sell"]
+        if not buys or not sells:
+            continue  # never entered, or still open
+        buy_qty = sum(int(f["qty"]) for f in buys)
+        sell_qty = sum(int(f["qty"]) for f in sells)
+        if sell_qty < buy_qty:
+            continue  # partial exit — still open
+        entry, exit_ = buys[0], sells[-1]  # fills pre-sorted by fill_at, id
+        entry_at, exit_at = entry["fill_at"], exit_["fill_at"]
+        entry_price = float(entry["price"])
+        exit_price = float(exit_["price"])
+        items.append(
+            (
+                exit_at,
+                1,
+                eid,
+                SymbolEngagement(
+                    kind="closed_trade",
+                    date=exit_at.date(),
+                    execution_id=eid,
+                    entry_date=entry_at.date(),
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    realized_pct=(exit_price - entry_price) / entry_price * 100.0,
+                    days_held=(exit_at.date() - entry_at.date()).days,
+                ),
+            )
+        )
+
+    for r in rejected_rows:
+        created_at = r["created_at"]
+        items.append(
+            (
+                created_at,
+                0,
+                int(r["proposal_id"]),
+                SymbolEngagement(
+                    kind="analyzed_no_trade",
+                    date=created_at.date(),
+                    conviction=(
+                        int(r["conviction"]) if r["conviction"] is not None else None
+                    ),
+                    reject_reason=r["reject_reason"],
+                ),
+            )
+        )
+
+    items.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    return [engagement for _, _, _, engagement in items[: max(limit, 0)]]
+
+
+# ---------------------------------------------------------------------------
 # JournalRepo — thin object facade over the module-level functions.
 #
 # Stories that consume the journal (S6.1, S6.2, S6.4, S7.1, S7.4, S5.6) take a
@@ -2359,3 +2529,17 @@ class JournalRepo:
 
     def get_conviction_calibration(self) -> dict[str, Any]:
         return get_conviction_calibration(self.db_path)
+
+    def get_prior_engagements_for_symbol(
+        self,
+        symbol: str,
+        *,
+        limit: int = 3,
+        exclude_execution_id: int | None = None,
+    ) -> list[SymbolEngagement]:
+        return get_prior_engagements_for_symbol(
+            self.db_path,
+            symbol,
+            limit=limit,
+            exclude_execution_id=exclude_execution_id,
+        )

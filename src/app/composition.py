@@ -237,6 +237,12 @@ def compose_agent(
             memory_assembler.register(
                 "calibration", CalibrationMemoryProvider(journal)
             )
+        if config.memory.symbol_history_enabled:
+            from app.memory_symbol_history import make_symbol_history_provider
+
+            memory_assembler.register(
+                "symbol_history", make_symbol_history_provider(journal)
+            )
 
     # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
     # lives in this constructor (D-047). Feature B: also wires the KS5
