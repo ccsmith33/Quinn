@@ -46,11 +46,10 @@ from config.calendar import ET
 from journal.models import DeskMemoryRow, TradePostmortemRow
 from journal.repo import (
     count_postmortems_since,
-    deactivate_desk_memory,
     find_closed_executions_without_postmortem,
     get_active_desk_memory,
     get_recent_postmortems,
-    insert_desk_memory,
+    insert_desk_memory_replacing_active,
     insert_trade_postmortem,
 )
 from observability.log_port import get_logger
@@ -481,14 +480,13 @@ class DeskJournalTicker:
             )
             return
         version = (active.version + 1) if active is not None else 1
-        new_id = insert_desk_memory(
+        # Insert + prior-deactivation in ONE transaction: a crash between
+        # the two can never leave two active synthesis rows.
+        new_id = insert_desk_memory_replacing_active(
             self._journal.db_path,
             DeskMemoryRow(
                 kind="synthesis", content=content, version=version, active=1
             ),
-        )
-        deactivate_desk_memory(
-            self._journal.db_path, "synthesis", except_id=new_id
         )
         log.info(
             "desk_journal.synthesis_written",

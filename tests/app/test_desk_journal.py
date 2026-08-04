@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import itertools
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ from journal.repo import (
     get_llm_calls_by_decision_id,
     get_postmortems_for_symbol,
     insert_desk_memory,
+    insert_desk_memory_replacing_active,
     insert_execution,
     insert_filing,
     insert_order,
@@ -224,6 +226,9 @@ def _seed_execution(
     )
 
 
+_ORDER_SEQ = itertools.count(1)
+
+
 def _add_order(
     db_path: str,
     execution_id: int,
@@ -234,7 +239,11 @@ def _add_order(
     fill_price: float | None,
     fill_at: dt.datetime | None,
     final_status: str | None = "filled",
+    qty: int = 10,
+    fill_qty: int | None = None,
 ) -> int:
+    if fill_qty is None and fill_price is not None:
+        fill_qty = qty
     return insert_order(
         db_path,
         OrderRow(
@@ -243,13 +252,13 @@ def _add_order(
             symbol=symbol,
             side=side,
             order_type="market",
-            qty=10,
+            qty=qty,
             tif="day",
-            broker_order_id=f"b-{execution_id}-{role}-{side}",
+            broker_order_id=f"b-{execution_id}-{role}-{side}-{next(_ORDER_SEQ)}",
             submitted_at=fill_at or _ENTRY_AT,
             final_status=final_status,
             realized_fill_price=fill_price,
-            realized_fill_qty=10 if fill_price is not None else None,
+            realized_fill_qty=fill_qty,
             realized_fill_at=fill_at,
         ),
     )
@@ -392,6 +401,56 @@ def test_close_detection_excludes_open_rejected_and_postmortemed(
     )
 
     assert find_closed_executions_without_postmortem(db, limit=10) == []
+
+
+def test_partial_exit_stays_open_until_flat_then_full_trade_postmortem(
+    registered_db: str, builder: PromptBuilder
+) -> None:
+    """Review advisory #6: a terminal partial exit (sold 5 of 10) must
+    NOT count as closed — same net-flat rule the calibration /
+    symbol_history readers use — so no post-mortem row can permanently
+    dedupe a still-open position. Once flat, the post-mortem is written
+    with the FULL-trade numbers (earliest entry fill → last sell fill)."""
+    eid = _seed_execution(registered_db, "PART")
+    _add_order(
+        registered_db, eid, role="entry", side="buy", symbol="PART",
+        fill_price=10.0, fill_at=_ENTRY_AT, qty=10,
+    )
+    # Terminal partial exit: order for 10, only 5 filled before close.
+    _add_order(
+        registered_db, eid, role="stop", side="sell", symbol="PART",
+        fill_price=10.5, fill_at=_EXIT_AT, qty=10, fill_qty=5,
+        final_status="partially_filled_closed",
+    )
+
+    assert find_closed_executions_without_postmortem(registered_db, limit=10) == []
+
+    ticker, fake, clock = _make_ticker(registered_db, builder)
+    asyncio.run(ticker.run_tick())
+    assert get_postmortems_for_symbol(registered_db, "PART") == []
+    assert fake.messages.calls == []  # not closed → no LLM spend
+
+    # The remaining 5 shares exit later at a different price → net flat.
+    later_exit = _EXIT_AT + dt.timedelta(days=2)
+    _add_order(
+        registered_db, eid, role="stop", side="sell", symbol="PART",
+        fill_price=11.0, fill_at=later_exit, qty=5, fill_qty=5,
+    )
+    rows = find_closed_executions_without_postmortem(registered_db, limit=10)
+    assert [r["execution_id"] for r in rows] == [eid]
+    # Full-trade numbers: earliest entry fill, LAST (flattening) sell.
+    assert rows[0]["entry_price"] == 10.0
+    assert rows[0]["exit_price"] == 11.0
+    assert rows[0]["exit_at"] == later_exit
+
+    clock[0] = _NOW_WEEK30 + dt.timedelta(days=1)  # new day → new pass
+    fake.messages.queue(_response(_pm_json()))
+    asyncio.run(ticker.run_tick())
+    pms = get_postmortems_for_symbol(registered_db, "PART")
+    assert len(pms) == 1
+    # exit_quality from the full-trade exit: (11-10)/(11-10) → 100.0
+    # (no HWM row; exit is the recorded peak).
+    assert pms[0].exit_quality_pct == 100.0
 
 
 def test_close_detection_cap_and_oldest_first(db: str) -> None:
@@ -665,6 +724,23 @@ def test_synthesis_same_week_restart_proof(
     asyncio.run(ticker2.run_tick())
     row = get_active_desk_memory(registered_db, "synthesis")
     assert row is not None and row.version == 2
+
+
+def test_insert_desk_memory_replacing_active_atomic_swap(db: str) -> None:
+    """Review advisory #7: the version swap is one transaction. The
+    helper also self-heals a pre-existing two-active state — after any
+    call exactly ONE row of the kind is active."""
+    insert_desk_memory(db, DeskMemoryRow(kind="synthesis", content="v1", version=1))
+    insert_desk_memory(db, DeskMemoryRow(kind="synthesis", content="v2", version=2))
+    new_id = insert_desk_memory_replacing_active(
+        db, DeskMemoryRow(kind="synthesis", content="v3", version=3)
+    )
+    with sqlite3.connect(db) as conn:
+        active = conn.execute(
+            "SELECT id, content FROM desk_memory "
+            "WHERE kind = 'synthesis' AND active = 1"
+        ).fetchall()
+    assert [(r[0], r[1]) for r in active] == [(new_id, "v3")]
 
 
 # ---------------------------------------------------------------------------

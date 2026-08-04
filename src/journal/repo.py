@@ -1930,24 +1930,37 @@ def get_prior_engagements_for_symbol(
     return [engagement for _, _, _, engagement in items[: max(limit, 0)]]
 
 
-def deactivate_desk_memory(
-    db_path: str, kind: str, *, except_id: int
+def insert_desk_memory_replacing_active(
+    db_path: str, row: DeskMemoryRow
 ) -> int:
-    """Soft-retire every `kind` row other than `except_id` (set active=0).
+    """Insert `row` AND soft-retire (active=0) every other active row of
+    the same kind, in ONE transaction — so exactly one row of the kind is
+    active at any observable moment; a crash between the two statements
+    cannot leave two active rows. The retired rows remain as append-only
+    provenance (009 design note). Returns the new row's id.
 
-    The desk-journal synthesis writer calls this right after inserting a
-    new version so exactly one row of the kind stays active; the retired
-    rows remain as append-only provenance (009 design note). Returns the
-    number of rows deactivated.
+    The desk-journal synthesis writer uses this for the weekly version
+    swap (version = prev + 1, prior deactivated).
     """
     with connect(db_path) as conn:
-        cur = _exec_write(
-            conn,
-            "UPDATE desk_memory SET active = 0 "
-            "WHERE kind = ? AND active = 1 AND id != ?",
-            (kind, except_id),
-        )
-        return int(cur.rowcount)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = conn.execute(
+                "INSERT INTO desk_memory (kind, content, version, active) "
+                "VALUES (?, ?, ?, ?)",
+                (row.kind, row.content, row.version, row.active),
+            )
+            new_id = int(cur.lastrowid or 0)
+            conn.execute(
+                "UPDATE desk_memory SET active = 0 "
+                "WHERE kind = ? AND active = 1 AND id != ?",
+                (row.kind, new_id),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        return new_id
 
 
 def count_postmortems_since(
@@ -1987,15 +2000,25 @@ def find_closed_executions_without_postmortem(
     """Closed accepted executions that still lack a `trade_postmortems`
     row — the desk-journal generation queue, oldest close first.
 
-    "Closed" is journal truth for flat-at-broker, same definition as
-    `get_closed_trade_pnls_chronological`: the execution has a filled
-    entry AND a filled sell-side exit order (any exit role — stop,
-    trailing_stop, take_profit, thesis_close, displacement_close, future
-    roles). External closes absorbed by the reconciler still qualify once
-    the FillIngestor journals the closing sell; a tombstone without a
-    journaled sell does NOT (no exit price to post-mortem — deliberate).
-    Open positions (no filled exit) never match. Execution-scoped, so a
-    later re-entry in the same symbol cannot hide an older closed trade.
+    "Closed" is the same NET-FLAT rule the memory READERS use
+    (`get_conviction_calibration` / `get_prior_engagements_for_symbol`):
+    the execution has at least one FILLED entry buy AND its filled sell
+    qty covers its filled buy qty ("filled" = `final_status` in
+    ('filled', 'partially_filled_closed') with non-NULL realized
+    price/qty). A partial exit (sold 5 of 10, sell order terminal)
+    leaves the execution OPEN here — no post-mortem until flat, so the
+    NOT EXISTS dedupe can never permanently swallow a still-open
+    position, and the recorded realized% always agrees with the readers'
+    full-trade number. External closes absorbed by the reconciler still
+    qualify once the FillIngestor journals the flattening sell; a
+    tombstone without a journaled sell does NOT (no exit price to
+    post-mortem — deliberate). Execution-scoped, so a later re-entry in
+    the same symbol cannot hide an older closed trade.
+
+    Entry/exit selection also mirrors the readers: entry = the EARLIEST
+    filled entry buy (`realized_fill_at` ASC, id ASC), exit = the LAST
+    filled sell (`realized_fill_at` DESC, id DESC) — the fill that took
+    the position to flat.
 
     Each row carries everything the post-mortem writer needs:
     `execution_id, symbol, thesis, conviction, entry_price, entry_at,
@@ -2018,21 +2041,38 @@ def find_closed_executions_without_postmortem(
             FROM executions e
             JOIN proposals pr ON pr.id = e.proposal_id
             JOIN orders en ON en.id = (
-                SELECT MAX(o.id) FROM orders o
-                WHERE o.execution_id = e.id AND o.role = 'entry'
+                SELECT o.id FROM orders o
+                WHERE o.execution_id = e.id
+                  AND o.role = 'entry' AND o.side = 'buy'
                   AND o.final_status IN ('filled', 'partially_filled_closed')
                   AND o.realized_fill_price IS NOT NULL
+                  AND o.realized_fill_qty IS NOT NULL
+                ORDER BY o.realized_fill_at ASC, o.id ASC
+                LIMIT 1
             )
             JOIN orders ex ON ex.id = (
-                SELECT MAX(o.id) FROM orders o
+                SELECT o.id FROM orders o
                 WHERE o.execution_id = e.id
                   AND o.side = 'sell' AND o.role != 'entry'
                   AND o.final_status IN ('filled', 'partially_filled_closed')
                   AND o.realized_fill_price IS NOT NULL
+                  AND o.realized_fill_qty IS NOT NULL
+                ORDER BY o.realized_fill_at DESC, o.id DESC
+                LIMIT 1
             )
             LEFT JOIN exit_policy_state eps ON eps.execution_id = e.id
             WHERE e.decision = 'accepted'
               AND pr.symbol IS NOT NULL
+              AND (
+                  SELECT SUM(CASE WHEN o.side = 'sell'
+                             THEN o.realized_fill_qty
+                             ELSE -o.realized_fill_qty END)
+                  FROM orders o
+                  WHERE o.execution_id = e.id
+                    AND o.final_status IN ('filled', 'partially_filled_closed')
+                    AND o.realized_fill_qty IS NOT NULL
+                    AND o.realized_fill_price IS NOT NULL
+              ) >= 0
               AND NOT EXISTS (
                   SELECT 1 FROM trade_postmortems tp
                   WHERE tp.execution_id = e.id
@@ -2659,5 +2699,5 @@ class JournalRepo:
             exclude_execution_id=exclude_execution_id,
         )
 
-    def deactivate_desk_memory(self, kind: str, *, except_id: int) -> int:
-        return deactivate_desk_memory(self.db_path, kind, except_id=except_id)
+    def insert_desk_memory_replacing_active(self, row: DeskMemoryRow) -> int:
+        return insert_desk_memory_replacing_active(self.db_path, row)
