@@ -14,7 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from app.memory_context import MemoryContextAssembler, MemoryQuery
+from app.memory_context import (
+    MEMORY_CONTAINMENT_HEADER,
+    MemoryContextAssembler,
+    MemoryQuery,
+)
 from app.memory_doctrine import (
     DOCTRINE_V1,
     make_doctrine_provider,
@@ -229,7 +233,10 @@ def test_register_doctrine_gated_on_seeds_and_registers(
 
     out = a.assemble(_q())
     assert out is not None
-    assert out.startswith("## MEMORY: Desk doctrine (study-derived priors)\n")
+    assert out.startswith(
+        MEMORY_CONTAINMENT_HEADER
+        + "\n\n## MEMORY: Desk doctrine (study-derived priors)\n"
+    )
     assert DOCTRINE_V1 in out
     assert len(_doctrine_rows(journal)) == 1
 

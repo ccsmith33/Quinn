@@ -33,7 +33,11 @@ from app.desk_journal import (
     compute_exit_quality_pct,
     make_desk_journal_provider,
 )
-from app.memory_context import MemoryContextAssembler, MemoryQuery
+from app.memory_context import (
+    MEMORY_CONTAINMENT_HEADER,
+    MemoryContextAssembler,
+    MemoryQuery,
+)
 from config.loader import MemoryConfig
 from journal.migrate import apply_migrations
 from journal.models import (
@@ -779,6 +783,7 @@ def test_provider_output_is_deterministic_through_assembler(db: str) -> None:
     assert first is not None
     assert first == second  # byte-identical for identical inputs
     assert first == (
+        f"{MEMORY_CONTAINMENT_HEADER}\n\n"
         f"## MEMORY: {DESK_JOURNAL_SECTION_TITLE}\nstable patterns (n=4)"
     )
 

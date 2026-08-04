@@ -24,6 +24,7 @@ import pytest
 from analyzer.sonnet import SonnetAnalyzer
 from analyzer.thesis_review import ThesisReviewContext, ThesisReviewer
 from app.memory_context import (
+    MEMORY_CONTAINMENT_HEADER,
     MemoryContextAssembler,
     MemoryQuery,
     MemorySection,
@@ -45,6 +46,7 @@ from prompts.loader import (
 )
 
 PROMPTS_DIR = Path("src/prompts")
+_HDR = MEMORY_CONTAINMENT_HEADER + "\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +254,7 @@ def test_analyzer_assemble_memory_builds_analyze_query() -> None:
 
     a.register("p", capture)
     out = _sonnet_analyzer(a)._assemble_memory(_filing_row(issuer_ticker="ACME"))
-    assert out == "## MEMORY: T\nB"
+    assert out == _HDR + "## MEMORY: T\nB"
     assert seen[0].symbol == "ACME"
     assert seen[0].purpose == "analyze"
     assert seen[0].execution_id is None
@@ -287,7 +289,7 @@ def test_reviewer_assemble_memory_builds_thesis_review_query() -> None:
         proposal=_proposal_row(symbol="ZZ", conviction=9), execution_id=42
     )
     out = _thesis_reviewer(a)._assemble_memory(ctx)
-    assert out == "## MEMORY: T\nB"
+    assert out == _HDR + "## MEMORY: T\nB"
     assert seen[0].symbol == "ZZ"
     assert seen[0].purpose == "thesis_review"
     assert seen[0].execution_id == 42
@@ -439,4 +441,7 @@ async def test_analyze_passes_assembled_block_when_enabled(
     )
     analyzer, builder = _analyzer_with(db, _assembler_with_section())
     await analyzer.analyze(stored_filing, raw_text="body", ctx=ctx)
-    assert builder.calls[0]["memory_block"] == "## MEMORY: Doctrine\nbase rates"
+    assert (
+        builder.calls[0]["memory_block"]
+        == _HDR + "## MEMORY: Doctrine\nbase rates"
+    )

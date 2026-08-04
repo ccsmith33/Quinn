@@ -13,7 +13,11 @@ from __future__ import annotations
 from typing import Any
 
 from app.memory_calibration import CalibrationMemoryProvider
-from app.memory_context import MemoryContextAssembler, MemoryQuery
+from app.memory_context import (
+    MEMORY_CONTAINMENT_HEADER,
+    MemoryContextAssembler,
+    MemoryQuery,
+)
 
 
 class _FakeJournal:
@@ -179,5 +183,7 @@ def test_assembles_under_the_shared_rail() -> None:
     )
     out = assembler.assemble(_q("analyze"))
     assert out is not None
-    assert out.startswith("## MEMORY: Conviction calibration\n")
+    assert out.startswith(
+        MEMORY_CONTAINMENT_HEADER + "\n\n## MEMORY: Conviction calibration\n"
+    )
     assert assembler.assemble(_q("thesis_review")) is None
