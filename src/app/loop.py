@@ -61,6 +61,14 @@ log = get_logger(__name__)
 # than holding the loop in BOOTING for hours.
 _RECOVERY_SCAN_MAX_FILINGS = 500
 
+# Review A2 — broker order states that mean "this order is dead and
+# created no exposure": a `prop-{id}-entry` found in one of these states
+# is NOT a live orphan and must not be adopted as a phantom position.
+# Everything else (accepted/new/pending_*/partially_filled/filled/
+# replaced/held/...) is either live or actually executed and is adopted
+# as before.
+_TERMINAL_DEAD_ORDER_STATUSES = frozenset({"rejected", "canceled", "expired"})
+
 
 class AgentLoop:
     """The long-running asyncio coordinator. One per agent process."""
@@ -1306,12 +1314,32 @@ class AgentLoop:
         proposal_row = get_proposal_by_id(db, row.proposal_id)
         if proposal_row is None:
             return "proposal_missing"
-        # Never double-enter: any non-rejected execution row (accepted /
-        # partial / adopted-from-broker) means the entry already exists.
+        # Never double-enter — GATING RULE (review A1):
+        #   - any non-rejected, non-submission_failed execution row
+        #     (accepted / submission_partial_no_stop / adopted-from-
+        #     broker) means the entry already exists → gated forever;
+        #   - a `submission_failed` row gates ONLY when at least one
+        #     `orders` row hangs off it — i.e. some leg actually reached
+        #     the broker (the 4cdf3d9 duplicate-client_order_id incident
+        #     class) and a blind re-submit could double-enter;
+        #   - a `submission_failed` row with NO orders rows means nothing
+        #     reached the broker (transient BrokerUnavailable, atomic
+        #     bracket rejection — the submitter journals these with
+        #     submitted_orders_json='[]' and writes no order rows), so
+        #     the row stays retryable instead of stranding pending until
+        #     silent expiry.
+        # Belt-and-braces for the no-orders-row path: the chain's
+        # `_adopt_orphan_orders` still probes the broker for a live
+        # `prop-{id}-entry` before any re-submission.
         with connect(db) as conn:
             existing = conn.execute(
-                "SELECT 1 FROM executions WHERE proposal_id = ? "
-                "AND decision != 'rejected' LIMIT 1",
+                "SELECT 1 FROM executions e "
+                "WHERE e.proposal_id = ? "
+                "AND e.decision != 'rejected' "
+                "AND (e.decision != 'submission_failed' "
+                "     OR EXISTS (SELECT 1 FROM orders o "
+                "                WHERE o.execution_id = e.id)) "
+                "LIMIT 1",
                 (row.proposal_id,),
             ).fetchone()
         if existing is not None:
@@ -1673,6 +1701,26 @@ class AgentLoop:
             )
             return False
         if entry is None:
+            return False
+        # Review A2 — liveness check. The broker remembers TERMINAL-DEAD
+        # orders under their client ids too: a crash-window entry that was
+        # rejected / canceled / expired must NOT be adopted as a phantom
+        # position (it created no exposure and never will). Only an order
+        # that is live or actually executed counts as an orphan; a dead
+        # one falls through to normal submission. (If the broker refuses
+        # the reused client_order_id, the submitter journals a
+        # `submission_failed` and — on the watchlist path — the row stays
+        # pending, bounded by expiry.)
+        if entry.status in _TERMINAL_DEAD_ORDER_STATUSES:
+            log.info(
+                "agent.orphan_entry_dead",
+                extra={
+                    "event": "agent.orphan_entry_dead",
+                    "proposal_id": ap.proposal_id,
+                    "symbol": entry.symbol,
+                    "status": entry.status,
+                },
+            )
             return False
 
         # Broker has the entry. Pull stop + tp too — both legs may have
