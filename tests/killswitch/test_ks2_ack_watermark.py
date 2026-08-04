@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -335,6 +336,51 @@ def test_watermark_survives_process_restart(journal: JournalRepo) -> None:
     )
     assert any(h.rule == "KS-2" and not h.fired for h in halts)
     assert fresh_ks.is_halted() is False
+
+
+def test_malformed_ks2_ack_payload_degrades_to_normal_fire(tmp_path: Path) -> None:
+    """Safe degrade for _active_ks2_ack (the raw-SQL operator-resume case):
+    a resume row whose notes carry a garbage ks2_ack payload — non-JSON
+    text containing the literal '"ks2_ack"' substring (so the repo LIKE
+    prefilter matches but json parsing fails), non-numeric dd_pct, a
+    non-dict ks2_ack, a missing peak — must never suppress: with the
+    feature ON, KS-2 FIRES normally and the halt row is written."""
+    payloads = [
+        # non-JSON free text that still matches LIKE '%"ks2_ack"%'
+        'manual sql resume, see "ks2_ack" incident notes',
+        # valid JSON, non-numeric dd_pct
+        json.dumps({"detail": "sql", "ks2_ack": {"dd_pct": "0.125", "peak": 100_000.0}}),
+        # valid JSON, ks2_ack is not a dict
+        json.dumps({"detail": "sql", "ks2_ack": ["dd_pct", 0.125]}),
+        # valid JSON, peak missing
+        json.dumps({"detail": "sql", "ks2_ack": {"dd_pct": 0.125}}),
+    ]
+    for i, notes in enumerate(payloads):
+        db = tmp_path / f"journal_{i}.db"
+        apply_migrations(str(db))
+        journal = JournalRepo(str(db))
+        _snapshot(journal, at=PEAK_AT, equity=100_000.0)
+        _snapshot(journal, at=HALT_DAY - dt.timedelta(minutes=5), equity=87_500.0)
+        halts, _ = _evaluate(journal, HALT_DAY, _cfg(reack=3.0))
+        assert any(h.rule == "KS-2" and h.fired for h in halts)
+        # Operator resumes via raw SQL (runbook style) with garbage notes.
+        with sqlite3.connect(str(db)) as conn:
+            conn.execute(
+                "INSERT INTO kill_switch_state (set_at, state, reason, set_by, notes) "
+                "VALUES (?, 'active', 'resume', 'operator', ?)",
+                (str(HALT_DAY + dt.timedelta(minutes=10)), notes),
+            )
+            conn.commit()
+        # NEXT ET day (same-day suppression expired): the malformed ack
+        # must be ignored — KS-2 re-fires and halts.
+        day2 = HALT_DAY + dt.timedelta(days=1)
+        _snapshot(journal, at=day2 - dt.timedelta(minutes=5), equity=87_500.0)
+        halts, ks = _evaluate(journal, day2, _cfg(reack=3.0))
+        ks2 = [h for h in halts if h.rule == "KS-2"]
+        assert len(ks2) == 1, notes
+        assert ks2[0].fired is True, notes
+        assert ks2[0].suppressed_by is None, notes
+        assert ks.state().reason == "auto:KS-2", notes
 
 
 def test_ks1_unaffected_by_active_ks2_watermark(journal: JournalRepo) -> None:
