@@ -326,6 +326,25 @@ class EventReviewsConfig(_Section):
         return self
 
 
+class MemoryConfig(_Section):
+    """LLM memory layer (shared rail for the doctrine / symbol_history /
+    desk_journal / calibration providers).
+
+    `enabled` is the master gate — with it false (or the section absent,
+    the default) no assembler is constructed and every LLM context build
+    is byte-identical to the pre-memory system. The per-provider bools
+    default true so that flipping the master on lights up whichever
+    providers are registered; an operator silences one provider by
+    setting its bool false without touching the others.
+    """
+
+    enabled: bool = False
+    doctrine_enabled: bool = True
+    symbol_history_enabled: bool = True
+    desk_journal_enabled: bool = True
+    calibration_enabled: bool = True
+
+
 class ReconcilerConfig(_Section):
     interval_seconds_market: int = Field(gt=0)
     # RETIRED — WS1 (D-078, delta §2.2). Diff explanation is now keyed to
@@ -401,6 +420,9 @@ class AppConfig(BaseModel):
     # Event-triggered thesis reviews — optional section, default OFF so
     # legacy configs keep booting with byte-identical behavior.
     event_reviews: EventReviewsConfig = Field(default_factory=EventReviewsConfig)
+    # LLM memory layer — optional section, default OFF (master gate) so
+    # legacy configs keep booting with byte-identical LLM context.
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     reconciler: ReconcilerConfig
     killswitch: KillSwitchConfig
     observability: ObservabilityConfig

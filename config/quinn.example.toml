@@ -179,3 +179,15 @@ betterstack_endpoint = "https://in.logs.betterstack.com"
 # failure rate is consistently <5% and runtime matters; increase if
 # Yahoo tightens the threshold.
 yfinance_min_interval_seconds = 0.2
+
+# LLM memory layer — optional, OFF by default (section may be omitted).
+# `enabled` is the master gate: false (or the section absent) means no
+# memory assembler is built and every LLM context is byte-identical to
+# the pre-memory system. The per-provider bools default true, so once
+# the master is on each registered provider lights up unless silenced.
+# [memory]
+# enabled = false
+# doctrine_enabled = true
+# symbol_history_enabled = true
+# desk_journal_enabled = true
+# calibration_enabled = true

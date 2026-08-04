@@ -29,6 +29,7 @@ from analyzer.anthropic_client import AnthropicClient
 from analyzer.opus import OpusReviewer
 from analyzer.sonnet import SonnetAnalyzer
 from analyzer.thesis_review import ThesisReviewer
+from app.memory_context import MemoryContextAssembler
 from app.retro_fill import RetroFillCoordinator
 from app.thesis_coordinator import (
     ThesisReviewCoordinator,
@@ -216,6 +217,19 @@ def compose_agent(
         endpoint=secrets.alpaca_endpoint.get_secret_value(),
     )
 
+    # LLM memory layer — the shared assembler the doctrine /
+    # symbol_history / desk_journal / calibration providers register on.
+    # Master-gated: when `[memory] enabled = false` (the default) we pass
+    # None everywhere and every LLM context build is byte-identical to
+    # the pre-memory system. When enabled, register providers here
+    # (guarded by their per-provider bools in `config.memory`) before
+    # handing the assembler to the analyzer + thesis reviewer. No real
+    # provider is registered yet — this is the plug point.
+    memory_assembler: MemoryContextAssembler | None = None
+    if config.memory.enabled:
+        memory_assembler = MemoryContextAssembler()
+        # provider registration lands here (per config.memory.*_enabled).
+
     # Sonnet analyzer (S5.3) — the conviction-threshold gate to Opus
     # lives in this constructor (D-047). Feature B: also wires the KS5
     # capacity gate so we skip Opus spend when no slot is free.
@@ -238,6 +252,7 @@ def compose_agent(
         max_output_tokens=config.analyzer.sonnet_max_output_tokens,
         ks5_max_concurrent=config.execution.ks5_max_concurrent,
         open_positions_counter=lambda: len(broker.get_positions()),
+        memory_assembler=memory_assembler,
     )
 
     # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.
@@ -284,6 +299,7 @@ def compose_agent(
         opus_model_id=config.analyzer.opus_model_id,
         db_path=journal.db_path,
         max_output_tokens=config.analyzer.opus_max_output_tokens,
+        memory_assembler=memory_assembler,
     )
     thesis_coordinator = ThesisReviewCoordinator(
         journal=journal,

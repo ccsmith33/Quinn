@@ -21,6 +21,7 @@ from .models import (
     BackupRow,
     ChoppingBlockRow,
     DeferredSellRow,
+    DeskMemoryRow,
     ExecutionRow,
     FilingRow,
     KillSwitchStateRow,
@@ -34,6 +35,7 @@ from .models import (
     SimilarityCacheRow,
     ThesisReviewRow,
     ThesisReviewScheduleRow,
+    TradePostmortemRow,
     UniverseMemberRow,
     UniverseSnapshotRow,
     VirtualExitRow,
@@ -1580,6 +1582,73 @@ def resolve_watchlist_row(
 
 
 # ---------------------------------------------------------------------------
+# desk memory (migration 009) + trade post-mortems (migration 010).
+#
+# Schema stubs for the LLM memory layer. These are thin, tested helpers;
+# the doctrine / symbol_history / desk_journal providers own the higher-
+# level read/write semantics and add methods as they need them.
+# ---------------------------------------------------------------------------
+
+
+def insert_desk_memory(db_path: str, row: DeskMemoryRow) -> int:
+    """Insert a desk-memory artifact; return its new id."""
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "INSERT INTO desk_memory (kind, content, version, active) "
+            "VALUES (?, ?, ?, ?)",
+            (row.kind, row.content, row.version, row.active),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def get_active_desk_memory(db_path: str, kind: str) -> DeskMemoryRow | None:
+    """The current active artifact of `kind` (highest version, newest on a
+    tie), or None when none is active."""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM desk_memory WHERE kind = ? AND active = 1 "
+            "ORDER BY version DESC, id DESC LIMIT 1",
+            (kind,),
+        ).fetchone()
+    return DeskMemoryRow(**dict(row)) if row is not None else None
+
+
+def insert_trade_postmortem(db_path: str, row: TradePostmortemRow) -> int:
+    """Insert a per-trade post-mortem; return its new id."""
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "INSERT INTO trade_postmortems "
+            "(execution_id, symbol, thesis_summary, outcome_summary, "
+            "exit_quality_pct, lesson) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                row.execution_id,
+                row.symbol,
+                row.thesis_summary,
+                row.outcome_summary,
+                row.exit_quality_pct,
+                row.lesson,
+            ),
+        )
+        return int(cur.lastrowid or 0)
+
+
+def get_postmortems_for_symbol(
+    db_path: str, symbol: str
+) -> list[TradePostmortemRow]:
+    """All post-mortems for `symbol`, newest-first."""
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM trade_postmortems WHERE symbol = ? "
+            "ORDER BY created_at DESC, id DESC",
+            (symbol,),
+        ).fetchall()
+    return [TradePostmortemRow(**dict(r)) for r in rows]
+
+
+# ---------------------------------------------------------------------------
 # JournalRepo — thin object facade over the module-level functions.
 #
 # Stories that consume the journal (S6.1, S6.2, S6.4, S7.1, S7.4, S5.6) take a
@@ -2158,3 +2227,20 @@ class JournalRepo:
                     pnl += sign * float(f["q"]) * float(f["p"]) - float(f["fee"])
                 out.append((eid, pnl, closed_at))
         return out
+
+    # LLM memory layer (migrations 009/010). Bound so the provider devs
+    # can reach these through the same JournalRepo the rest of the agent
+    # uses instead of threading `db_path` separately.
+    def insert_desk_memory(self, row: DeskMemoryRow) -> int:
+        return insert_desk_memory(self.db_path, row)
+
+    def get_active_desk_memory(self, kind: str) -> DeskMemoryRow | None:
+        return get_active_desk_memory(self.db_path, kind)
+
+    def insert_trade_postmortem(self, row: TradePostmortemRow) -> int:
+        return insert_trade_postmortem(self.db_path, row)
+
+    def get_postmortems_for_symbol(
+        self, symbol: str
+    ) -> list[TradePostmortemRow]:
+        return get_postmortems_for_symbol(self.db_path, symbol)

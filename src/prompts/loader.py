@@ -172,12 +172,24 @@ class PromptBuilder:
         return f"{name}@{digest[:_HASH_PREFIX_LEN]}"
 
     def build_sonnet_filing_analysis(
-        self, filing: FilingRow, raw_text: str, ctx: AnalyzerContext
+        self,
+        filing: FilingRow,
+        raw_text: str,
+        ctx: AnalyzerContext,
+        *,
+        memory_block: str | None = None,
     ) -> ApiRequest:
+        # `memory_block` (LLM memory layer) is appended at the very END of
+        # block 3 (the per-call filing payload) so it never perturbs the
+        # cached system/decision blocks. None (the default, and whenever
+        # the memory master gate is off) → byte-identical to pre-memory.
+        block3 = self._filing_payload(filing, raw_text)
+        if memory_block:
+            block3 = f"{block3}---\n{memory_block}\n"
         return self._build(
             name=ACTIVE_SONNET_ANALYSIS_PROMPT,
             block2_text=self._block2_text(ctx),
-            block3_text=self._filing_payload(filing, raw_text),
+            block3_text=block3,
         )
 
     def build_opus_proposal_review(
@@ -214,6 +226,7 @@ class PromptBuilder:
         trigger_reason: str | None = None,
         trigger_detail: str | None = None,
         capacity_pressure_block: str | None = None,
+        memory_block: str | None = None,
     ) -> ApiRequest:
         """Feature A — compose the Opus thesis-review request for an open
         position whose horizon has elapsed (or an event trigger fired).
@@ -277,6 +290,11 @@ class PromptBuilder:
         )
         if capacity_pressure_block:
             block3 = f"{block3}---\n{capacity_pressure_block}\n"
+        # LLM memory layer — appended AFTER every existing block (incl. the
+        # capacity block) at the tail of the per-call user message, so the
+        # cached system blocks are untouched. None → byte-identical.
+        if memory_block:
+            block3 = f"{block3}---\n{memory_block}\n"
         return self._build(
             name=ACTIVE_OPUS_THESIS_REVIEW_PROMPT,
             block2_text=ctx_summary,

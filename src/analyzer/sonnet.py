@@ -39,6 +39,7 @@ import hashlib
 from collections.abc import Callable
 from typing import Any, Literal, Protocol
 
+from app.memory_context import MemoryContextAssembler, MemoryQuery
 from journal.models import FilingRow, ProposalRow
 from journal.repo import get_llm_calls_by_decision_id, get_proposal_by_id
 from observability.log_port import get_logger
@@ -59,7 +60,12 @@ _DECISION_ID_HEX_LEN = 32
 
 class _PromptBuilderPort(Protocol):
     def build_sonnet_filing_analysis(
-        self, filing: FilingRow, raw_text: str, ctx: AnalyzerContext
+        self,
+        filing: FilingRow,
+        raw_text: str,
+        ctx: AnalyzerContext,
+        *,
+        memory_block: str | None = None,
     ) -> ApiRequest: ...
 
     def prompt_version(self, name: str) -> str: ...
@@ -124,6 +130,7 @@ class SonnetAnalyzer:
         max_output_tokens: int | None = None,
         ks5_max_concurrent: int | None = None,
         open_positions_counter: Callable[[], int] | None = None,
+        memory_assembler: MemoryContextAssembler | None = None,
     ) -> None:
         self._client = client
         self._store = store
@@ -144,6 +151,10 @@ class SonnetAnalyzer:
         # `lambda: len(broker.get_positions())`.
         self._ks5_max_concurrent = ks5_max_concurrent
         self._open_positions_counter = open_positions_counter
+        # LLM memory layer. None (default, and whenever the memory master
+        # gate is off) → no MemoryQuery is built and the request is
+        # byte-identical to the pre-memory analyzer.
+        self._memory_assembler = memory_assembler
 
     async def analyze(
         self,
@@ -151,7 +162,10 @@ class SonnetAnalyzer:
         raw_text: str,
         ctx: AnalyzerContext,
     ) -> AnalyzerResult:
-        request = self._builder.build_sonnet_filing_analysis(filing, raw_text, ctx)
+        memory_block = self._assemble_memory(filing)
+        request = self._builder.build_sonnet_filing_analysis(
+            filing, raw_text, ctx, memory_block=memory_block
+        )
         prompt_version = request.prompt_version
         decision_id = compute_decision_id(
             filing_id=filing.id,
@@ -270,6 +284,22 @@ class SonnetAnalyzer:
                 await self._opus.review(proposal_row, filing, raw_text)
 
         return result
+
+    def _assemble_memory(self, filing: FilingRow) -> str | None:
+        """Build the memory block for this filing analysis, or None when the
+        memory layer is disabled / contributes nothing. Provider failures
+        are absorbed inside the assembler, so this never raises into the
+        analysis path."""
+        if self._memory_assembler is None:
+            return None
+        return self._memory_assembler.assemble(
+            MemoryQuery(
+                symbol=filing.issuer_ticker,
+                purpose="analyze",
+                execution_id=None,
+                conviction=None,
+            )
+        )
 
     def _read_telemetry(self, decision_id: str) -> CallTelemetry:
         rows = get_llm_calls_by_decision_id(self._db_path, decision_id)

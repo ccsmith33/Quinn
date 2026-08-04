@@ -102,9 +102,21 @@ class _FakePromptBuilder:
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def build_sonnet_filing_analysis(
-        self, filing: FilingRow, raw_text: str, ctx: AnalyzerContext
+        self,
+        filing: FilingRow,
+        raw_text: str,
+        ctx: AnalyzerContext,
+        *,
+        memory_block: str | None = None,
     ) -> ApiRequest:
-        self.calls.append({"filing": filing, "raw_text": raw_text, "ctx": ctx})
+        self.calls.append(
+            {
+                "filing": filing,
+                "raw_text": raw_text,
+                "ctx": ctx,
+                "memory_block": memory_block,
+            }
+        )
         return ApiRequest(
             system=[
                 Block(text="block1", cache_control={"type": "ephemeral"}),

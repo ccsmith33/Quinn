@@ -277,6 +277,36 @@ class WatchlistRow(_Row):
     notes: str | None = None
 
 
+class DeskMemoryRow(_Row):
+    """Desk-level memory artifact (migration 009). `kind` ∈
+    {"doctrine", "synthesis"}; versioned + soft-deactivated (`active`)
+    rather than rewritten in place. The provider devs own the write
+    semantics; this row is the schema stub they build on."""
+
+    id: int | None = None
+    kind: Literal["doctrine", "synthesis"]
+    content: str
+    version: int = 1
+    created_at: dt.datetime | None = None
+    active: int = 1
+
+
+class TradePostmortemRow(_Row):
+    """Per-trade post-mortem record (migration 010). One row per closed
+    execution the desk_journal path has synthesized; served by symbol via
+    `get_postmortems_for_symbol`. Columns are deliberately loose — the
+    provider devs own the semantics."""
+
+    id: int | None = None
+    execution_id: int
+    symbol: str
+    thesis_summary: str | None = None
+    outcome_summary: str | None = None
+    exit_quality_pct: float | None = None
+    lesson: str | None = None
+    created_at: dt.datetime | None = None
+
+
 class BackupRow(_Row):
     id: int | None = None
     started_at: dt.datetime

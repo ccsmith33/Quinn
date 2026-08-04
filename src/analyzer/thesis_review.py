@@ -17,6 +17,7 @@ import json
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
+from app.memory_context import MemoryContextAssembler, MemoryQuery
 from journal.models import ProposalRow, ThesisReviewRow
 from journal.repo import get_llm_calls_by_decision_id, insert_thesis_review
 from observability.log_port import get_logger
@@ -128,6 +129,7 @@ class _PromptBuilderPort(Protocol):
         trigger_reason: str | None = None,
         trigger_detail: str | None = None,
         capacity_pressure_block: str | None = None,
+        memory_block: str | None = None,
     ) -> ApiRequest: ...
 
 
@@ -183,14 +185,20 @@ class ThesisReviewer:
         opus_model_id: str,
         db_path: str,
         max_output_tokens: int | None = None,
+        memory_assembler: MemoryContextAssembler | None = None,
     ) -> None:
         self._client = client
         self._builder = prompt_builder
         self._opus_model_id = opus_model_id
         self._db_path = db_path
         self._max_output_tokens = max_output_tokens
+        # LLM memory layer. None (default, and whenever the memory master
+        # gate is off) → no MemoryQuery is built and the request is
+        # byte-identical to the pre-memory reviewer.
+        self._memory_assembler = memory_assembler
 
     async def review(self, ctx: ThesisReviewContext) -> ThesisReviewResult:
+        memory_block = self._assemble_memory(ctx)
         request = self._builder.build_opus_thesis_review(
             proposal=ctx.proposal,
             execution_id=ctx.execution_id,
@@ -209,6 +217,7 @@ class ThesisReviewer:
             trigger_reason=ctx.trigger_reason,
             trigger_detail=ctx.trigger_detail,
             capacity_pressure_block=ctx.capacity_pressure_block,
+            memory_block=memory_block,
         )
         # Build a unique decision_id per thesis-review schedule so llm_calls
         # rows stay distinct from proposal-review rows for the same proposal.
@@ -255,6 +264,22 @@ class ThesisReviewer:
             ),
         )
         return result
+
+    def _assemble_memory(self, ctx: ThesisReviewContext) -> str | None:
+        """Build the memory block for this thesis review, or None when the
+        memory layer is disabled / contributes nothing. Provider failures
+        are absorbed inside the assembler, so this never raises into the
+        review path."""
+        if self._memory_assembler is None:
+            return None
+        return self._memory_assembler.assemble(
+            MemoryQuery(
+                symbol=ctx.proposal.symbol,
+                purpose="thesis_review",
+                execution_id=ctx.execution_id,
+                conviction=ctx.proposal.conviction,
+            )
+        )
 
     def _read_telemetry(self, decision_id: str) -> CallTelemetry:
         rows = get_llm_calls_by_decision_id(self._db_path, decision_id)

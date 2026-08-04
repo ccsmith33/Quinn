@@ -12,6 +12,7 @@ from config.loader import (
     ConfigError,
     EventReviewsConfig,
     ExecutionConfig,
+    MemoryConfig,
     load_config,
 )
 
@@ -111,6 +112,44 @@ def test_event_reviews_capacity_target_slots_parses_from_toml(tmp_path: Path) ->
     cfg = load_config(str(p))
     assert cfg.event_reviews.capacity_target_slots == 2
     assert cfg.event_reviews.daily_sweep is True
+
+
+# ---------------------------------------------------------------------------
+# [memory] — LLM memory layer (master gate + per-provider bools)
+# ---------------------------------------------------------------------------
+
+
+def test_memory_section_absent_defaults_off() -> None:
+    """The example config carries no [memory] table — back-compat: the
+    section defaults in with the master gate OFF and every provider bool
+    ON (the master gate is what actually suppresses them)."""
+    cfg = load_config(str(EXAMPLE_TOML))
+    assert cfg.memory.enabled is False
+    assert cfg.memory.doctrine_enabled is True
+    assert cfg.memory.symbol_history_enabled is True
+    assert cfg.memory.desk_journal_enabled is True
+    assert cfg.memory.calibration_enabled is True
+
+
+def test_memory_section_parses_from_toml(tmp_path: Path) -> None:
+    text = EXAMPLE_TOML.read_text(encoding="utf-8")
+    text += (
+        "\n[memory]\n"
+        "enabled = true\n"
+        "symbol_history_enabled = false\n"
+    )
+    p = tmp_path / "with_memory.toml"
+    p.write_text(text, encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.memory.enabled is True
+    # explicit override sticks; the untouched bools keep their default
+    assert cfg.memory.symbol_history_enabled is False
+    assert cfg.memory.doctrine_enabled is True
+
+
+def test_memory_forbids_unknown_key() -> None:
+    with pytest.raises(ValidationError):
+        MemoryConfig(bogus_provider_enabled=True)  # type: ignore[call-arg]
 
 
 @pytest.mark.parametrize("bad", [-1, 6, 100])
