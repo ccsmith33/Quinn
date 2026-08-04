@@ -275,3 +275,46 @@ def test_non_sweep_reviews_write_no_block(db: str) -> None:
     )
     asyncio.run(coord.run_tick())
     assert get_latest_chopping_block(db) == []
+
+
+def test_write_degrades_when_table_missing_and_warns_once(db: str) -> None:
+    """A4 — on a DB migrated before this feature (no chopping_block table),
+    the sweep write degrades gracefully: no exception, warned once."""
+    from app.thesis_coordinator import _ChoppingBlockCandidate
+    from journal.repo import connect
+
+    eid = _seed(db, symbol="AAA", fill_price=100.0, entry_at=NOW - dt.timedelta(days=10))
+    with connect(db) as conn:
+        conn.execute("DROP TABLE chopping_block")
+
+    coord = _coordinator(
+        db, _FakeBroker(prices={"AAA": 90.0}, positions=[_pos("AAA", 90.0)]),
+        _Reviewer({"AAA": 5}),
+    )
+    cands = [
+        _ChoppingBlockCandidate(
+            execution_id=eid, symbol="AAA", expendability=5,
+            reason="stale", unrealized_gain_pct=-0.10, days_held=10,
+        )
+    ]
+    # Must not raise, and the once-latch flips.
+    coord._write_chopping_block(cands, now=NOW)
+    assert coord._chopping_block_unavailable_warned is True
+    # A second write is still a no-op (latched) and never raises.
+    coord._write_chopping_block(cands, now=NOW)
+
+
+def test_run_tick_survives_missing_table(db: str) -> None:
+    """End-to-end: a full sweep tick completes even when the table is gone
+    (the block write is skipped, the reviews still run)."""
+    from journal.repo import connect
+
+    _seed(db, symbol="AAA", fill_price=100.0, entry_at=NOW - dt.timedelta(days=10))
+    with connect(db) as conn:
+        conn.execute("DROP TABLE chopping_block")
+    coord = _coordinator(
+        db, _FakeBroker(prices={"AAA": 90.0}, positions=[_pos("AAA", 90.0)]),
+        _Reviewer({"AAA": 5}),
+    )
+    asyncio.run(coord.run_tick())  # must not raise
+    assert coord._chopping_block_unavailable_warned is True

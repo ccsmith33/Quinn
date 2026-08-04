@@ -757,10 +757,17 @@ def test_trading_days_held_counts_market_open_days_only() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _write_block(db: str, ranked_eids: list[tuple[int, str]], *, exp: int = 4) -> None:
-    """Persist a chopping block for NOW's ET date. `ranked_eids` is
-    [(execution_id, symbol), ...] in rank order (rank 1 first)."""
-    block_date = NOW.astimezone(ET).date().isoformat()
+def _write_block(
+    db: str,
+    ranked_eids: list[tuple[int, str]],
+    *,
+    exp: int = 4,
+    block_date: str | None = None,
+) -> None:
+    """Persist a chopping block. `ranked_eids` is [(execution_id, symbol),
+    ...] in rank order (rank 1 first). `block_date` defaults to NOW's ET
+    date; pass an explicit ET date to exercise the override freshness gate."""
+    block_date = block_date or NOW.astimezone(ET).date().isoformat()
     rows = [
         ChoppingBlockRow(
             block_date=block_date, execution_id=eid, symbol=sym,
@@ -988,3 +995,63 @@ def test_young_victim_conviction_out_of_band_rejected(value: int) -> None:
 def test_young_victim_conviction_valid_values(value: int) -> None:
     cfg = _cfg(displacement_young_victim_min_conviction=value)
     assert cfg.displacement_young_victim_min_conviction == value
+
+
+# ---------------------------------------------------------------------------
+# A3 — AGE OVERRIDE freshness: a stale block must not sanction a young evict
+# ---------------------------------------------------------------------------
+
+# NOW is Tue 2026-06-09. Mon 2026-06-08 is the previous trading session
+# (fresh); Thu 2026-06-04 is three sessions back (stale: Fri/Mon/Tue).
+PREV_SESSION_DATE = "2026-06-08"
+STALE_BLOCK_DATE = "2026-06-04"
+
+
+def test_age_override_refused_on_stale_block(db: str) -> None:
+    """A young victim on a block older than the previous trading session is
+    NOT evictable by the override — the thesis sanction is stale."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)
+    _write_block(db, [(young_eid, "YNG")], block_date=STALE_BLOCK_DATE)
+    victim = _engine(db, broker).find_victim(
+        [_position("YNG", unrealized_pct=-4.0)],
+        new_symbol="ACME", conviction=9,
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+    )
+    assert victim is None
+
+
+def test_age_override_fires_on_previous_session_block(db: str) -> None:
+    """A block from the immediately previous trading session is fresh — the
+    override fires (weekend/overnight gap is within tolerance)."""
+    broker = _RecordingBroker()
+    young_eid = _seed_victim(db, symbol="YNG", entry_at=YOUNG)
+    _write_block(db, [(young_eid, "YNG")], block_date=PREV_SESSION_DATE)
+    victim = _engine(db, broker).find_victim(
+        [_position("YNG", unrealized_pct=-4.0)],
+        new_symbol="ACME", conviction=9,
+        cfg=_cfg(displacement_young_victim_min_conviction=9),
+    )
+    assert victim is not None
+    assert victim.symbol == "YNG"
+    assert victim.via_override is True
+
+
+def test_ordinary_block_ordering_ignores_staleness(db: str) -> None:
+    """Ordinary (aged-victim) block ORDERING may use a stale block — those
+    victims are fully re-qualified live, so a stale thesis rank is safe."""
+    broker = _RecordingBroker()
+    low_eid = _seed_victim(db, symbol="LOWG", entry_at=AGED)
+    high_eid = _seed_victim(db, symbol="HIGHG", entry_at=AGED)
+    positions = [
+        _position("LOWG", unrealized_pct=-8.0),  # deterministic weakest
+        _position("HIGHG", unrealized_pct=+2.0),
+    ]
+    _write_block(
+        db, [(high_eid, "HIGHG"), (low_eid, "LOWG")], block_date=STALE_BLOCK_DATE
+    )
+    victim = _engine(db, broker).find_victim(
+        positions, new_symbol="ACME", conviction=8, cfg=_cfg()
+    )
+    assert victim is not None
+    assert victim.symbol == "HIGHG"  # block rank still wins despite staleness

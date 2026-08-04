@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sqlite3
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -257,6 +258,10 @@ class ThesisReviewCoordinator:
         # F5: latch so the "target above cap → clamped" warning is emitted
         # at most once per process rather than on every swept tick.
         self._capacity_clamp_warned = False
+        # A4: latch so a missing `chopping_block` table (a DB migrated
+        # before the feature) warns ONCE per process rather than on every
+        # sweep tick — the sweep still completes, only without the block.
+        self._chopping_block_unavailable_warned = False
         self._get_live_protective_order = get_live_protective_order or (
             lambda *, execution_id, roles: _default_get_live_protective_order(
                 self._journal.db_path, execution_id=execution_id, roles=roles
@@ -534,7 +539,26 @@ class ThesisReviewCoordinator:
             )
             for i, c in enumerate(ranked, start=1)
         ]
-        replace_chopping_block(self._journal.db_path, block_date, rows)
+        try:
+            replace_chopping_block(self._journal.db_path, block_date, rows)
+        except sqlite3.OperationalError as e:
+            # Missing `chopping_block` table (DB migrated before this
+            # feature). Degrade gracefully — the sweep already completed;
+            # only the block persistence is skipped. Warn ONCE so the
+            # missing migration is visible instead of silently swallowed
+            # every day (A4).
+            if not self._chopping_block_unavailable_warned:
+                log.warning(
+                    "event_reviews.chopping_block_unavailable",
+                    extra={
+                        "event": "event_reviews.chopping_block_unavailable",
+                        "block_date": block_date,
+                        "error": str(e),
+                        "hint": "run journal migrations (chopping_block table missing)",
+                    },
+                )
+                self._chopping_block_unavailable_warned = True
+            return
         log.info(
             "event_reviews.chopping_block",
             extra={

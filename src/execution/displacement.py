@@ -130,6 +130,23 @@ def trading_days_held(entry_date: dt.date, today: dt.date) -> int:
     return days
 
 
+def _block_is_fresh(block_date: str, today_et: dt.date) -> bool:
+    """True when the chopping block dated `block_date` (ET) is from the
+    CURRENT or the immediately PREVIOUS trading session relative to
+    `today_et` — the freshness the AGE OVERRIDE requires. A block older
+    than one trading session (a weekend that spans a holiday, or one or
+    more failed sweeps) is stale: `trading_days_held` counts >= 2 market
+    days between it and today. A block dated today (or, defensively, in
+    the future) is always fresh."""
+    try:
+        bd = dt.date.fromisoformat(block_date)
+    except ValueError:
+        return False
+    if bd >= today_et:
+        return True
+    return trading_days_held(bd, today_et) <= 1
+
+
 def displaced_today(db_path: str, *, now: dt.datetime) -> bool:
     """Hard cap: has a displacement already run this ET trading day?
 
@@ -314,7 +331,11 @@ class DisplacementEngine:
         """
         today_et = self._now_fn().astimezone(ET).date()
         ignore_gain_cutoff = conviction >= GAIN_CUTOFF_EXEMPT_CONVICTION
-        block_ranks = self._load_chopping_block_ranks(cfg)
+        block = self._load_chopping_block(cfg)
+        block_ranks: dict[int, int] | None = None
+        block_date: str | None = None
+        if block is not None:
+            block_ranks, block_date = block
 
         qualified: list[DisplacementVictim] = []
         for pos in open_positions:
@@ -351,6 +372,27 @@ class DisplacementEngine:
             # the proposal clears the override conviction gate.
             min_conv = cfg.displacement_young_victim_min_conviction
             if min_conv and conviction >= min_conv:
+                # FRESHNESS GATE: the override evicts a position younger than
+                # the normal dead-weight rule, so it demands a CURRENT thesis
+                # sanction. A block older than the previous trading session
+                # (a weekend/holiday/failed-sweep gap) is stale — refuse the
+                # override and fall through to no-young-victims. Ordinary
+                # rank-ordering above may still use a latest-but-stale block
+                # because those victims are fully re-qualified live.
+                if block_date is None or not _block_is_fresh(
+                    block_date, today_et
+                ):
+                    log.info(
+                        "execution.displacement.stale_block_override_skipped",
+                        extra={
+                            "event": "execution.displacement.stale_block_override_skipped",
+                            "new_symbol": new_symbol,
+                            "conviction": conviction,
+                            "block_date": block_date,
+                            "today_et": today_et.isoformat(),
+                        },
+                    )
+                    return None
                 young_in_block = [
                     v
                     for v in qualified
@@ -429,14 +471,16 @@ class DisplacementEngine:
             days_held=trading_days_held(entry_date_et, today_et),
         )
 
-    def _load_chopping_block_ranks(
+    def _load_chopping_block(
         self, cfg: ExecutionConfig
-    ) -> dict[int, int] | None:
-        """execution_id -> rank for the most recent chopping block, or None
-        when the feature is off / no block has been persisted. A missing
-        `chopping_block` table (a DB migrated before this feature) is
-        treated the same as an empty block — displacement then falls back
-        to the deterministic ranking."""
+    ) -> tuple[dict[int, int], str] | None:
+        """`(execution_id -> rank, block_date)` for the most recent chopping
+        block, or None when the feature is off / no block has been
+        persisted. A missing `chopping_block` table (a DB migrated before
+        this feature) is treated the same as an empty block — displacement
+        then falls back to the deterministic ranking. `block_date` is the
+        ET date the block was written; the AGE OVERRIDE uses it to require a
+        fresh thesis sanction (see `_block_is_fresh`)."""
         if not cfg.displacement_use_chopping_block:
             return None
         try:
@@ -445,7 +489,7 @@ class DisplacementEngine:
             return None
         if not rows:
             return None
-        return {r.execution_id: r.rank for r in rows}
+        return {r.execution_id: r.rank for r in rows}, rows[0].block_date
 
     def _latest_accepted_execution(
         self, symbol: str
