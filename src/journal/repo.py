@@ -1933,11 +1933,17 @@ def get_prior_engagements_for_symbol(
 def insert_desk_memory_replacing_active(
     db_path: str, row: DeskMemoryRow
 ) -> int:
-    """Insert `row` AND soft-retire (active=0) every other active row of
-    the same kind, in ONE transaction — so exactly one row of the kind is
-    active at any observable moment; a crash between the two statements
-    cannot leave two active rows. The retired rows remain as append-only
-    provenance (009 design note). Returns the new row's id.
+    """Soft-retire (active=0) every active row of `row.kind`, then insert
+    `row`, in ONE transaction — so exactly one row of the kind is active
+    at any observable moment; a crash mid-swap cannot leave two active
+    rows (rollback restores the prior active row). The retired rows
+    remain as append-only provenance (009 design note). Returns the new
+    row's id.
+
+    Statement ORDER matters: deactivate-then-insert, so the swap never
+    holds two active rows even inside the transaction — required by the
+    partial unique index on desk_memory(kind) WHERE active=1, which is
+    enforced per-statement, not at commit.
 
     The desk-journal synthesis writer uses this for the weekly version
     swap (version = prev + 1, prior deactivated).
@@ -1945,17 +1951,17 @@ def insert_desk_memory_replacing_active(
     with connect(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         try:
+            conn.execute(
+                "UPDATE desk_memory SET active = 0 "
+                "WHERE kind = ? AND active = 1",
+                (row.kind,),
+            )
             cur = conn.execute(
                 "INSERT INTO desk_memory (kind, content, version, active) "
                 "VALUES (?, ?, ?, ?)",
                 (row.kind, row.content, row.version, row.active),
             )
             new_id = int(cur.lastrowid or 0)
-            conn.execute(
-                "UPDATE desk_memory SET active = 0 "
-                "WHERE kind = ? AND active = 1 AND id != ?",
-                (row.kind, new_id),
-            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
