@@ -1022,3 +1022,356 @@ async def test_e2e_with_real_prompt_builder_and_store(
     calls = get_llm_calls_by_decision_id(db, decision_id)
     purposes = sorted(c.purpose for c in calls)
     assert purposes == ["analyze", "review"]
+
+
+# ---------------------------------------------------------------------------
+# COST LEVER — analyzer input cap (`analyzer.analyzer_max_input_chars`).
+#
+# Prod journal (3d): 650 filing-analysis calls averaged 33.6k input tokens;
+# 72.3% of all input tokens sat beyond the first 15k of each filing, and
+# every conviction>=5 proposal came from a filing in the 7.4-31k band. The
+# fat tail is the exhibit stack (press-release duplicates, financial
+# statements) that trails the Item sections in an 8-K and never produces
+# signal.
+# ---------------------------------------------------------------------------
+
+def _cap_analyzer(
+    *, db: str, builder: Any, opus: Any, client: Any, cap: int
+) -> Any:
+    from analyzer.sonnet import SonnetAnalyzer
+    from proposal.store import ProposalStore
+
+    return SonnetAnalyzer(
+        client=client,
+        store=ProposalStore(db_path=db),
+        prompt_builder=builder,
+        opus_reviewer=opus,
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=7,
+        db_path=db,
+        max_input_chars=cap,
+    )
+
+
+@pytest.mark.asyncio
+async def test_input_cap_off_is_byte_identical(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """Cap 0 (the default) = feature off: the builder sees the raw text
+    unchanged, and the decision_id source string is the pre-feature one."""
+    raw_text = "x" * 500_000
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = _cap_analyzer(
+        db=db, builder=builder, opus=_FakeOpusReviewer(), client=client, cap=0
+    )
+
+    await analyzer.analyze(filing, raw_text=raw_text, ctx=ctx)
+
+    assert builder.calls[0]["raw_text"] == raw_text
+    expected = hashlib.sha256(
+        f"{filing.id}|claude-sonnet-4-6|{sonnet_prompt_version}".encode()
+    ).hexdigest()[:32]
+    assert client.calls[0]["decision_id"] == expected
+
+
+@pytest.mark.asyncio
+async def test_input_cap_truncates_and_appends_marker(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """Over-cap text is cut at the cap boundary and carries the fixed
+    marker telling the model what was dropped and how to flag it."""
+    from analyzer.sonnet import truncation_marker
+
+    # No newlines: the cut lands exactly on the cap boundary.
+    raw_text = "x" * 100_000
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = _cap_analyzer(
+        db=db, builder=builder, opus=_FakeOpusReviewer(), client=client, cap=60_000
+    )
+
+    await analyzer.analyze(filing, raw_text=raw_text, ctx=ctx)
+
+    sent = builder.calls[0]["raw_text"]
+    marker = truncation_marker(60_000)
+    assert sent.endswith(marker)
+    assert sent[: -len(marker)] == "x" * 60_000
+    assert "Filing truncated at 60000 characters" in marker
+
+
+@pytest.mark.asyncio
+async def test_input_cap_prefers_clean_cut_at_newline(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """The cut prefers the last newline before the cap so the model never
+    sees a sentence sliced mid-word."""
+    from analyzer.sonnet import truncation_marker
+
+    # 7-char lines put the cap boundary mid-line: 2857*7 = 19999, so the
+    # last newline at-or-before the cap sits at 19998.
+    cap = 20_000
+    raw_text = "abcdef\n" * 20_000
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = _cap_analyzer(
+        db=db, builder=builder, opus=_FakeOpusReviewer(), client=client, cap=cap
+    )
+
+    await analyzer.analyze(filing, raw_text=raw_text, ctx=ctx)
+
+    sent = builder.calls[0]["raw_text"]
+    body = sent[: -len(truncation_marker(cap))]
+    # Cut at the last newline at-or-before the cap, not mid-line.
+    assert body == raw_text[:19_998]
+    assert body.endswith("abcdef")
+    assert len(body) <= cap
+
+
+@pytest.mark.asyncio
+async def test_input_cap_hard_cuts_when_newline_would_lose_the_body(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """A filing whose only early newline sits near the top (HTML stripped
+    to one long line, say) must NOT collapse to that newline — preferring
+    a clean cut can never cost more than a sliver of the budget, so the
+    boundary falls back to the hard cap."""
+    from analyzer.sonnet import truncation_marker
+
+    cap = 20_000
+    raw_text = "TITLE\n" + "y" * 100_000  # sole newline at index 5
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = _cap_analyzer(
+        db=db, builder=builder, opus=_FakeOpusReviewer(), client=client, cap=cap
+    )
+
+    await analyzer.analyze(filing, raw_text=raw_text, ctx=ctx)
+
+    sent = builder.calls[0]["raw_text"]
+    body = sent[: -len(truncation_marker(cap))]
+    assert body == raw_text[:cap]
+
+
+@pytest.mark.asyncio
+async def test_input_cap_leaves_under_cap_filings_untouched(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """A filing shorter than the cap is passed through verbatim — no
+    marker, no cut."""
+    raw_text = "8-K Item 1.01 — Material Definitive Agreement\n" * 100
+    assert len(raw_text) < 60_000
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = _cap_analyzer(
+        db=db, builder=builder, opus=_FakeOpusReviewer(), client=client, cap=60_000
+    )
+
+    await analyzer.analyze(filing, raw_text=raw_text, ctx=ctx)
+
+    assert builder.calls[0]["raw_text"] == raw_text
+    assert "TRUNCATED" not in builder.calls[0]["raw_text"].upper()
+
+
+@pytest.mark.asyncio
+async def test_input_cap_does_not_touch_memory_block(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """The cap applies to raw_text ONLY. The memory block is assembled
+    separately and appended by the prompt builder AFTER the filing body,
+    so a cap can never amputate doctrine or the prompt scaffold."""
+
+    class _Assembler:
+        def assemble(self, query: Any) -> str:
+            return "# Memory\n" + ("m" * 5_000)
+
+    from analyzer.sonnet import SonnetAnalyzer, truncation_marker
+    from proposal.store import ProposalStore
+
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=ProposalStore(db_path=db),
+        prompt_builder=builder,
+        opus_reviewer=_FakeOpusReviewer(),
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=7,
+        db_path=db,
+        max_input_chars=20_000,
+        memory_assembler=_Assembler(),  # type: ignore[arg-type]
+    )
+
+    await analyzer.analyze(filing, raw_text="z" * 100_000, ctx=ctx)
+
+    assert builder.calls[0]["memory_block"] == "# Memory\n" + ("m" * 5_000)
+    assert len(builder.calls[0]["raw_text"]) <= 20_000 + len(truncation_marker(20_000))
+
+
+@pytest.mark.asyncio
+async def test_input_cap_logs_truncation_event(
+    db: str,
+    filing: FilingRow,
+    ctx: AnalyzerContext,
+    sonnet_prompt_version: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One `agent.analyzer_input_truncated` per truncated call, carrying
+    the before/after sizes so the operator can price the lever."""
+    import logging
+
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    builder = _FakePromptBuilder(sonnet_prompt_version=sonnet_prompt_version)
+    analyzer = _cap_analyzer(
+        db=db, builder=builder, opus=_FakeOpusReviewer(), client=client, cap=20_000
+    )
+
+    with caplog.at_level(logging.INFO):
+        await analyzer.analyze(filing, raw_text="q" * 90_000, ctx=ctx)
+
+    events = [
+        r for r in caplog.records
+        if getattr(r, "event", None) == "agent.analyzer_input_truncated"
+    ]
+    assert len(events) == 1
+    assert events[0].filing_id == filing.id
+    assert events[0].original_chars == 90_000
+    assert events[0].capped_chars == 20_000
+
+
+def test_decision_id_changes_with_input_cap(sonnet_prompt_version: str) -> None:
+    """The cap changes what the model is shown, so it is part of the
+    decision's identity: a cap change re-analyzes rather than replaying a
+    proposal formed from different evidence. Cap 0 (off) must reproduce
+    the pre-feature id byte-for-byte."""
+    from analyzer.sonnet import compute_decision_id
+
+    def _id(cap: int) -> str:
+        return compute_decision_id(
+            filing_id=42,
+            model_id="claude-sonnet-4-6",
+            prompt_version=sonnet_prompt_version,
+            input_cap=cap,
+        )
+
+    # Off == the pre-feature source string.
+    legacy = hashlib.sha256(
+        f"42|claude-sonnet-4-6|{sonnet_prompt_version}".encode()
+    ).hexdigest()[:32]
+    assert _id(0) == legacy
+    assert compute_decision_id(
+        filing_id=42,
+        model_id="claude-sonnet-4-6",
+        prompt_version=sonnet_prompt_version,
+    ) == legacy
+
+    # Stable for the same cap, distinct across caps.
+    assert _id(60_000) == _id(60_000)
+    assert len({_id(0), _id(20_000), _id(60_000)}) == 3
+
+
+@pytest.mark.asyncio
+async def test_input_cap_decision_id_matches_loop_mirror(
+    db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str
+) -> None:
+    """CRITICAL — crash recovery. `AgentLoop._compose_decision_id` mirrors
+    the analyzer's derivation to find the persisted proposal after a
+    restart. It has no raw_text, so it reads the cap off the analyzer
+    instance; if the two ever disagreed the loop would look up an id that
+    was never written and silently re-analyze (double spend) or lose the
+    proposal. This pins them together with the cap ON."""
+    from types import SimpleNamespace
+
+    from analyzer.sonnet import SonnetAnalyzer
+    from app.loop import AgentLoop
+    from prompts.loader import ACTIVE_SONNET_ANALYSIS_PROMPT, PromptBuilder
+    from proposal.store import ProposalStore
+
+    client = _FakeAnthropicClient(db_path=db, responses=[json.dumps(_valid_no_trade_payload())])
+    # The REAL builder: the mirror resolves ACTIVE_SONNET_ANALYSIS_PROMPT,
+    # so a stub that only knows one prompt name would not exercise it.
+    real_builder = PromptBuilder(Path("src/prompts"))
+    real_pv = real_builder.prompt_version(ACTIVE_SONNET_ANALYSIS_PROMPT)
+    insert_prompt(
+        db,
+        PromptRow(
+            prompt_version=real_pv,
+            name=ACTIVE_SONNET_ANALYSIS_PROMPT,
+            file_path=f"src/prompts/{ACTIVE_SONNET_ANALYSIS_PROMPT}.txt",
+            content_hash=real_pv.split("@")[1].ljust(64, "0"),
+        ),
+    )
+    analyzer = SonnetAnalyzer(
+        client=client,
+        store=ProposalStore(db_path=db),
+        prompt_builder=real_builder,
+        opus_reviewer=_FakeOpusReviewer(),
+        sonnet_model_id="claude-sonnet-4-6",
+        opus_review_conviction_threshold=7,
+        db_path=db,
+        max_input_chars=60_000,
+    )
+
+    await analyzer.analyze(filing, raw_text="w" * 200_000, ctx=ctx)
+    actual = client.calls[0]["decision_id"]
+
+    mirror = AgentLoop._compose_decision_id(
+        SimpleNamespace(_components=SimpleNamespace(analyzer=analyzer)),  # type: ignore[arg-type]
+        filing,
+    )
+    assert mirror == actual
+
+
+@pytest.mark.asyncio
+async def test_input_cap_never_touches_system_blocks_real_builder(
+    db: str, filing: FilingRow, ctx: AnalyzerContext
+) -> None:
+    """Spec item 5, against the REAL PromptBuilder: the cap is scoped to
+    raw_text. The cached system blocks (prompt scaffold + schemas) and the
+    memory section appended after the filing body must survive intact — a
+    cap that reached them would silently drop doctrine or the response
+    schema and roll the prompt-version hash."""
+    from analyzer.sonnet import SonnetAnalyzer, truncation_marker
+    from prompts.loader import PromptBuilder
+    from proposal.store import ProposalStore
+
+    memory = "# Memory\n" + ("m" * 4_000)
+
+    class _Assembler:
+        def assemble(self, query: Any) -> str:
+            return memory
+
+    real_builder = PromptBuilder(Path("src/prompts"))
+
+    def _build(cap: int, text: str) -> ApiRequest:
+        return real_builder.build_sonnet_filing_analysis(
+            filing,
+            SonnetAnalyzer(
+                client=_FakeAnthropicClient(db_path=db),
+                store=ProposalStore(db_path=db),
+                prompt_builder=real_builder,
+                opus_reviewer=_FakeOpusReviewer(),
+                sonnet_model_id="claude-sonnet-4-6",
+                opus_review_conviction_threshold=7,
+                db_path=db,
+                max_input_chars=cap,
+                memory_assembler=_Assembler(),  # type: ignore[arg-type]
+            )._apply_input_cap(filing, text),
+            ctx,
+            memory_block=memory,
+        )
+
+    uncapped = _build(0, "body\n" * 40_000)
+    capped = _build(20_000, "body\n" * 40_000)
+
+    # Cacheable prefix is byte-identical — the cap cannot roll it.
+    assert [b.text for b in capped.system] == [b.text for b in uncapped.system]
+    assert capped.prompt_version == uncapped.prompt_version
+
+    block3 = capped.messages[-1].content[-1].text
+    # Memory survives in full, after the truncated body.
+    assert memory in block3
+    assert block3.index(truncation_marker(20_000)) < block3.index(memory)
+    # The filing header scaffold is intact.
+    assert f"accession_number: {filing.accession_number}" in block3
+    assert len(block3) < len(uncapped.messages[-1].content[-1].text)

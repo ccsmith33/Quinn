@@ -315,6 +315,11 @@ def compose_agent(
         # With `opus_review_full_book_gate = false` this returns the
         # configured threshold verbatim.
         review_threshold_fn=lambda: _review_threshold(config, broker, journal.db_path),
+        # COST LEVER — filing-body ceiling. 0 (default) = off. The value
+        # is part of the decision_id, so changing it re-analyzes rather
+        # than replaying a proposal formed from different evidence;
+        # `AgentLoop._compose_decision_id` reads it back off this instance.
+        max_input_chars=config.analyzer.analyzer_max_input_chars,
     )
 
     # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.

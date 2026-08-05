@@ -1889,7 +1889,9 @@ class AgentLoop:
         can look up the persisted proposal after analyze() returns.
         The prompt name MUST be the constant the builder resolves for
         the analyzer (ACTIVE_SONNET_ANALYSIS_PROMPT) — a diverging
-        literal here silently mismatches decision ids."""
+        literal here silently mismatches decision ids. Same for the input
+        cap: it is read off the analyzer instance rather than re-read from
+        config so the two derivations cannot drift under a SIGHUP."""
         from analyzer.sonnet import compute_decision_id
         from prompts.loader import ACTIVE_SONNET_ANALYSIS_PROMPT
 
@@ -1901,6 +1903,7 @@ class AgentLoop:
             filing_id=filing.id,
             model_id=sonnet_model_id,
             prompt_version=prompt_version,
+            input_cap=self._components.analyzer._max_input_chars,  # noqa: SLF001
         )
 
     def _lookup_existing_proposal(

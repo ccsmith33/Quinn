@@ -70,6 +70,32 @@ class AnalyzerConfig(_Section):
     # the moment a slot frees or cash returns. Default false =
     # byte-identical to pre-feature.
     opus_review_full_book_gate: bool = Field(default=False)
+    # COST LEVER — hard ceiling on the filing text handed to the analyzer.
+    # Prod journal (3d, 650 calls): 72.3% of all input tokens sat beyond the
+    # first 15k characters of each filing, and every conviction>=5 proposal
+    # came from a filing in the 7.4-31k band. An 8-K leads with its Item
+    # sections (the catalyst) and trails the exhibit stack (press-release
+    # duplicates, financial statements), so the dropped tail is the part
+    # that has never produced signal. 0 (default) = off, byte-identical to
+    # pre-feature. See `_check_input_cap_floor` for why small caps are
+    # rejected rather than clamped.
+    analyzer_max_input_chars: int = Field(default=0)
+
+    @model_validator(mode="after")
+    def _check_input_cap_floor(self) -> AnalyzerConfig:
+        """0 disables the cap; any other value must clear 20_000 chars
+        (~5k tokens). Below that the cut lands inside the Item sections —
+        the catalyst itself — not the exhibit tail, so the analyzer would
+        be reasoning about an amputated filing. A typo'd cap is an
+        operator error and is rejected at load time rather than silently
+        blinding the analyzer in prod."""
+        v = self.analyzer_max_input_chars
+        if v != 0 and v < 20_000:
+            raise ValueError(
+                "analyzer_max_input_chars must be 0 (disabled) or >= 20000; "
+                f"got {v}"
+            )
+        return self
 
 
 class Ks5Tier(_Section):

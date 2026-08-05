@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from config.loader import (
+    AnalyzerConfig,
     AppConfig,
     ConfigError,
     EventReviewsConfig,
@@ -523,3 +524,50 @@ def test_watchlist_rejects_out_of_range(field: str, bad: object) -> None:
 def test_watchlist_accepts_bounds(field: str, good: object) -> None:
     cfg = ExecutionConfig(**_execution_kwargs(**{field: good}))
     assert getattr(cfg, field) == good
+
+
+# ---------------------------------------------------------------------------
+# COST LEVER — [analyzer] analyzer_max_input_chars.
+# ---------------------------------------------------------------------------
+
+def _analyzer_kwargs(**overrides: object) -> dict[str, object]:
+    """Minimal valid AnalyzerConfig kwargs; overridable per-test."""
+    base: dict[str, object] = {
+        "sonnet_model_id": "claude-sonnet-4-6",
+        "opus_model_id": "claude-opus-4-7",
+        "opus_review_conviction_threshold": 5,
+        "sonnet_max_output_tokens": 4096,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_analyzer_max_input_chars_defaults_off() -> None:
+    """Default 0 = feature off, byte-identical to pre-feature."""
+    cfg = AnalyzerConfig(**_analyzer_kwargs())
+    assert cfg.analyzer_max_input_chars == 0
+
+
+@pytest.mark.parametrize("bad", [1, 100, 19_999, -1])
+def test_analyzer_max_input_chars_rejects_below_floor(bad: int) -> None:
+    """A cap under 20_000 chars (~5k tokens) would amputate real 8-K Item
+    bodies, not just the exhibit tail. Rejected at load time."""
+    with pytest.raises(ValidationError):
+        AnalyzerConfig(**_analyzer_kwargs(analyzer_max_input_chars=bad))
+
+
+@pytest.mark.parametrize("good", [0, 20_000, 60_000, 400_000])
+def test_analyzer_max_input_chars_accepts_zero_and_floor(good: int) -> None:
+    cfg = AnalyzerConfig(**_analyzer_kwargs(analyzer_max_input_chars=good))
+    assert cfg.analyzer_max_input_chars == good
+
+
+def test_analyzer_max_input_chars_rejected_from_toml(tmp_path: Path) -> None:
+    """The floor is enforced through the real load path, not just the model."""
+    bad = EXAMPLE_TOML.read_text(encoding="utf-8").replace(
+        "[analyzer]", "[analyzer]\nanalyzer_max_input_chars = 5000"
+    )
+    p = tmp_path / "bad.toml"
+    p.write_text(bad, encoding="utf-8")
+    with pytest.raises(ConfigError):
+        load_config(str(p))

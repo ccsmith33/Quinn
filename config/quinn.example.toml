@@ -33,6 +33,18 @@ opus_model_id = "claude-opus-4-7"
 opus_review_conviction_threshold = 5
 sonnet_max_output_tokens = 4096
 opus_max_output_tokens = 4096
+# COST LEVER — hard ceiling on the filing text handed to the analyzer, in
+# characters (~4 chars/token). Prod journal (3d, 650 calls): 72.3% of all
+# input tokens sat beyond the first 15k characters of each filing, while
+# every conviction>=5 proposal came from a filing in the 7.4-31k band. An
+# 8-K leads with its Item sections (the catalyst) and trails the exhibit
+# stack (press-release duplicates, financial statements), so the dropped
+# tail is the part that has never produced signal. The model is told what
+# was removed and asked to flag it if the exhibits look material.
+# 0 = off. Any other value must be >= 20000 (a lower cap would cut into
+# the Item sections themselves) — rejected at load otherwise. This value
+# is part of the decision_id: changing it re-analyzes.
+analyzer_max_input_chars = 0
 # COST LEVER — drop a prefiltered filing before the analyzer call when its
 # issuer is outside the universe snapshot or priced under
 # execution.price_floor_usd. Fails OPEN (analyzes anyway) on an unresolved

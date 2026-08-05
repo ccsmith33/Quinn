@@ -53,6 +53,13 @@ log = get_logger(__name__)
 
 _DECISION_ID_HEX_LEN = 32
 
+# COST LEVER — input cap. A clean cut at the last newline before the cap
+# must still retain at least this fraction of the budget; below it we take
+# the hard boundary instead. Without the floor a filing whose only early
+# newline sits near the top (HTML stripped to one long line) would collapse
+# to a handful of characters and the analyzer would reason about nothing.
+_CLEAN_CUT_MIN_RETENTION = 0.9
+
 
 # ---------------------------------------------------------------------------
 # Ports (boundaries to S5.1 / S5.2 / S5.4 / S5.5)
@@ -132,6 +139,7 @@ class SonnetAnalyzer:
         open_positions_counter: Callable[[], int] | None = None,
         memory_assembler: MemoryContextAssembler | None = None,
         review_threshold_fn: Callable[[], int] | None = None,
+        max_input_chars: int = 0,
     ) -> None:
         self._client = client
         self._store = store
@@ -166,6 +174,13 @@ class SonnetAnalyzer:
         # divergence here writes the wrong reject_reason, not a wrong
         # trade.
         self._review_threshold_fn = review_threshold_fn
+        # COST LEVER — ceiling on the filing text handed to the model.
+        # 0 (default / legacy test path) = off, byte-identical to
+        # pre-feature. Applied here rather than in the prompt builder so
+        # the cut lands before any token spend and touches raw_text only:
+        # the memory block and the prompt scaffold are assembled
+        # downstream and are never in scope of the cap.
+        self._max_input_chars = max_input_chars
 
     async def analyze(
         self,
@@ -173,6 +188,7 @@ class SonnetAnalyzer:
         raw_text: str,
         ctx: AnalyzerContext,
     ) -> AnalyzerResult:
+        raw_text = self._apply_input_cap(filing, raw_text)
         memory_block = self._assemble_memory(filing)
         request = self._builder.build_sonnet_filing_analysis(
             filing, raw_text, ctx, memory_block=memory_block
@@ -182,6 +198,7 @@ class SonnetAnalyzer:
             filing_id=filing.id,
             model_id=self._sonnet_model_id,
             prompt_version=prompt_version,
+            input_cap=self._max_input_chars,
         )
 
         raw = await self._client.call(
@@ -339,6 +356,35 @@ class SonnetAnalyzer:
             )
             return self._threshold
 
+    def _apply_input_cap(self, filing: FilingRow, raw_text: str) -> str:
+        """Trim the filing body to the configured character ceiling.
+
+        An 8-K leads with its Item sections — the catalyst — and trails the
+        exhibit stack (press-release duplicates, financial statements), so
+        the tail this drops is the part that has never produced a
+        conviction. The rebalance is deliberate: the model is told what was
+        removed and asked to flag it if the visible content suggests the
+        exhibits mattered.
+        """
+        cap = self._max_input_chars
+        if not cap or len(raw_text) <= cap:
+            return raw_text
+
+        cut = cap
+        nl = raw_text.rfind("\n", 0, cap + 1)
+        if nl >= cap * _CLEAN_CUT_MIN_RETENTION:
+            cut = nl
+        log.info(
+            "agent.analyzer_input_truncated",
+            extra={
+                "event": "agent.analyzer_input_truncated",
+                "filing_id": filing.id,
+                "original_chars": len(raw_text),
+                "capped_chars": cut,
+            },
+        )
+        return raw_text[:cut] + truncation_marker(cap)
+
     def _assemble_memory(self, filing: FilingRow) -> str | None:
         """Build the memory block for this filing analysis, or None when the
         memory layer is disabled / contributes nothing. Provider failures
@@ -378,12 +424,47 @@ class SonnetAnalyzer:
 # Pure helpers (testable in isolation)
 # ---------------------------------------------------------------------------
 
-def compute_decision_id(*, filing_id: int | None, model_id: str, prompt_version: str) -> str:
-    """AC-9: deterministic decision_id from (filing.id, model_id, prompt_version)."""
+def compute_decision_id(
+    *,
+    filing_id: int | None,
+    model_id: str,
+    prompt_version: str,
+    input_cap: int = 0,
+) -> str:
+    """AC-9: deterministic decision_id from (filing.id, model_id, prompt_version)
+    plus, when the input cap is on, the cap itself.
+
+    COST LEVER — why the cap is part of the decision's identity: the cap
+    changes what the model is actually shown, so two analyses under
+    different caps are decisions made on different evidence. Folding it in
+    means changing the cap re-analyzes rather than replaying a proposal
+    formed from a filing the operator has since decided to truncate
+    differently. It cannot be derived from the truncated *text* instead:
+    `AgentLoop._compose_decision_id` mirrors this derivation without
+    holding raw_text, and a source string it cannot reproduce would break
+    crash-recovery lookup of the persisted proposal.
+
+    `input_cap=0` (feature off) reproduces the pre-feature source string
+    byte-for-byte, so ids already in the journal keep resolving.
+    """
     if filing_id is None:
         raise ValueError("filing.id is required to compute decision_id")
     src = f"{filing_id}|{model_id}|{prompt_version}"
+    if input_cap:
+        src = f"{src}|cap={input_cap}"
     return hashlib.sha256(src.encode("utf-8")).hexdigest()[:_DECISION_ID_HEX_LEN]
+
+
+def truncation_marker(cap: int) -> str:
+    """The fixed note appended to a truncated filing body. Tells the model
+    what was dropped and gives it a way to signal that the drop mattered."""
+    return (
+        f"\n\n[NOTE: Filing truncated at {cap} characters for analysis. "
+        "Item sections lead 8-K filings; omitted content is exhibit material "
+        "(full press-release text, financial statements). If the visible "
+        "content suggests the omitted exhibits are material to conviction, "
+        "say so in your rationale.]"
+    )
 
 
 def _parse_and_validate(raw: str) -> AnalyzerResult:
@@ -474,4 +555,5 @@ __all__ = [
     "SonnetAnalyzer",
     "augment_request_for_retry",
     "compute_decision_id",
+    "truncation_marker",
 ]
