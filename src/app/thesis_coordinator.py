@@ -1662,7 +1662,7 @@ class ThesisReviewCoordinator:
         target = self._capacity_target_slots
         if target <= 0 or self._execution_config is None:
             return None
-        from execution.sizing import ks5_effective_cap
+        from execution.review_gate import slot_usage
 
         # Broker truth is the source for "what is open". Any snapshot
         # failure just skips the block this tick — the review still runs,
@@ -1683,11 +1683,11 @@ class ThesisReviewCoordinator:
         # Pending entry BUYs consume capacity the same way sizing counts
         # them (incident 2026-05-07: pre-market entries queue unfilled and
         # don't show in get_positions()). Absent on pre-WS1 adapters/stubs.
-        pending_symbols: set[str] = set()
+        pending_entries: list[Any] = []
         get_open_orders = getattr(self._broker, "get_open_orders", None)
         if get_open_orders is not None:
             try:
-                pending_symbols = {o.symbol for o in get_open_orders() if o.is_entry}
+                pending_entries = [o for o in get_open_orders() if o.is_entry]
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "event_reviews.pending_orders_failed",
@@ -1696,20 +1696,27 @@ class ThesisReviewCoordinator:
                         "error": str(e),
                     },
                 )
-                pending_symbols = set()
+                pending_entries = []
 
         # Slot accounting mirrors SizingEngine.size's KS-5 gate (sizing.py):
         # used slots = unique symbols across held ∪ pending-entry BUYs, cap =
-        # ks5_effective_cap. F4: the two sites read from INDEPENDENTLY
-        # assembled inputs and agree today only because long-only makes
-        # `qty != 0` ≡ `qty > 0` (sizing filters neither sign). If short
-        # support is ever added, the held-symbol derivation must be
-        # reconciled in BOTH places or the counts silently diverge.
-        held_symbols = {p.symbol for p in positions}
-        pending_only = pending_symbols - held_symbols
-        cap = ks5_effective_cap(account.equity, self._execution_config)
-        used = len(held_symbols | pending_symbols)
-        open_slots = cap - used
+        # ks5_effective_cap. F4: this site and the Opus-review cost gate now
+        # share `execution.review_gate.slot_usage` so they cannot drift;
+        # sizing still computes it inline as the authoritative pre-trade
+        # gate, and agrees because long-only makes `qty != 0` ≡ `qty > 0`
+        # (sizing filters neither sign). If short support is ever added, the
+        # held-symbol derivation must be reconciled in BOTH places or the
+        # counts silently diverge.
+        usage = slot_usage(
+            equity=account.equity,
+            positions=positions,
+            pending_entries=pending_entries,
+            cfg=self._execution_config,
+        )
+        held_symbols = usage.held_symbols
+        pending_only = usage.pending_only
+        cap = usage.cap
+        open_slots = usage.open_slots
 
         # F5: a configured target above the effective cap can never be
         # satisfied (open_slots maxes out at cap), so clamp it — otherwise

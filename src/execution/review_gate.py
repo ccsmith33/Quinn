@@ -28,7 +28,7 @@ already committed, less the reserve floor.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,6 +46,61 @@ log = get_logger(__name__)
 # the two features independently reversible, which matters more than the
 # marginal saving on cv8-10 proposals (a small fraction of the volume).
 NO_DISPLACEMENT_FLOOR = 8
+
+
+@dataclass(frozen=True)
+class SlotUsage:
+    """KS-5 slot accounting for one decision.
+
+    The single definition of "how full is the book", shared by the
+    Opus-review gate and the thesis coordinator's capacity-pressure
+    sweep. `SizingEngine.size` performs the same computation inline as
+    the authoritative pre-trade gate; the two agree because both count
+    UNIQUE symbols across held ∪ pending-entry BUYs against
+    `ks5_effective_cap`. (Carry-forward of the F4 note in
+    `thesis_coordinator`: before this type the two read sites assembled
+    their inputs independently and agreed only by construction.)
+    """
+
+    cap: int
+    held_symbols: frozenset[str]
+    pending_symbols: frozenset[str]
+
+    @property
+    def used(self) -> int:
+        return len(self.held_symbols | self.pending_symbols)
+
+    @property
+    def open_slots(self) -> int:
+        return self.cap - self.used
+
+    @property
+    def pending_only(self) -> frozenset[str]:
+        """Pending entries on names not already held — the count that is
+        meaningful to an operator reading a capacity log line."""
+        return self.pending_symbols - self.held_symbols
+
+
+def slot_usage(
+    *,
+    equity: float,
+    positions: Iterable[Any],
+    pending_entries: Iterable[Any],
+    cfg: ExecutionConfig,
+) -> SlotUsage:
+    """Pure slot math. Callers own their own broker I/O and error
+    handling; only the accounting lives here.
+
+    `positions` must already be filtered to live holdings (`qty != 0`)
+    and `pending_entries` to entry BUYs — the two call sites have
+    different failure semantics for those reads, so the filtering stays
+    with the fetch.
+    """
+    return SlotUsage(
+        cap=ks5_effective_cap(equity, cfg),
+        held_symbols=frozenset(p.symbol for p in positions),
+        pending_symbols=frozenset(o.symbol for o in pending_entries),
+    )
 
 
 @dataclass(frozen=True)
@@ -123,10 +178,12 @@ def compute_book_pressure(
             )
             pending_entries = []
 
-    held_symbols = {p.symbol for p in positions}
-    pending_symbols = {o.symbol for o in pending_entries}
-    cap = ks5_effective_cap(account.equity, cfg)
-    open_slots = cap - len(held_symbols | pending_symbols)
+    usage = slot_usage(
+        equity=account.equity,
+        positions=positions,
+        pending_entries=pending_entries,
+        cfg=cfg,
+    )
 
     try:
         committed = float(pending_entry_spend_fn(pending_entries))
@@ -142,7 +199,7 @@ def compute_book_pressure(
 
     reserve_floor = cfg.ks7_cash_reserve_pct * account.equity
     return BookPressure(
-        open_slots=open_slots,
+        open_slots=usage.open_slots,
         cash_headroom=account.cash - committed - reserve_floor,
     )
 
@@ -227,7 +284,9 @@ __all__ = [
     "NO_DISPLACEMENT_FLOOR",
     "BookPressure",
     "compute_book_pressure",
+    "SlotUsage",
     "displacement_viable_conviction",
     "effective_opus_review_threshold",
     "resolve_review_threshold",
+    "slot_usage",
 ]

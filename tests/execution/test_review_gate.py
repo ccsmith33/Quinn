@@ -19,6 +19,7 @@ from execution.review_gate import (
     compute_book_pressure,
     displacement_viable_conviction,
     effective_opus_review_threshold,
+    slot_usage,
 )
 
 
@@ -126,6 +127,61 @@ def test_young_victim_disabled_zero_does_not_lower_the_bar() -> None:
         displacement_young_victim_min_conviction=0,
     )
     assert displacement_viable_conviction(cfg) == 8
+
+
+# ---------------------------------------------------------------------------
+# slot_usage — the shared KS-5 accounting
+# ---------------------------------------------------------------------------
+
+def test_slot_usage_counts_unique_symbols_across_held_and_pending() -> None:
+    """A pending entry on a name already held consumes ONE slot, not two —
+    the property that makes this agree with SizingEngine's KS-5 gate."""
+    broker = _FakeBroker(symbols=["A", "B"], pending=["B", "C"])
+    usage = slot_usage(
+        equity=10_000.0,
+        positions=broker.get_positions(),
+        pending_entries=broker.get_open_orders(),
+        cfg=_cfg(ks5_max_concurrent=10),
+    )
+    assert usage.used == 3
+    assert usage.open_slots == 7
+    assert usage.pending_only == frozenset({"C"})
+
+
+def test_slot_usage_uses_the_tiered_cap_not_the_ceiling() -> None:
+    usage = slot_usage(
+        equity=10_000.0,
+        positions=[],
+        pending_entries=[],
+        cfg=_cfg(
+            ks5_max_concurrent=10,
+            ks5_tiers=[Ks5Tier(equity_max=15_000.0, max_positions=4)],
+        ),
+    )
+    assert usage.cap == 4
+    assert usage.open_slots == 4
+
+
+def test_thesis_capacity_sweep_and_review_gate_agree() -> None:
+    """Both features read the book through this one helper — pin that the
+    numbers the capacity sweep reports are the numbers the cost gate acts
+    on, for the same broker state."""
+    cfg = _cfg(
+        ks5_max_concurrent=10,
+        ks5_tiers=[Ks5Tier(equity_max=15_000.0, max_positions=3)],
+    )
+    broker = _FakeBroker(equity=10_000.0, symbols=["A", "B"], pending=["C"])
+    usage = slot_usage(
+        equity=10_000.0,
+        positions=broker.get_positions(),
+        pending_entries=broker.get_open_orders(),
+        cfg=cfg,
+    )
+    pressure = compute_book_pressure(
+        broker=broker, cfg=cfg, pending_entry_spend_fn=_no_spend
+    )
+    assert pressure is not None
+    assert pressure.open_slots == usage.open_slots == 0
 
 
 # ---------------------------------------------------------------------------
