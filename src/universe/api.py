@@ -74,6 +74,18 @@ class Universe:
     def is_in_universe(self, ticker: str) -> bool:
         return ticker in self._tickers
 
+    def member_count(self) -> int:
+        """Number of members in the loaded snapshot.
+
+        Zero is the in-process shape of "no usable snapshot": `load_latest`
+        raises when the snapshot row is absent, but a snapshot whose
+        `universe_members` rows failed to load leaves a Universe that
+        answers "not a member" to every ticker. Callers that gate on
+        membership use this to fail open rather than treat an empty
+        snapshot as a universe-wide rejection (carry-forward D-038).
+        """
+        return len(self._tickers)
+
     def is_in_universe_by_cik(self, cik: int) -> bool:
         return cik in self._ciks
 

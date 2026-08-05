@@ -28,6 +28,13 @@ from config.calendar import ET, is_market_open_day
 #   - ks5_concurrent_limit  — book full (SizingEngine, KS-5)
 #   - ks7_cash_reserve      — cash-reserve floor (SizingEngine, KS-7)
 #   - insufficient_capital  — buying-power check (validator step 6)
+#   - review_skipped_full_book — the Opus-review cost gate declined to pay
+#     for review because the book was full AND cash was at the KS-7 floor
+#     (`execution.review_gate`). Capital-class by construction: the ONLY
+#     thing standing between this proposal and a normal entry is capital,
+#     and the watchlist is how it gets its second chance. Without this
+#     entry the gate would silently discard proposals that today reach
+#     the queue via `ks5_concurrent_limit`.
 # NOT included: opus_reject / kill_switch / universe / price_floor /
 # exit_geometry / schema (not capital), ks6_already_held (we never
 # pyramid), conviction_too_low (won't change), and
@@ -38,6 +45,7 @@ CAPITAL_REJECT_REASONS = frozenset(
         "ks5_concurrent_limit",
         "ks7_cash_reserve",
         "insufficient_capital",
+        "review_skipped_full_book",
     }
 )
 

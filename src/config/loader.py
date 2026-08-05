@@ -51,6 +51,25 @@ class AnalyzerConfig(_Section):
     # Sonnet and Opus must pull from typed config to honour the
     # per-call cost ceiling. See D-052.
     opus_max_output_tokens: int = Field(default=4096, gt=0)
+    # COST LEVER — deterministic pre-analysis buyability gate. When on, a
+    # prefiltered filing whose issuer is outside the current universe
+    # snapshot, or whose snapshot price sits under
+    # `execution.price_floor_usd`, is dropped BEFORE the analyzer call:
+    # no tokens, no proposal row. Both checks re-state what the execution
+    # validator already enforces, so nothing that would have traded is
+    # lost. Fails OPEN on an unresolved ticker or an empty snapshot — the
+    # gate can never silence the analyzer wholesale. Default false =
+    # byte-identical to pre-feature.
+    analyzer_unbuyable_gate: bool = Field(default=False)
+    # COST LEVER — full-book Opus-review gate. When on AND the book is at
+    # its effective KS-5 cap AND KS-7 headroom cannot fund one cheapest-
+    # legal share, the review bar rises to the lowest displacement-viable
+    # conviction; proposals under the raised bar skip Opus and are
+    # journaled `review_skipped_full_book` (still watchlist-eligible).
+    # Evaluated per proposal from broker truth, so it reverts on its own
+    # the moment a slot frees or cash returns. Default false =
+    # byte-identical to pre-feature.
+    opus_review_full_book_gate: bool = Field(default=False)
 
 
 class Ks5Tier(_Section):

@@ -37,6 +37,7 @@ from typing import Any
 from broker.alpaca import BrokerUnavailable
 from broker.protocol import BrokerRejected, OpenOrder
 from execution.orders import AcceptedProposal, SubmissionAccepted, SubmissionFailed
+from execution.review_gate import resolve_review_threshold
 from execution.sizing import SizingAccepted, SizingRejected
 from execution.validator import Accepted, Rejected
 from journal.models import ExecutionRow, FilingRow
@@ -69,6 +70,12 @@ _RECOVERY_SCAN_MAX_FILINGS = 500
 # adopted. Everything else (accepted/new/pending_*/partially_filled/
 # filled/replaced/held/...) is live or executed and is adopted as before.
 _TERMINAL_DEAD_ORDER_STATUSES = frozenset({"rejected", "canceled", "expired"})
+
+# Price floor the cost levers assume when no `[execution]` section is
+# wired (legacy/stub configs in unit tests). Matches both the validator's
+# own default and the universe snapshot's prev-close screen, so the three
+# never disagree on what "too cheap to trade" means.
+_PRICE_FLOOR_FALLBACK = 5.00
 
 
 class AgentLoop:
@@ -103,6 +110,13 @@ class AgentLoop:
         # one entry per ET day per row; process-local, so a restart may
         # re-log once — accepted, the alternative is a schema column).
         self._watchlist_retry_log_dates: dict[int, dt.date] = {}
+        # COST LEVER — how many times the pre-analysis buyability gate
+        # fell back to "analyze anyway" this process. A gate that fails
+        # open on everything is free but useless; a gate that never fails
+        # open on a box with a broken ticker resolver would be silently
+        # over-skipping. The counter rides every fail-open log line so
+        # either shape is visible without a new metrics surface.
+        self._analyzer_gate_fail_opens: int = 0
 
     # -- Public surface ----------------------------------------------------
 
@@ -541,6 +555,12 @@ class AgentLoop:
             await self._maybe_execute_existing(existing_pid)
             return
 
+        # COST LEVER — deterministic buyability gate (default OFF). Sits
+        # after the idempotency short-circuit so replay/recovery keeps its
+        # exact semantics, and before the only LLM call on this path.
+        if self._skip_unbuyable(filing):
+            return
+
         raw_text = self._read_raw(filing)
         await self._components.analyzer.analyze(filing, raw_text, ctx)
 
@@ -685,19 +705,46 @@ class AgentLoop:
             review is None
             and threshold is not None
             and proposal_row.conviction is not None
-            and proposal_row.conviction >= threshold
         ):
-            log.info(
-                "agent.execution_pending_capacity",
-                extra={
-                    "event": "agent.execution_pending_capacity",
-                    "proposal_id": proposal_id,
-                    "conviction": proposal_row.conviction,
-                    "threshold": threshold,
-                },
-            )
-            self._write_rejected_execution(proposal_id, "pending_capacity")
-            return
+            # COST LEVER — the full-book gate may have raised the bar past
+            # this proposal, in which case the missing review is a
+            # deliberate, TERMINAL skip rather than a deferral. Recomputed
+            # here from the same helper the analyzer used; with the gate
+            # off `effective == threshold` and the `elif` is unreachable,
+            # so this block is byte-identical to pre-feature behavior.
+            effective = self._effective_opus_review_threshold(threshold)
+            if proposal_row.conviction >= effective:
+                log.info(
+                    "agent.execution_pending_capacity",
+                    extra={
+                        "event": "agent.execution_pending_capacity",
+                        "proposal_id": proposal_id,
+                        "conviction": proposal_row.conviction,
+                        "threshold": effective,
+                    },
+                )
+                self._write_rejected_execution(proposal_id, "pending_capacity")
+                return
+            if proposal_row.conviction >= threshold:
+                log.info(
+                    "agent.execution_review_skipped_full_book",
+                    extra={
+                        "event": "agent.execution_review_skipped_full_book",
+                        "proposal_id": proposal_id,
+                        "conviction": proposal_row.conviction,
+                        "configured_threshold": threshold,
+                        "effective_threshold": effective,
+                    },
+                )
+                self._write_rejected_execution(
+                    proposal_id, "review_skipped_full_book"
+                )
+                # The watchlist is how these get their second chance —
+                # `review_skipped_full_book` is a capital-class reason, so
+                # an eligible proposal parks here exactly as a
+                # `ks5_concurrent_limit` reject would have.
+                self._enroll_review_skipped(proposal_id, proposal_row)
+                return
 
         # Run the validator → sizer → submitter chain. Day-0 semantics:
         # the chain journals reject rows and (feature: watchlist) enrolls
@@ -1014,9 +1061,12 @@ class AgentLoop:
         """WATCHLIST enrollment — park an approved, capital-blocked,
         high-conviction proposal for a bounded deferred retry.
 
-        Called ONLY from the day-0 reject paths of `_run_entry_chain`,
-        which sits after the Opus-reject and pending_capacity guards —
-        so every candidate here is an approved proposal. The reason
+        Called from the day-0 reject paths of `_run_entry_chain`, which
+        sits after the Opus-reject and pending_capacity guards — so those
+        candidates are approved proposals — and from `_execute`'s
+        `review_skipped_full_book` branch, where review was deliberately
+        deferred and `_review_deferred_entry` pays for it at retry time
+        before anything reaches the broker. The reason
         filter narrows to the CAPITAL class only
         (`app.watchlist.CAPITAL_REJECT_REASONS`): validator rejects
         other than `insufficient_capital`, Opus rejects and kill-switch
@@ -1298,10 +1348,15 @@ class AgentLoop:
     async def _attempt_watchlist_entry(self, row: Any) -> str | None:
         """Retry a parked proposal through the NORMAL execution chain.
 
-        DETERMINISTIC — no LLM calls anywhere on this path: the Opus
-        review already happened on day 0 (enrollment only ever follows
-        an approved proposal), and the chain is validator + sizer +
-        submitter only. The validator IS re-run — it is pure, cheap
+        The chain itself is validator + sizer + submitter only — no LLM.
+        The ONE exception is a proposal enrolled with
+        `review_skipped_full_book`: the Opus-review cost gate deliberately
+        did not pay for review on day 0 because a full book with no cash
+        made the trade impossible. Capital has since freed (that is why
+        this retry is running), so the review is now due and is paid for
+        HERE, before anything reaches the broker — FR-17 holds on every
+        path. Every other enrolled row was reviewed on day 0 (or never
+        needed review) and stays LLM-free. The validator IS re-run — it is pure, cheap
         (one quote + one account snapshot, zero LLM) and deterministic —
         so kill-switch, universe, price-floor and exit-geometry are all
         re-checked at retry-time prices; the sizer re-runs every
@@ -1346,6 +1401,10 @@ class AgentLoop:
         if existing is not None:
             return "already_executed"
         review = get_proposal_review_by_proposal_id(db, row.proposal_id)
+        if review is None:
+            review, blocked = await self._review_deferred_entry(proposal_row)
+            if blocked is not None:
+                return blocked
         if review is not None and review.decision in ("reject", "malformed"):
             return "opus_reject"  # defensive; enrollment never follows these
         return await self._run_entry_chain(
@@ -1368,6 +1427,118 @@ class AgentLoop:
             return int(self._config.analyzer.opus_review_conviction_threshold)
         except (AttributeError, TypeError, ValueError):
             return None
+
+    def _effective_opus_review_threshold(self, configured: int) -> int:
+        """COST LEVER — the review bar for THIS decision, gate included.
+
+        Delegates to the same `resolve_review_threshold` seam the analyzer
+        was wired with at composition, so the two cannot drift apart. With
+        the gate off it returns `configured` unchanged.
+        """
+        return resolve_review_threshold(
+            config=self._config,
+            broker=self._components.broker,
+            pending_entry_spend_fn=lambda orders: _pending_entry_spend(
+                self._components.journal.db_path, orders
+            ),
+            price_floor_fallback=_PRICE_FLOOR_FALLBACK,
+        )
+
+    async def _review_deferred_entry(
+        self, proposal_row: Any
+    ) -> tuple[Any, str | None]:
+        """Pay for the Opus review the full-book cost gate deferred.
+
+        Returns `(review_row, None)` when the proposal is cleared to
+        continue, or `(None, reason)` when the caller must leave the
+        watchlist row pending for another tick. `(None, None)` means no
+        review was ever due — the pre-gate path, unchanged.
+
+        This runs only for rows enrolled as `review_skipped_full_book`:
+        with the gate off, `_execute`'s guard has already written
+        `pending_capacity` for every unreviewed proposal at/above the
+        threshold, so nothing reaches here without a review.
+        """
+        threshold = self._opus_review_threshold()
+        if threshold is None or proposal_row.conviction is None:
+            return None, None
+        if proposal_row.conviction < threshold:
+            return None, None  # review was never due for this conviction
+
+        # Re-evaluate the gate: if the book is STILL locked, don't spend —
+        # leave the row pending (bounded by expiry) and try next tick.
+        if proposal_row.conviction < self._effective_opus_review_threshold(
+            threshold
+        ):
+            return None, "review_skipped_full_book"
+
+        from journal.repo import get_filing_by_id
+
+        filing = get_filing_by_id(self._components.journal.db_path, proposal_row.filing_id)
+        if filing is None:
+            return None, "filing_missing"
+
+        log.info(
+            "agent.watchlist_deferred_review",
+            extra={
+                "event": "agent.watchlist_deferred_review",
+                "proposal_id": proposal_row.id,
+                "conviction": proposal_row.conviction,
+                "threshold": threshold,
+            },
+        )
+        try:
+            await self._components.reviewer.review(
+                proposal_row, filing, self._read_raw(filing)
+            )
+        except Exception as e:  # noqa: BLE001 — a failed review is retryable
+            log.error(
+                "agent.watchlist_deferred_review_failed",
+                extra={
+                    "event": "agent.watchlist_deferred_review_failed",
+                    "proposal_id": proposal_row.id,
+                    "error": str(e),
+                    "error_class": type(e).__name__,
+                },
+            )
+            return None, "review_failed"
+
+        review = get_proposal_review_by_proposal_id(
+            self._components.journal.db_path, proposal_row.id
+        )
+        if review is None:
+            # The reviewer returned without persisting — never submit
+            # unreviewed (FR-17). Row stays pending.
+            return None, "review_missing"
+        return review, None
+
+    def _enroll_review_skipped(self, proposal_id: int, proposal_row: Any) -> None:
+        """Park a full-book-skipped proposal on the watchlist.
+
+        `_maybe_enroll_watchlist` normally runs inside `_run_entry_chain`,
+        which this proposal never reaches — it was rejected before the
+        validator. Rebuild the working `TradeProposal` from the stored
+        payload (no reviewer overlay: there is no review) so the same
+        enrollment filters apply. Best-effort — a payload we cannot parse
+        leaves the journaled rejection standing, unenrolled.
+        """
+        try:
+            from proposal.schemas import validate_trade_proposal
+
+            trade = validate_trade_proposal(json.loads(proposal_row.raw_response))
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "agent.review_skipped_enroll_payload_invalid",
+                extra={
+                    "event": "agent.review_skipped_enroll_payload_invalid",
+                    "proposal_id": proposal_id,
+                    "error": str(e),
+                },
+            )
+            return
+        self._maybe_enroll_watchlist(
+            proposal_id, trade, "review_skipped_full_book", quote_last=None
+        )
 
     def _attempt_displacement(
         self,
@@ -1640,6 +1811,78 @@ class AgentLoop:
             f"issuer={member.ticker} cik={member.cik} exchange={member.exchange} "
             f"market_cap={member.market_cap:.0f} prev_close={member.prev_close:.2f}"
         )
+
+    def _skip_unbuyable(self, filing: FilingRow) -> bool:
+        """COST LEVER — True when this filing must not reach the analyzer.
+
+        The gate asks the two questions the execution validator asks
+        anyway (universe membership, trade-time price floor) against the
+        in-memory universe snapshot, so a filer that can never produce a
+        buyable proposal costs zero tokens and journals no proposal. It
+        is coarse on purpose: the snapshot's `prev_close` is day-stale,
+        and the validator still does the precise quote-backed check.
+
+        Fails OPEN in every ambiguous case (see `app.analyzer_gate`) —
+        including a missing `analyzer` config section, so a stub config
+        in tests never turns the gate on by accident.
+        """
+        analyzer_cfg = getattr(self._config, "analyzer", None)
+        if analyzer_cfg is None or not getattr(
+            analyzer_cfg, "analyzer_unbuyable_gate", False
+        ):
+            return False
+
+        from app.analyzer_gate import (
+            FailOpen,
+            SkipUnbuyable,
+            evaluate_buyability,
+        )
+
+        # Same floor the validator enforces, from the same config value —
+        # if the operator raises one, both move together.
+        execution_cfg = getattr(self._config, "execution", None)
+        price_floor = float(
+            getattr(execution_cfg, "price_floor_usd", None) or _PRICE_FLOOR_FALLBACK
+        )
+        try:
+            decision = evaluate_buyability(
+                ticker=filing.issuer_ticker,
+                cik=filing.cik,
+                universe=self._components.universe,
+                price_floor_usd=price_floor,
+            )
+        except Exception as e:  # noqa: BLE001 — a broken gate must not block
+            decision = FailOpen(detail=f"gate_error:{type(e).__name__}")
+
+        if isinstance(decision, FailOpen):
+            self._analyzer_gate_fail_opens += 1
+            log.warning(
+                "agent.analyzer_gate_fail_open",
+                extra={
+                    "event": "agent.analyzer_gate_fail_open",
+                    "filing_id": filing.id,
+                    "symbol": filing.issuer_ticker,
+                    "detail": decision.detail,
+                    "fail_open_count": self._analyzer_gate_fail_opens,
+                },
+            )
+            return False
+
+        if isinstance(decision, SkipUnbuyable):
+            log.info(
+                "agent.analyzer_skipped_unbuyable",
+                extra={
+                    "event": "agent.analyzer_skipped_unbuyable",
+                    "filing_id": filing.id,
+                    "symbol": decision.symbol,
+                    "reason": decision.reason,
+                    "price": decision.price,
+                    "price_floor_usd": price_floor,
+                },
+            )
+            return True
+
+        return False
 
     def _compose_decision_id(self, filing: FilingRow) -> str:
         """Mirror SonnetAnalyzer's decision_id derivation so the loop

@@ -661,6 +661,7 @@ def _build_components(
     queue: asyncio.Queue,
     similarity_artifact_dir: str,
     ks5_max_concurrent: int | None = None,
+    config: Any = None,
 ) -> Any:
     """Build the AgentComponents bundle used by all integration tests.
 
@@ -702,6 +703,14 @@ def _build_components(
             if ks5_max_concurrent is not None
             else None
         ),
+        # COST LEVER — mirrors `compose_agent`'s wiring so the analyzer's
+        # Opus-review bar moves with the book exactly as it does in prod.
+        # None (no config passed) keeps the pre-lever behavior.
+        review_threshold_fn=(
+            (lambda: _review_threshold(config, fake_broker, db_path))
+            if config is not None
+            else None
+        ),
     )
     validator = ProposalValidator()
     sizer = SizingEngine()
@@ -731,6 +740,18 @@ def _build_components(
         killswitch=killswitch,
         ingestion_queue=queue,
         journal=journal,
+    )
+
+
+def _review_threshold(config: Any, broker: Any, db_path: str) -> int:
+    """Same seam `app.composition._review_threshold` wires in production."""
+    from app.loop import _pending_entry_spend
+    from execution.review_gate import resolve_review_threshold
+
+    return resolve_review_threshold(
+        config=config,
+        broker=broker,
+        pending_entry_spend_fn=lambda orders: _pending_entry_spend(db_path, orders),
     )
 
 
@@ -765,6 +786,7 @@ def build_components(
         *,
         queue: asyncio.Queue,
         ks5_max_concurrent: int | None = None,
+        config: Any = None,
     ) -> Any:
         return _build_components(
             db_path=db_path,
@@ -778,6 +800,7 @@ def build_components(
             queue=queue,
             similarity_artifact_dir=str(tmp_path / "sim"),
             ks5_max_concurrent=ks5_max_concurrent,
+            config=config,
         )
     return _factory
 

@@ -131,6 +131,7 @@ class SonnetAnalyzer:
         ks5_max_concurrent: int | None = None,
         open_positions_counter: Callable[[], int] | None = None,
         memory_assembler: MemoryContextAssembler | None = None,
+        review_threshold_fn: Callable[[], int] | None = None,
     ) -> None:
         self._client = client
         self._store = store
@@ -155,6 +156,16 @@ class SonnetAnalyzer:
         # gate is off) → no MemoryQuery is built and the request is
         # byte-identical to the pre-memory analyzer.
         self._memory_assembler = memory_assembler
+        # COST LEVER — decision-time Opus-review bar. When wired, this
+        # returns the EFFECTIVE threshold for the current book state,
+        # which the full-book gate may raise above the configured value
+        # (see `execution.review_gate`). None (default / legacy test
+        # path) uses the configured threshold verbatim. The agent loop
+        # computes the same number from the same helper so its
+        # missing-review guard classifies the skip correctly — a
+        # divergence here writes the wrong reject_reason, not a wrong
+        # trade.
+        self._review_threshold_fn = review_threshold_fn
 
     async def analyze(
         self,
@@ -225,7 +236,12 @@ class SonnetAnalyzer:
         # AC-7: conviction-gated routing to Opus reviewer (FR-17 / FR-18).
         if isinstance(result, ProposalEmitted):
             conviction = int(result.payload.get("conviction", 0))
-            if conviction >= self._threshold:
+            # COST LEVER — the full-book gate may raise the bar above the
+            # configured threshold for this decision (see
+            # `execution.review_gate`); with the gate off it returns the
+            # configured value and this is the original comparison.
+            effective_threshold = self._effective_threshold()
+            if conviction >= effective_threshold:
                 # Feature B: capacity gate. If KS5 is at cap, skip Opus —
                 # the proposal can't be actioned and would only be rejected
                 # by the sizer anyway. Absence of a `proposal_reviews` row
@@ -282,8 +298,46 @@ class SonnetAnalyzer:
                         "store and read"
                     )
                 await self._opus.review(proposal_row, filing, raw_text)
+            elif conviction >= self._threshold:
+                # Review WAS due at the configured bar; the full-book gate
+                # raised it out of reach. The agent loop recomputes the
+                # same effective bar and journals this proposal
+                # `review_skipped_full_book` (watchlist-eligible).
+                log.info(
+                    "agent.opus_skipped_full_book",
+                    extra={
+                        "event": "agent.opus_skipped_full_book",
+                        "filing_id": filing.id,
+                        "proposal_id": proposal_id,
+                        "conviction": conviction,
+                        "configured_threshold": self._threshold,
+                        "effective_threshold": effective_threshold,
+                    },
+                )
 
         return result
+
+    def _effective_threshold(self) -> int:
+        """The Opus-review bar for this decision.
+
+        Falls back to the configured threshold whenever no gate is wired
+        or the gate itself errors — an exception here must never raise
+        the bar (that would silence Opus on a live trade), so the failure
+        direction is "review anyway".
+        """
+        if self._review_threshold_fn is None:
+            return self._threshold
+        try:
+            return int(self._review_threshold_fn())
+        except Exception as e:  # noqa: BLE001 — fail toward reviewing
+            log.warning(
+                "agent.opus_review_threshold_failed",
+                extra={
+                    "event": "agent.opus_review_threshold_failed",
+                    "error": str(e),
+                },
+            )
+            return self._threshold
 
     def _assemble_memory(self, filing: FilingRow) -> str | None:
         """Build the memory block for this filing analysis, or None when the

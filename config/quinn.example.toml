@@ -33,6 +33,21 @@ opus_model_id = "claude-opus-4-7"
 opus_review_conviction_threshold = 5
 sonnet_max_output_tokens = 4096
 opus_max_output_tokens = 4096
+# COST LEVER — drop a prefiltered filing before the analyzer call when its
+# issuer is outside the universe snapshot or priced under
+# execution.price_floor_usd. Fails OPEN (analyzes anyway) on an unresolved
+# ticker or an empty snapshot. NOTE: with a fresh snapshot and the default
+# $5 floor this catches almost nothing — the prefilter's CIK gate and the
+# refresh job's own $5 screen get there first. It earns its keep on a
+# STALE snapshot, and immediately if price_floor_usd is raised above $5.
+analyzer_unbuyable_gate = false
+# COST LEVER — skip (and defer) Opus review when the book is at its
+# effective KS-5 cap AND KS-7 headroom cannot fund one $5 share. Proposals
+# below displacement-viable conviction are journaled
+# `review_skipped_full_book` and parked on the watchlist, which pays for
+# the review once capital frees. Requires watchlist_min_conviction > 0 to
+# be useful — without the watchlist these proposals are simply dropped.
+opus_review_full_book_gate = false
 
 [execution]
 broker_mode = "paper"             # 'paper' | 'live'

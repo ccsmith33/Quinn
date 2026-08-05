@@ -97,14 +97,17 @@ def test_watchlist_enabled_switch() -> None:
 
 def test_capital_reject_reasons_exact_vocabulary() -> None:
     """The enrollment filter is exactly the capital class — the sizer's
-    KS-5 (book full) and KS-7 (cash floor) rejects plus the validator's
-    buying-power check. Everything else must stay out: non-capital
-    validator rejects, Opus rejects, kill-switch halts, KS-6 re-entry,
-    conviction floor, and the ambiguous one-share case."""
+    KS-5 (book full) and KS-7 (cash floor) rejects, the validator's
+    buying-power check, and the Opus-review cost gate's full-book skip
+    (capital is likewise the only thing blocking it). Everything else must
+    stay out: non-capital validator rejects, Opus rejects, kill-switch
+    halts, KS-6 re-entry, conviction floor, and the ambiguous one-share
+    case."""
     assert CAPITAL_REJECT_REASONS == {
         "ks5_concurrent_limit",
         "ks7_cash_reserve",
         "insufficient_capital",
+        "review_skipped_full_book",
     }
     for excluded in (
         "opus_reject",

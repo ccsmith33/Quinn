@@ -144,6 +144,24 @@ class AgentComponents:
     pdt_transition_converter: Any | None = None
 
 
+def _review_threshold(config: AppConfig, broker: BrokerAdapter, db_path: str) -> int:
+    """COST LEVER — the analyzer's decision-time Opus-review bar.
+
+    `app.loop` owns `_pending_entry_spend` (it prices pending entries from
+    journal `orders` rows) and imports this module at load time, so the
+    import is function-local to keep the cycle from closing. Called once
+    per high-conviction proposal, long after boot.
+    """
+    from app.loop import _pending_entry_spend
+    from execution.review_gate import resolve_review_threshold
+
+    return resolve_review_threshold(
+        config=config,
+        broker=broker,
+        pending_entry_spend_fn=lambda orders: _pending_entry_spend(db_path, orders),
+    )
+
+
 def compose_agent(
     config: AppConfig,
     *,
@@ -291,6 +309,12 @@ def compose_agent(
         ks5_max_concurrent=config.execution.ks5_max_concurrent,
         open_positions_counter=lambda: len(broker.get_positions()),
         memory_assembler=memory_assembler,
+        # COST LEVER — decision-time Opus-review bar. Same seam
+        # `AgentLoop._execute` uses, so the analyzer's decision to skip
+        # review and the loop's classification of that skip cannot drift.
+        # With `opus_review_full_book_gate = false` this returns the
+        # configured threshold verbatim.
+        review_threshold_fn=lambda: _review_threshold(config, broker, journal.db_path),
     )
 
     # Execution stack (S6.2 / S6.3 / S6.4) — pure logic, no broker yet.

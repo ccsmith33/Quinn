@@ -44,6 +44,13 @@ log = get_logger(__name__)
 # NOT emitted by the validator — but it shares the `executions.reject_reason`
 # column, so the canonical vocabulary lives here next to the validator
 # reasons for ops to read in one place.
+#
+# `review_skipped_full_book` (cost lever) is likewise written by
+# `AgentLoop._execute`, not the validator: the Opus-review gate declined
+# to pay for review because the book was full AND cash sat at the KS-7
+# floor. Unlike `pending_capacity` it is TERMINAL for the day-0 path —
+# the proposal's second chance is the watchlist, which pays for the
+# deferred review once capital frees.
 RejectReason = Literal[
     "schema",
     "kill_switch",
@@ -53,6 +60,7 @@ RejectReason = Literal[
     "insufficient_capital",
     "direction_unsupported",
     "pending_capacity",
+    "review_skipped_full_book",
 ]
 
 # Trade-time price floor (FR-8 / ADR-006 §3): the daily snapshot enforces
