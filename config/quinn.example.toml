@@ -26,6 +26,12 @@ form_4_enabled = true
 # (~3x cheaper than Sonnet 4.6) — Opus reviewer at conviction-7+ remains
 # the quality safety net.
 sonnet_model_id = "claude-haiku-4-5-20251001"
+# Review-tier model. Recommended: claude-opus-5 (released 2026-08, May 2026
+# knowledge cutoff; same $5/$25 per-1M pricing tier as 4.7/4.8, same API
+# surface — no request-shape changes needed). claude-opus-4-7 and
+# claude-opus-4-8 remain pinned alternatives at the same price; all three
+# have pricing entries in src/analyzer/pricing.py, so the flip is
+# config-only. Structural change: requires restart, not SIGHUP.
 opus_model_id = "claude-opus-4-7"
 # Lowered from 7 (2026-05-06) to surface more borderline proposals for Opus
 # review while paper-trading. Revisit after observing trade rate vs. Opus

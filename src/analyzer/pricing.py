@@ -1,8 +1,8 @@
 """Per-model Anthropic pricing table — used by `AnthropicClient` to compute
 `cost_usd` from token counts (S5.2 AC-2).
 
-Initial values match Anthropic's public pricing as of 2026-04 (claude-api
-skill cached snapshot; see `shared/models.md`). Prices are in USD per token
+Values match Anthropic's public pricing as of 2026-08 (claude-api skill
+cached snapshot; see `shared/models.md`). Prices are in USD per token
 (divided from the public per-1M-token rates).
 
 REFRESH ANNUALLY. Anthropic does not version model IDs by pricing change,
@@ -42,11 +42,13 @@ class ModelPricing:
 # Pricing table (USD per 1M tokens → divided to per-token below)
 # ---------------------------------------------------------------------------
 
-# Per Anthropic public pricing (cached 2026-04):
-#   Opus 4.7 / 4.6: $5 input / $25 output per 1M
-#   Sonnet 4.6:     $3 input / $15 output per 1M
-#   Haiku 4.5:      $1 input / $5  output per 1M
+# Per Anthropic public pricing (cached 2026-08):
+#   Opus 5 / 4.8 / 4.7 / 4.6: $5 input / $25 output per 1M
+#   Sonnet 4.6:               $3 input / $15 output per 1M
+#   Haiku 4.5:                $1 input / $5  output per 1M
 _PUBLIC_RATES_PER_MILLION: dict[str, tuple[float, float]] = {
+    "claude-opus-5": (5.00, 25.00),
+    "claude-opus-4-8": (5.00, 25.00),
     "claude-opus-4-7": (5.00, 25.00),
     "claude-opus-4-6": (5.00, 25.00),
     "claude-sonnet-4-6": (3.00, 15.00),
