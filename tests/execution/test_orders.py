@@ -212,13 +212,14 @@ def _proposal(
     entry_style: str = "market_open",
     entry_limit_price: float | None = None,
     take_profit_price: float | None = None,
+    stop_loss_price: float = 8.50,
 ) -> TradeProposal:
     payload: dict[str, Any] = {
         "symbol": symbol,
         "direction": "long",
         "size_pct_of_capital": 0.05,
         "entry_style": entry_style,
-        "stop_loss_price": 8.50,
+        "stop_loss_price": stop_loss_price,
         "time_horizon_days": 10,
         "conviction": 8,
         "thesis": (
@@ -1160,3 +1161,108 @@ def test_bracket_journal_rows_leave_final_status_null_pending_fill() -> None:
             f"role={row['role']!r} wrote final_status={row['final_status']!r} "
             "at submission; must stay NULL until a terminal fill outcome"
         )
+
+
+# ---------------------------------------------------------------------------
+# Hotfix 2026-08-11 (Alpaca 42210000) — the LLM schema carries no increment
+# constraint on prices; every broker-bound bracket / PDT price is quantized
+# at the submission seam. Stop DOWN, TP UP, buy entry limit DOWN — all
+# directions preserve the inverted-stop/TP guards and validator geometry
+# (which run on the raw proposal values).
+# ---------------------------------------------------------------------------
+
+def _quote(last: float) -> Quote:
+    return Quote(
+        symbol="ACME",
+        bid=last - 0.02,
+        ask=last + 0.03,
+        last=last,
+        ts=dt.datetime(2026, 4, 28, 14, 30, tzinfo=dt.UTC),
+    )
+
+
+def test_bracket_quantizes_llm_subpenny_prices() -> None:
+    """Sub-penny LLM prices land on the penny grid at submission: stop
+    17.8567 → 17.85 (down), TP 26.4312 → 26.44 (up). The journal rows
+    record the quantized values actually sent, never the raw ones."""
+    p = _proposal(stop_loss_price=17.8567, take_profit_price=26.4312)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker(quote=_quote(20.02))
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionAccepted)
+    bracket = broker.submitted_brackets[0]
+    assert bracket.stop_loss_price == 17.85
+    assert bracket.take_profit_price == 26.44
+    stop_row = next(o for o in journal.orders if o["role"] == "stop")
+    tp_row = next(o for o in journal.orders if o["role"] == "take_profit")
+    assert stop_row["stop_price"] == 17.85
+    assert tp_row["limit_price"] == 26.44
+
+
+def test_bracket_quantizes_subpenny_entry_limit_down() -> None:
+    """A sub-penny LLM buy entry limit rounds DOWN (never pays more
+    than proposed): 19.9567 → 19.95."""
+    p = _proposal(
+        entry_style="limit",
+        entry_limit_price=19.9567,
+        stop_loss_price=17.8567,
+        take_profit_price=26.4312,
+    )
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker(quote=_quote(20.02))
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionAccepted)
+    assert broker.submitted_brackets[0].entry_limit_price == 19.95
+
+
+def test_bracket_two_dp_prices_are_identity() -> None:
+    """Clean 2dp LLM prices pass through byte-identical in every slot —
+    quantization never shifts an already-valid price."""
+    p = _proposal(
+        entry_style="limit",
+        entry_limit_price=19.95,
+        stop_loss_price=17.85,
+        take_profit_price=26.44,
+    )
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker(quote=_quote(20.02))
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(accepted, broker, journal, _FakeKillSwitch())
+
+    assert isinstance(result, SubmissionAccepted)
+    bracket = broker.submitted_brackets[0]
+    assert bracket.entry_limit_price == 19.95
+    assert bracket.stop_loss_price == 17.85
+    assert bracket.take_profit_price == 26.44
+
+
+def test_pdt_virtual_exits_store_quantized_prices() -> None:
+    """PDT branch: the virtual_exits rows persist the QUANTIZED stop/TP
+    (built by _build_stop/_build_take_profit), so pdt_transition and
+    deferred-TP submission downstream inherit broker-valid prices."""
+    p = _proposal(stop_loss_price=17.8567, take_profit_price=26.4312)
+    accepted = _accepted(proposal=p)
+    broker = _FakeBroker(quote=_quote(20.02))
+    journal = _FakeJournal()
+    submitter = OrderSubmitter()
+
+    result = submitter.submit(
+        accepted, broker, journal, _FakeKillSwitch(),
+        pdt_state=_FakePDTState(active=True),
+    )
+
+    assert isinstance(result, SubmissionAccepted)
+    stop = next(v for v in journal.virtual_exits if v["role"] == "stop")
+    tp = next(v for v in journal.virtual_exits if v["role"] == "tp")
+    assert stop["stop_price"] == 17.85
+    assert tp["tp_price"] == 26.44

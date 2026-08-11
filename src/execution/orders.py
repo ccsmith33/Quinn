@@ -68,6 +68,7 @@ from broker.protocol import (
     Quote,
     SubmittedOrder,
 )
+from execution.quantize import quantize_price
 from journal.models import ExecutionRow, OrderRow, VirtualExitRow
 from observability.log_port import get_logger
 from proposal.schemas import TradeProposal
@@ -420,6 +421,17 @@ class OrderSubmitter:
         Hotfix 2026-05-07: this is the single submission point for
         normal flow. The historical separate `_build_entry` /
         `_build_stop` / `_build_take_profit` pathway has been retired.
+
+        Hotfix 2026-08-11 (Alpaca 42210000): the LLM schema carries no
+        increment constraint on prices — quantize every broker-bound
+        price at this seam. Stop DOWN (a protective sell-stop a hair
+        lower is semantically identical; the inverted-stop guard's
+        `stop < entry` can only become MORE true). TP UP (a sell limit
+        a hair higher preserves the inverted-TP guard and the direction
+        of the validator's R:R floor, both of which ran on the raw
+        proposal values — the sub-cent submission delta widens risk /
+        reward by less than one increment each). Buy entry limit DOWN
+        (never pays more than proposed).
         """
         p = ap.proposal
         entry_order_type: Literal["market", "limit"]
@@ -427,7 +439,9 @@ class OrderSubmitter:
         if p.entry_style == "limit":
             assert p.entry_limit_price is not None  # enforced by TradeProposal validator
             entry_order_type = "limit"
-            entry_limit_price = p.entry_limit_price
+            entry_limit_price = quantize_price(
+                p.entry_limit_price, direction="down"
+            )
         else:
             entry_order_type = "market"
             entry_limit_price = None
@@ -447,8 +461,12 @@ class OrderSubmitter:
             entry_tif="gtc",
             entry_client_order_id=f"prop-{ap.proposal_id}-entry",
             entry_limit_price=entry_limit_price,
-            stop_loss_price=p.stop_loss_price,
-            take_profit_price=p.take_profit_price,
+            stop_loss_price=quantize_price(p.stop_loss_price, direction="down"),
+            take_profit_price=(
+                quantize_price(p.take_profit_price, direction="up")
+                if p.take_profit_price is not None
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -558,7 +576,11 @@ class OrderSubmitter:
                 order_type="limit",
                 tif="day",
                 client_order_id=f"prop-{ap.proposal_id}-entry",
-                limit_price=p.entry_limit_price,
+                # Hotfix 2026-08-11 (Alpaca 42210000): LLM price, buy
+                # limit → quantize DOWN (never pays more than proposed).
+                limit_price=quantize_price(
+                    p.entry_limit_price, direction="down"
+                ),
             )
         return OrderRequest(
             symbol=p.symbol,
@@ -579,7 +601,11 @@ class OrderSubmitter:
             order_type="stop",
             tif="gtc",
             client_order_id=f"prop-{ap.proposal_id}-stop",
-            stop_price=p.stop_loss_price,
+            # Hotfix 2026-08-11 (Alpaca 42210000): LLM price → quantize
+            # DOWN at the seam. The PDT branch stores this in the
+            # virtual_exits row, so pdt_transition / deferred-TP
+            # submission downstream inherit the clean value.
+            stop_price=quantize_price(p.stop_loss_price, direction="down"),
         )
 
     @staticmethod
@@ -594,7 +620,9 @@ class OrderSubmitter:
             order_type="limit",
             tif="gtc",
             client_order_id=f"prop-{ap.proposal_id}-tp",
-            limit_price=p.take_profit_price,
+            # Hotfix 2026-08-11 (Alpaca 42210000): LLM price → quantize
+            # UP (raise-preserving; see _build_bracket).
+            limit_price=quantize_price(p.take_profit_price, direction="up"),
         )
 
     @staticmethod
