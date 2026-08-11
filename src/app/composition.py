@@ -355,6 +355,9 @@ def compose_agent(
         journal=journal,
         opus_reviewer=reviewer,
         ks5_max_concurrent=config.execution.ks5_max_concurrent,
+        # COST LEVER (advisory #5) — the retro review sees the same
+        # capped filing body the day-0 analyzer saw.
+        max_input_chars=config.analyzer.analyzer_max_input_chars,
     )
 
     # Feature A — thesis-review coordinator. Reviews open positions

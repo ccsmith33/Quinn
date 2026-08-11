@@ -49,6 +49,17 @@ log = get_logger(__name__)
 RETRO_CONVICTION_FLOOR = 9
 RETRO_FRESHNESS_WINDOW = dt.timedelta(hours=6)
 
+# SCOPE NOTE (full-book Opus-review gate): retro-fill rescues
+# `pending_capacity` rows ONLY. `review_skipped_full_book` rows — the
+# gate's deliberate skips — are retro-ineligible BY DESIGN
+# (`find_retro_candidate` excludes any non-pending_capacity execution
+# row): their designated rescue path is the WATCHLIST, whose deferred
+# retry pays for the skipped review before entering, and the `AppConfig`
+# cross-field validator guarantees the watchlist is on whenever the gate
+# is. Conversely, sub-cv9 `pending_capacity` rows sit under this floor
+# and are rescued by the loop's belt-and-braces watchlist enrollment,
+# not by retro-fill.
+
 
 class _OpusReviewerPort(Protocol):
     async def review(
@@ -77,12 +88,18 @@ class RetroFillCoordinator:
         opus_reviewer: _OpusReviewerPort,
         ks5_max_concurrent: int,
         now_fn: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.UTC),
+        max_input_chars: int = 0,
     ) -> None:
         self._journal = journal
         self._opus = opus_reviewer
         self._ks5_max = ks5_max_concurrent
         self._now_fn = now_fn
         self._execute_fn: ExecuteProposalFn | None = None
+        # COST LEVER (advisory #5) — same filing-body cap the day-0
+        # analyzer applies (`analyzer.analyzer_max_input_chars`, wired by
+        # `compose_agent`); the retro review must see the same capped
+        # text a day-0 review would have. 0 = off.
+        self._max_input_chars = max_input_chars
 
     def set_executor(self, fn: ExecuteProposalFn) -> None:
         """Wire the agent loop's `execute_proposal` after construction.
@@ -151,7 +168,16 @@ class RetroFillCoordinator:
                 },
             )
             return
-        raw_text = _read_raw_text(filing.raw_text_path)
+        # Advisory #5 — cap the filing body exactly as the day-0 analyzer
+        # would have (same helper, same marker), so the retro review is
+        # consistent with day-0 reviews and the cap's savings apply here.
+        from analyzer.sonnet import cap_filing_text
+
+        raw_text = cap_filing_text(
+            _read_raw_text(filing.raw_text_path),
+            cap=self._max_input_chars,
+            filing_id=filing.id,
+        )
 
         log.info(
             "agent.retro_candidate_selected",

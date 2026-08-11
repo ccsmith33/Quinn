@@ -695,7 +695,16 @@ def _build_components(
         prompt_builder=prompt_builder,
         opus_reviewer=reviewer,
         sonnet_model_id=sonnet_model_id,
-        opus_review_conviction_threshold=7,
+        # Mirror `compose_agent`: the analyzer's constructor threshold and
+        # the config the review-threshold fn resolves must be the SAME
+        # knob (the analyzer's below-threshold hoist relies on
+        # `effective >= configured`). 7 preserves the legacy default for
+        # tests that pass no config.
+        opus_review_conviction_threshold=(
+            config.analyzer.opus_review_conviction_threshold
+            if config is not None
+            else 7
+        ),
         db_path=db_path,
         ks5_max_concurrent=ks5_max_concurrent,
         open_positions_counter=(

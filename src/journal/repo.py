@@ -379,6 +379,14 @@ def find_retro_candidate(
       - NO `proposal_reviews` row exists (defense-in-depth: Opus must
         not have already reviewed it via some other path)
 
+    `review_skipped_full_book` rows (the full-book Opus-review cost
+    gate's skip) are retro-ineligible BY DESIGN — they match the
+    "any non-pending_capacity execution row" exclusion below. Their
+    designated rescue path is the WATCHLIST, whose deferred retry pays
+    for the skipped review before entering; the `AppConfig` cross-field
+    validator guarantees the watchlist is on whenever the gate is, so
+    the exclusion never strands a proposal.
+
     Tie-break: highest conviction first, then most recent. Returns at
     most one candidate per call (the caller serializes retro work).
     """
@@ -1568,8 +1576,20 @@ def resolve_watchlist_row(
 
     Returns False when the row was not pending (already resolved by a
     concurrent path) — callers treat that as a benign no-op.
+
+    `skipped_review_reject` (the deferred Opus review came back
+    reject/malformed) and `review_failed` (the deferred review failed
+    `MAX_DEFERRED_REVIEW_ATTEMPTS` times) are the full-book-gate
+    additions to the terminal vocabulary.
     """
-    if status not in ("entered", "expired", "skipped_chase", "skipped_held"):
+    if status not in (
+        "entered",
+        "expired",
+        "skipped_chase",
+        "skipped_held",
+        "skipped_review_reject",
+        "review_failed",
+    ):
         raise ValueError(f"not a terminal watchlist status: {status!r}")
     with connect(db_path) as conn:
         cur = _exec_write(
@@ -1579,6 +1599,22 @@ def resolve_watchlist_row(
             "notes = COALESCE(?, notes) "
             "WHERE id = ? AND status = 'pending'",
             (status, notes, watchlist_id),
+        )
+        return cur.rowcount > 0
+
+
+def update_watchlist_notes(
+    db_path: str, watchlist_id: int, notes: str
+) -> bool:
+    """Rewrite a PENDING row's notes in place (the deferred-review
+    attempt counter, advisory #3). Status and resolved_at are untouched;
+    a row that resolved concurrently is a benign no-op (False)."""
+    with connect(db_path) as conn:
+        cur = _exec_write(
+            conn,
+            "UPDATE watchlist SET notes = ? "
+            "WHERE id = ? AND status = 'pending'",
+            (notes, watchlist_id),
         )
         return cur.rowcount > 0
 

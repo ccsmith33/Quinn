@@ -39,17 +39,22 @@ opus_model_id = "claude-opus-4-7"
 opus_review_conviction_threshold = 5
 sonnet_max_output_tokens = 4096
 opus_max_output_tokens = 4096
-# COST LEVER — hard ceiling on the filing text handed to the analyzer, in
-# characters (~4 chars/token). Prod journal (3d, 650 calls): 72.3% of all
+# COST LEVER — ceiling on the filing text handed to the analyzer, in
+# characters (~4 chars/token). NOT a hard ceiling on the payload: a
+# truncated filing carries a fixed ~330-char truncation marker telling
+# the model what was dropped, so the body actually sent is cap + marker.
+# Prod journal (3d, 650 calls): 72.3% of all
 # input tokens sat beyond the first 15k characters of each filing, while
 # every conviction>=5 proposal came from a filing in the 7.4-31k band. An
 # 8-K leads with its Item sections (the catalyst) and trails the exhibit
 # stack (press-release duplicates, financial statements), so the dropped
-# tail is the part that has never produced signal. The model is told what
-# was removed and asked to flag it if the exhibits look material.
+# tail is the part that has never produced signal.
 # 0 = off. Any other value must be >= 20000 (a lower cap would cut into
-# the Item sections themselves) — rejected at load otherwise. This value
-# is part of the decision_id: changing it re-analyzes.
+# the Item sections themselves) — rejected at load otherwise.
+# OPERATOR NOTE: this value is part of the decision_id, so flipping it
+# re-keys the decision ids of in-flight proposals — each such filing is
+# re-analyzed ONCE under the new cap (bounded one-time re-spend, not a
+# replay). Expected; plan flips for quiet hours if that spend matters.
 analyzer_max_input_chars = 0
 # COST LEVER — drop a prefiltered filing before the analyzer call when its
 # issuer is outside the universe snapshot or priced under
@@ -63,8 +68,10 @@ analyzer_unbuyable_gate = false
 # effective KS-5 cap AND KS-7 headroom cannot fund one $5 share. Proposals
 # below displacement-viable conviction are journaled
 # `review_skipped_full_book` and parked on the watchlist, which pays for
-# the review once capital frees. Requires watchlist_min_conviction > 0 to
-# be useful — without the watchlist these proposals are simply dropped.
+# the review once capital frees. REQUIRES execution.watchlist_min_conviction
+# > 0 — the watchlist is the only rescue path for gate-skipped proposals
+# (retro-fill excludes them by design), so the loader refuses to boot the
+# gate without it (ConfigError at load time).
 opus_review_full_book_gate = false
 
 [execution]

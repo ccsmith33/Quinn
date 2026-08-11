@@ -34,7 +34,11 @@ from config.calendar import ET, is_market_open_day
 #     thing standing between this proposal and a normal entry is capital,
 #     and the watchlist is how it gets its second chance. Without this
 #     entry the gate would silently discard proposals that today reach
-#     the queue via `ks5_concurrent_limit`.
+#     the queue via `ks5_concurrent_limit`. The watchlist is these rows'
+#     DESIGNATED — and only — rescue path: retro-fill excludes them by
+#     design (`journal.repo.find_retro_candidate` keys on
+#     `pending_capacity` alone), which is why `AppConfig` refuses to load
+#     the gate without `watchlist_min_conviction > 0`.
 # NOT included: opus_reject / kill_switch / universe / price_floor /
 # exit_geometry / schema (not capital), ks6_already_held (we never
 # pyramid), conviction_too_low (won't change), and
@@ -50,6 +54,42 @@ CAPITAL_REJECT_REASONS = frozenset(
 )
 
 _MARKET_CLOSE_ET = dt.time(16, 0)
+
+# Advisory #3 — budget of FAILED deferred-review attempts per watchlist
+# row (reviewer raised, or returned without persisting a review row).
+# At the ~2/min agent tick an unbounded row would retry ~390 times per
+# trading day; after this many failures the loop resolves the row
+# terminally (`status='review_failed'`) instead. A still-locked book
+# does not consume budget — nothing was spent, expiry bounds that wait.
+MAX_DEFERRED_REVIEW_ATTEMPTS = 5
+
+_REVIEW_ATTEMPTS_TAG = "review_attempts="
+
+
+def parse_review_attempts(notes: str | None) -> int:
+    """Read the failed-attempt counter back out of a row's notes.
+    Tolerant of absent / foreign / mangled notes — those count as 0."""
+    if not notes:
+        return 0
+    for token in notes.split():
+        if token.startswith(_REVIEW_ATTEMPTS_TAG):
+            try:
+                return int(token[len(_REVIEW_ATTEMPTS_TAG):])
+            except ValueError:
+                return 0
+    return 0
+
+
+def with_review_attempts(notes: str | None, attempts: int) -> str:
+    """Return `notes` with its `review_attempts=N` token set to
+    `attempts`, preserving every other token (the enrollment's
+    `reject_reason=...` stays intact for the operator)."""
+    kept = [
+        t
+        for t in (notes.split() if notes else [])
+        if not t.startswith(_REVIEW_ATTEMPTS_TAG)
+    ]
+    return " ".join([*kept, f"{_REVIEW_ATTEMPTS_TAG}{attempts}"])
 
 
 def watchlist_enabled(execution_cfg: Any) -> bool:
@@ -102,8 +142,11 @@ def ensure_utc(d: dt.datetime) -> dt.datetime:
 
 __all__ = [
     "CAPITAL_REJECT_REASONS",
+    "MAX_DEFERRED_REVIEW_ATTEMPTS",
     "chase_exceeded",
     "compute_expiry",
     "ensure_utc",
+    "parse_review_attempts",
     "watchlist_enabled",
+    "with_review_attempts",
 ]

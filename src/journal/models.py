@@ -260,7 +260,8 @@ class WatchlistRow(_Row):
 
     A capital-blocked, approved, high-conviction proposal parked for a
     bounded retry. `status` ∈ {"pending", "entered", "expired",
-    "skipped_chase", "skipped_held"}; terminal states set `resolved_at`.
+    "skipped_chase", "skipped_held", "skipped_review_reject",
+    "review_failed"}; terminal states set `resolved_at`.
     `reference_price` is the decision-time broker NBBO `last` — the same
     quote the SizingEngine sized against.
     """

@@ -70,7 +70,11 @@ class AnalyzerConfig(_Section):
     # the moment a slot frees or cash returns. Default false =
     # byte-identical to pre-feature.
     opus_review_full_book_gate: bool = Field(default=False)
-    # COST LEVER — hard ceiling on the filing text handed to the analyzer.
+    # COST LEVER — ceiling on the FILING TEXT handed to the analyzer. Not
+    # a hard ceiling on the outbound payload: a truncated filing carries a
+    # fixed ~330-char truncation marker telling the model what was
+    # dropped, so the body actually sent is cap + marker (plus the prompt
+    # scaffold and memory block, which are never in the cap's scope).
     # Prod journal (3d, 650 calls): 72.3% of all input tokens sat beyond the
     # first 15k characters of each filing, and every conviction>=5 proposal
     # came from a filing in the 7.4-31k band. An 8-K leads with its Item
@@ -79,6 +83,11 @@ class AnalyzerConfig(_Section):
     # that has never produced signal. 0 (default) = off, byte-identical to
     # pre-feature. See `_check_input_cap_floor` for why small caps are
     # rejected rather than clamped.
+    # OPERATOR NOTE — the cap is part of `decision_id`, so flipping it
+    # re-keys the decision ids of in-flight (analyzed-but-unresolved)
+    # proposals: the idempotency lookup misses and each such filing is
+    # re-analyzed once under the new cap. Bounded, one-time re-spend —
+    # expected, not a bug.
     analyzer_max_input_chars: int = Field(default=0)
 
     @model_validator(mode="after")
@@ -477,6 +486,35 @@ class AppConfig(BaseModel):
     observability: ObservabilityConfig
     dashboard: DashboardConfig = Field(default_factory=DashboardConfig)
     universe: UniverseConfig = Field(default_factory=UniverseConfig)
+
+    @model_validator(mode="after")
+    def _check_full_book_gate_has_rescue_path(self) -> AppConfig:
+        """Cross-section invariant: `[analyzer] opus_review_full_book_gate`
+        requires `[execution] watchlist_min_conviction > 0`.
+
+        The gate journals its skips `review_skipped_full_book`, which
+        retro-fill excludes BY DESIGN (`find_retro_candidate` keys on
+        `pending_capacity` alone) — the WATCHLIST's deferred retry is the
+        only rescue path, and it is off at `watchlist_min_conviction = 0`.
+        With both set that way, every gate skip (including a cv9/cv10
+        under `displacement_min_conviction = 10`) would be silently
+        discarded. Operator error → rejected at load time (ConfigError
+        via `load_config`) rather than silently dropping proposals in
+        prod. Lives at AppConfig level because the two knobs sit in
+        different sections.
+        """
+        if (
+            self.analyzer.opus_review_full_book_gate
+            and self.execution.watchlist_min_conviction <= 0
+        ):
+            raise ValueError(
+                "analyzer.opus_review_full_book_gate = true requires "
+                "execution.watchlist_min_conviction > 0: the watchlist is "
+                "the only rescue path for review_skipped_full_book "
+                "proposals (retro-fill excludes them by design); with the "
+                "watchlist off the gate would silently discard them"
+            )
+        return self
 
 
 _DEFAULT_PATHS = [

@@ -236,15 +236,26 @@ def resolve_review_threshold(
     pending_entry_spend_fn: Callable[[list[Any]], float],
     price_floor_fallback: float = 5.00,
 ) -> int:
-    """The single seam both the analyzer and the agent loop ask for the bar.
+    """The one helper every caller asks for the bar.
 
-    Two callers must agree on this number: `SonnetAnalyzer` decides
-    whether to pay for Opus, and `AgentLoop._execute` decides whether a
-    missing review means `pending_capacity` (deferred, Feature C will
-    retry) or `review_skipped_full_book` (terminal, watchlist-eligible).
-    A divergence writes the wrong reject_reason — never a wrong trade —
-    but it would strand proposals in the wrong queue, so both go through
-    here rather than reimplementing the read.
+    Each call is one fresh broker snapshot, and each call site makes ONE
+    decision from it:
+
+      - `SonnetAnalyzer._effective_threshold` — the AUTHORITATIVE skip
+        decision. When it skips, the analyzer's recorder seam persists
+        the `review_skipped_full_book` outcome (executions row +
+        watchlist enrollment) before `analyze` returns, so nothing ever
+        re-reads the broker to CLASSIFY that skip. (BLOCKING-1: two
+        independent reads let a transient broker error here reclassify a
+        gate skip as `pending_capacity` and strand sub-cv9 proposals in
+        retro-fill's queue, which floors at cv9.)
+      - `AgentLoop._execute` — crash-replay fallback only: classifies a
+        missing review when no persisted decision exists (pre-gate
+        Feature B skips, or a crash between the analyzer's store and its
+        recorder). A fresh decision from current truth, not a re-read of
+        the analyzer's.
+      - `AgentLoop._review_deferred_entry` — retry-time gating: don't
+        pay for the deferred review while the book is still locked.
 
     Returns the configured threshold on any missing config, disabled
     gate, or error: the failure direction is always "review anyway".

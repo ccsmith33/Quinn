@@ -1153,6 +1153,24 @@ async def test_input_cap_hard_cuts_when_newline_would_lose_the_body(
     assert body == raw_text[:cap]
 
 
+def test_input_cap_clean_cut_taken_exactly_at_the_90pct_boundary() -> None:
+    """Boundary pin for the clean-cut retention floor: a last-newline
+    landing EXACTLY at cap * 0.9 still earns the clean cut (the
+    comparison is `>=`, inclusive) — one character below it falls back
+    to the hard boundary. Exercises the shared `cap_filing_text` helper
+    every review path (day-0, deferred, retro) routes through."""
+    from analyzer.sonnet import cap_filing_text, truncation_marker
+
+    cap = 20_000  # 90% line at exactly 18_000
+    at_boundary = "a" * 18_000 + "\n" + "b" * 10_000
+    out = cap_filing_text(at_boundary, cap=cap)
+    assert out == "a" * 18_000 + truncation_marker(cap)
+
+    below_boundary = "a" * 17_999 + "\n" + "b" * 10_000
+    out = cap_filing_text(below_boundary, cap=cap)
+    assert out == below_boundary[:cap] + truncation_marker(cap)
+
+
 @pytest.mark.asyncio
 async def test_input_cap_leaves_under_cap_filings_untouched(
     db: str, filing: FilingRow, ctx: AnalyzerContext, sonnet_prompt_version: str

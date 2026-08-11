@@ -527,6 +527,50 @@ def test_watchlist_accepts_bounds(field: str, good: object) -> None:
 
 
 # ---------------------------------------------------------------------------
+# COST LEVER — full-book gate ⇄ watchlist cross-field invariant (AppConfig).
+# ---------------------------------------------------------------------------
+
+
+def test_full_book_gate_without_watchlist_is_a_config_error(
+    tmp_path: Path,
+) -> None:
+    """`analyzer.opus_review_full_book_gate = true` with the watchlist off
+    (the example's default) must refuse to load: the watchlist is the
+    ONLY rescue path for `review_skipped_full_book` proposals (retro-fill
+    excludes them by design), so this combination silently discards
+    skipped proposals — including a cv9 under displacement_min_conviction
+    = 10. Cross-section rule, so it lives on AppConfig, not a section."""
+    toml = EXAMPLE_TOML.read_text(encoding="utf-8").replace(
+        "opus_review_full_book_gate = false",
+        "opus_review_full_book_gate = true",
+    )
+    p = tmp_path / "gate_no_watchlist.toml"
+    p.write_text(toml, encoding="utf-8")
+    with pytest.raises(ConfigError, match="watchlist_min_conviction"):
+        load_config(str(p))
+
+
+def test_full_book_gate_with_watchlist_on_loads(tmp_path: Path) -> None:
+    """The sanctioned pairing — gate on AND watchlist on — parses."""
+    toml = (
+        EXAMPLE_TOML.read_text(encoding="utf-8")
+        .replace(
+            "opus_review_full_book_gate = false",
+            "opus_review_full_book_gate = true",
+        )
+        .replace(
+            "sizing_high_pct = 0.10",
+            "sizing_high_pct = 0.10\nwatchlist_min_conviction = 6",
+        )
+    )
+    p = tmp_path / "gate_with_watchlist.toml"
+    p.write_text(toml, encoding="utf-8")
+    cfg = load_config(str(p))
+    assert cfg.analyzer.opus_review_full_book_gate is True
+    assert cfg.execution.watchlist_min_conviction == 6
+
+
+# ---------------------------------------------------------------------------
 # COST LEVER — [analyzer] analyzer_max_input_chars.
 # ---------------------------------------------------------------------------
 

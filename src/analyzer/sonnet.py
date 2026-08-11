@@ -140,6 +140,7 @@ class SonnetAnalyzer:
         memory_assembler: MemoryContextAssembler | None = None,
         review_threshold_fn: Callable[[], int] | None = None,
         max_input_chars: int = 0,
+        review_skip_recorder: Callable[..., None] | None = None,
     ) -> None:
         self._client = client
         self._store = store
@@ -181,6 +182,33 @@ class SonnetAnalyzer:
         # the memory block and the prompt scaffold are assembled
         # downstream and are never in scope of the cap.
         self._max_input_chars = max_input_chars
+        # COST LEVER — full-book skip recorder (BLOCKING-1 fix). When the
+        # gate raises the bar past a proposal, THIS analyzer decision is
+        # the authoritative one: the recorder persists it (executions row
+        # `review_skipped_full_book` + watchlist enrollment, both written
+        # by `AgentLoop._record_review_skip`) synchronously, before
+        # `analyze` returns. The agent loop therefore never re-reads the
+        # broker to classify the missing review — the re-read is what
+        # allowed a transient broker error to reclassify a gate skip as
+        # `pending_capacity` and strand sub-cv9 proposals in the retro
+        # queue they can never leave. Wired by `AgentLoop.__init__` via
+        # `set_review_skip_recorder`; None (legacy/unit-test path) keeps
+        # the skip log-only, and the loop's crash-replay fallback
+        # classifies it instead.
+        self._review_skip_recorder = review_skip_recorder
+
+    @property
+    def max_input_chars(self) -> int:
+        """The configured filing-body ceiling (0 = off). Public so the
+        agent loop's decision-id mirror and the deferred/retro review
+        paths read the SAME value this instance analyzes under."""
+        return self._max_input_chars
+
+    def set_review_skip_recorder(self, fn: Callable[..., None] | None) -> None:
+        """Two-phase wiring seam for the full-book skip recorder (the
+        loop is constructed after the analyzer, mirroring
+        `RetroFillCoordinator.set_executor`)."""
+        self._review_skip_recorder = fn
 
     async def analyze(
         self,
@@ -253,6 +281,12 @@ class SonnetAnalyzer:
         # AC-7: conviction-gated routing to Opus reviewer (FR-17 / FR-18).
         if isinstance(result, ProposalEmitted):
             conviction = int(result.payload.get("conviction", 0))
+            # Configured-threshold check FIRST (advisory #7 hoist): the
+            # effective bar is always >= the configured one, so a
+            # below-threshold proposal can never need review and must not
+            # pay the gate's broker snapshot to learn that.
+            if conviction < self._threshold:
+                return result
             # COST LEVER — the full-book gate may raise the bar above the
             # configured threshold for this decision (see
             # `execution.review_gate`); with the gate off it returns the
@@ -315,11 +349,14 @@ class SonnetAnalyzer:
                         "store and read"
                     )
                 await self._opus.review(proposal_row, filing, raw_text)
-            elif conviction >= self._threshold:
+            else:
                 # Review WAS due at the configured bar; the full-book gate
-                # raised it out of reach. The agent loop recomputes the
-                # same effective bar and journals this proposal
-                # `review_skipped_full_book` (watchlist-eligible).
+                # raised it out of reach. THIS is the authoritative skip
+                # decision (BLOCKING-1): the recorder persists the
+                # `review_skipped_full_book` executions row and the
+                # watchlist enrollment right here, so the agent loop
+                # classifies the missing review from the journal — never
+                # from a second, divergence-prone broker read.
                 log.info(
                     "agent.opus_skipped_full_book",
                     extra={
@@ -331,6 +368,24 @@ class SonnetAnalyzer:
                         "effective_threshold": effective_threshold,
                     },
                 )
+                if self._review_skip_recorder is not None:
+                    try:
+                        self._review_skip_recorder(
+                            proposal_id,
+                            configured_threshold=self._threshold,
+                            effective_threshold=effective_threshold,
+                        )
+                    except Exception as e:  # noqa: BLE001 — the loop's
+                        # crash-replay fallback still classifies the skip;
+                        # a failed record must not fail the analysis.
+                        log.error(
+                            "agent.review_skip_record_failed",
+                            extra={
+                                "event": "agent.review_skip_record_failed",
+                                "proposal_id": proposal_id,
+                                "error": str(e),
+                            },
+                        )
 
         return result
 
@@ -366,24 +421,9 @@ class SonnetAnalyzer:
         removed and asked to flag it if the visible content suggests the
         exhibits mattered.
         """
-        cap = self._max_input_chars
-        if not cap or len(raw_text) <= cap:
-            return raw_text
-
-        cut = cap
-        nl = raw_text.rfind("\n", 0, cap + 1)
-        if nl >= cap * _CLEAN_CUT_MIN_RETENTION:
-            cut = nl
-        log.info(
-            "agent.analyzer_input_truncated",
-            extra={
-                "event": "agent.analyzer_input_truncated",
-                "filing_id": filing.id,
-                "original_chars": len(raw_text),
-                "capped_chars": cut,
-            },
+        return cap_filing_text(
+            raw_text, cap=self._max_input_chars, filing_id=filing.id
         )
-        return raw_text[:cut] + truncation_marker(cap)
 
     def _assemble_memory(self, filing: FilingRow) -> str | None:
         """Build the memory block for this filing analysis, or None when the
@@ -453,6 +493,42 @@ def compute_decision_id(
     if input_cap:
         src = f"{src}|cap={input_cap}"
     return hashlib.sha256(src.encode("utf-8")).hexdigest()[:_DECISION_ID_HEX_LEN]
+
+
+def cap_filing_text(
+    raw_text: str, *, cap: int, filing_id: int | None = None
+) -> str:
+    """COST LEVER — trim a filing body to `cap` characters + the fixed
+    truncation marker. The single implementation behind EVERY review
+    input: day-0 analysis (`SonnetAnalyzer._apply_input_cap`), the
+    watchlist's deferred review (`AgentLoop._review_deferred_entry`), and
+    retro-fill (`RetroFillCoordinator.run_tick`) — advisory #5: a
+    deferred or retro review must see the same capped text a day-0
+    review would have, or the cap's savings silently stop applying the
+    moment a proposal leaves the day-0 path.
+
+    `cap=0` (feature off) and under-cap text are returned unchanged. A
+    clean cut at the last newline before the cap is preferred when it
+    retains >= 90% of the budget (inclusive — a newline exactly at the
+    90% line is taken); otherwise the hard boundary applies.
+    """
+    if not cap or len(raw_text) <= cap:
+        return raw_text
+
+    cut = cap
+    nl = raw_text.rfind("\n", 0, cap + 1)
+    if nl >= cap * _CLEAN_CUT_MIN_RETENTION:
+        cut = nl
+    log.info(
+        "agent.analyzer_input_truncated",
+        extra={
+            "event": "agent.analyzer_input_truncated",
+            "filing_id": filing_id,
+            "original_chars": len(raw_text),
+            "capped_chars": cut,
+        },
+    )
+    return raw_text[:cut] + truncation_marker(cap)
 
 
 def truncation_marker(cap: int) -> str:
@@ -554,6 +630,7 @@ def augment_request_for_retry(request: ApiRequest, *, prior_error: str) -> ApiRe
 __all__ = [
     "SonnetAnalyzer",
     "augment_request_for_retry",
+    "cap_filing_text",
     "compute_decision_id",
     "truncation_marker",
 ]

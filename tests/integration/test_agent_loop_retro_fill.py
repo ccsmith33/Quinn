@@ -664,6 +664,68 @@ async def test_retro_fill_skips_when_no_slack(
     assert called == []
 
 
+@pytest.mark.asyncio
+async def test_retro_review_input_is_capped_like_day_zero(
+    db_path: str,
+    journal,
+    tmp_path: Path,
+) -> None:
+    """Advisory #5 — retro-fill's Opus review sees the SAME capped filing
+    body a day-0 analysis would have (shared `cap_filing_text` helper:
+    cap applied, marker appended, over-cap tail dropped). Without this,
+    every retro review shipped the full untruncated filing and the cap's
+    savings silently stopped applying off the day-0 path."""
+    from analyzer.sonnet import truncation_marker
+    from app.retro_fill import RetroFillCoordinator
+
+    raw_dir = tmp_path / "raw-cap"
+    raw_dir.mkdir()
+    sonnet_pv = _seed_prompt(db_path)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _pid, filing = _insert_pending_proposal(
+        db_path,
+        prompt_version=sonnet_pv,
+        decision_id="retro-cap1",
+        symbol="ACME",
+        conviction=9,
+        raw_text_dir=raw_dir,
+        accession="0001234567-26-100077",
+        created_at=now - dt.timedelta(hours=2),
+    )
+    cap = 20_000
+    Path(filing.raw_text_path).write_text(
+        ("material 8-K item section line\n" * 1_500) + "TAIL_SENTINEL",
+        encoding="utf-8",
+    )
+
+    captured: list[str] = []
+
+    class _SpyReviewer:
+        async def review(self, proposal, source_filing, raw_text):
+            captured.append(raw_text)
+            raise RuntimeError("input captured — abort tick here")
+
+    coordinator = RetroFillCoordinator(
+        journal=journal,
+        opus_reviewer=_SpyReviewer(),
+        ks5_max_concurrent=5,
+        now_fn=lambda: now,
+        max_input_chars=cap,
+    )
+
+    async def _noop_executor(proposal_id: int, f: FilingRow) -> None:
+        return None
+
+    coordinator.set_executor(_noop_executor)
+    await coordinator.run_tick()
+
+    marker = truncation_marker(cap)
+    assert len(captured) == 1
+    assert captured[0].endswith(marker)
+    assert "TAIL_SENTINEL" not in captured[0]
+    assert len(captured[0]) <= cap + len(marker)
+
+
 # ---------------------------------------------------------------------------
 # Helper: a minimal executor mirroring AgentLoop._execute's chain.
 #

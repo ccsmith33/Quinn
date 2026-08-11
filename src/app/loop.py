@@ -117,6 +117,23 @@ class AgentLoop:
         # over-skipping. The counter rides every fail-open log line so
         # either shape is visible without a new metrics surface.
         self._analyzer_gate_fail_opens: int = 0
+        # COST LEVER / BLOCKING-1 — single-evaluation seam for the
+        # full-book Opus-review gate. The ANALYZER's per-proposal gate
+        # read is the authoritative skip decision; wiring the recorder
+        # here makes that decision durable (executions row + watchlist
+        # enrollment written synchronously, inside `analyze`) so this
+        # loop never re-reads the broker to classify a skip it did not
+        # make. Two-phase wiring mirrors `RetroFillCoordinator.
+        # set_executor`; stub components without an analyzer (or stub
+        # analyzers without the seam — legacy unit tests) simply keep
+        # the crash-replay fallback in `_execute`.
+        set_recorder = getattr(
+            getattr(self._components, "analyzer", None),
+            "set_review_skip_recorder",
+            None,
+        )
+        if set_recorder is not None:
+            set_recorder(self._record_review_skip)
 
     # -- Public surface ----------------------------------------------------
 
@@ -722,18 +739,29 @@ class AgentLoop:
         # submission path, (b) gives Feature C's retro-fill query a
         # deterministic signal to find these proposals, and (c) keeps
         # the audit trail complete.
+        #
+        # COST LEVER — a full-book gate skip does NOT normally reach this
+        # guard: the analyzer's skip decision was persisted at analyze
+        # time by `_record_review_skip` (BLOCKING-1 single-evaluation
+        # design), so the idempotency check above already returned. This
+        # branch therefore only classifies (a) pre-gate Feature B skips
+        # and (b) the crash window between the analyzer's store and its
+        # recorder — a FRESH classification from current broker truth,
+        # not a re-read of a decision made elsewhere.
         threshold = self._opus_review_threshold()
         if (
             review is None
             and threshold is not None
             and proposal_row.conviction is not None
+            # Advisory #7 hoist: the effective bar is always >= the
+            # configured one, so a below-threshold proposal never needed
+            # review — don't pay the gate's broker snapshot (3 calls) to
+            # find that out.
+            and proposal_row.conviction >= threshold
         ):
-            # COST LEVER — the full-book gate may have raised the bar past
-            # this proposal, in which case the missing review is a
-            # deliberate, TERMINAL skip rather than a deferral. Recomputed
-            # here from the same helper the analyzer used; with the gate
-            # off `effective == threshold` and the `elif` is unreachable,
-            # so this block is byte-identical to pre-feature behavior.
+            # With the gate off `effective == threshold`, the else-branch
+            # is unreachable, and this block is byte-identical to
+            # pre-feature behavior.
             effective = self._effective_opus_review_threshold(threshold)
             if proposal_row.conviction >= effective:
                 log.info(
@@ -746,27 +774,44 @@ class AgentLoop:
                     },
                 )
                 self._write_rejected_execution(proposal_id, "pending_capacity")
+                # BLOCKING-1 belt-and-braces: below retro-fill's cv9
+                # floor, `pending_capacity` has NO retry path of its own
+                # (Feature C never selects it), so park it on the
+                # watchlist too — the retry pays for the deferred review
+                # before anything reaches the broker, exactly like a
+                # gate-skipped row. At/above the floor, retro-fill owns
+                # the rescue and a second queue would double-path it.
+                from app.retro_fill import RETRO_CONVICTION_FLOOR
+
+                if proposal_row.conviction < RETRO_CONVICTION_FLOOR:
+                    self._enroll_capital_blocked(
+                        proposal_id, proposal_row, "pending_capacity"
+                    )
                 return
-            if proposal_row.conviction >= threshold:
-                log.info(
-                    "agent.execution_review_skipped_full_book",
-                    extra={
-                        "event": "agent.execution_review_skipped_full_book",
-                        "proposal_id": proposal_id,
-                        "conviction": proposal_row.conviction,
-                        "configured_threshold": threshold,
-                        "effective_threshold": effective,
-                    },
-                )
-                self._write_rejected_execution(
-                    proposal_id, "review_skipped_full_book"
-                )
-                # The watchlist is how these get their second chance —
-                # `review_skipped_full_book` is a capital-class reason, so
-                # an eligible proposal parks here exactly as a
-                # `ks5_concurrent_limit` reject would have.
-                self._enroll_review_skipped(proposal_id, proposal_row)
-                return
+            # Crash-replay fallback for a gate skip whose recorder never
+            # ran (or a stub analyzer without the seam): classify + rescue
+            # exactly as the recorder would have.
+            log.info(
+                "agent.execution_review_skipped_full_book",
+                extra={
+                    "event": "agent.execution_review_skipped_full_book",
+                    "proposal_id": proposal_id,
+                    "conviction": proposal_row.conviction,
+                    "configured_threshold": threshold,
+                    "effective_threshold": effective,
+                },
+            )
+            self._write_rejected_execution(
+                proposal_id, "review_skipped_full_book"
+            )
+            # The watchlist is how these get their second chance —
+            # `review_skipped_full_book` is a capital-class reason, so
+            # an eligible proposal parks here exactly as a
+            # `ks5_concurrent_limit` reject would have.
+            self._enroll_capital_blocked(
+                proposal_id, proposal_row, "review_skipped_full_book"
+            )
+            return
 
         # Run the validator → sizer → submitter chain. Day-0 semantics:
         # the chain journals reject rows and (feature: watchlist) enrolls
@@ -1112,25 +1157,50 @@ class AgentLoop:
             cfg = getattr(self._config, "execution", None)
             if cfg is None or not watchlist_enabled(cfg):
                 return
-            if reason not in CAPITAL_REJECT_REASONS:
+            # `pending_capacity` is deliberately NOT in
+            # CAPITAL_REJECT_REASONS (that set is the day-0 reject-chain
+            # vocabulary, pinned by tests as the canonical list): it
+            # reaches this seam only from `_execute`'s belt-and-braces
+            # branch, which enrolls sub-cv9 rows retro-fill will never
+            # select (BLOCKING-1).
+            if (
+                reason not in CAPITAL_REJECT_REASONS
+                and reason != "pending_capacity"
+            ):
                 return
             if trade.conviction < cfg.watchlist_min_conviction:
                 return
             # Symbol-not-held guard, using the same effective-symbol view
             # the sizer's KS-5/KS-6 checks use (broker positions plus
-            # queued pre-market entry buys).
-            held = {
-                p.symbol
-                for p in self._components.broker.get_positions()
-                if p.qty != 0
-            }
+            # queued pre-market entry buys). Best-effort in BOTH reads:
+            # this guard is an optimization (the retry pass resolves
+            # `skipped_held`, and KS-6 hard-blocks a double entry at the
+            # sizer), so a transient broker error must degrade to
+            # "assume not held" rather than dropping the enrollment —
+            # losing the rescue row strands the proposal (BLOCKING-1).
+            held: set[str] = set()
+            try:
+                held = {
+                    p.symbol
+                    for p in self._components.broker.get_positions()
+                    if p.qty != 0
+                }
+            except Exception as e:  # noqa: BLE001 — KS-6 is the hard gate
+                log.warning(
+                    "watchlist.enroll_positions_unavailable",
+                    extra={
+                        "event": "watchlist.enroll_positions_unavailable",
+                        "proposal_id": proposal_id,
+                        "error": str(e),
+                    },
+                )
             try:
                 held |= {
                     o.symbol
                     for o in self._components.broker.get_open_orders()
                     if o.is_entry
                 }
-            except Exception:  # noqa: BLE001 — positions are the hard gate
+            except Exception:  # noqa: BLE001 — same posture as positions
                 pass
             if trade.symbol in held:
                 return
@@ -1349,6 +1419,40 @@ class AgentLoop:
                         "price_delta_pct": delta_pct,
                     },
                 )
+            elif reason == "opus_reject":
+                # Advisory #4 — the deferred review came back reject /
+                # malformed. That verdict will not change on a later
+                # tick, so resolve NOW instead of blocking the symbol
+                # (one pending row per symbol) and re-logging daily
+                # until expiry. The `proposal_reviews` row carries the
+                # audit trail of the rejection.
+                resolve_watchlist_row(db, row.id, status="skipped_review_reject")
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                log.info(
+                    "watchlist.skipped_review_reject",
+                    extra={
+                        "event": "watchlist.skipped_review_reject",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                    },
+                )
+            elif reason == "review_attempts_exhausted":
+                # Advisory #3 — the deferred review failed
+                # MAX_DEFERRED_REVIEW_ATTEMPTS times (exceptions or
+                # missing persisted reviews). Stop burning retries (and
+                # potential API spend) on a review that keeps failing.
+                resolve_watchlist_row(db, row.id, status="review_failed")
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                log.warning(
+                    "watchlist.review_failed",
+                    extra={
+                        "event": "watchlist.review_failed",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                    },
+                )
             else:
                 # Still blocked (usually capital again) — leave pending
                 # with NO status change; throttle the log to once per ET
@@ -1371,10 +1475,11 @@ class AgentLoop:
         """Retry a parked proposal through the NORMAL execution chain.
 
         The chain itself is validator + sizer + submitter only — no LLM.
-        The ONE exception is a proposal enrolled with
-        `review_skipped_full_book`: the Opus-review cost gate deliberately
-        did not pay for review on day 0 because a full book with no cash
-        made the trade impossible. Capital has since freed (that is why
+        The ONE exception is a proposal that carries no review because
+        the day-0 pipeline deliberately deferred it: a
+        `review_skipped_full_book` gate skip, or a sub-cv9
+        `pending_capacity` row rescued by `_execute`'s belt-and-braces
+        enrollment. Capital has since freed (that is why
         this retry is running), so the review is now due and is paid for
         HERE, before anything reaches the broker — FR-17 holds on every
         path. Every other enrolled row was reviewed on day 0 (or never
@@ -1424,11 +1529,16 @@ class AgentLoop:
             return "already_executed"
         review = get_proposal_review_by_proposal_id(db, row.proposal_id)
         if review is None:
-            review, blocked = await self._review_deferred_entry(proposal_row)
+            review, blocked = await self._review_deferred_entry(
+                proposal_row, watchlist_row=row
+            )
             if blocked is not None:
                 return blocked
         if review is not None and review.decision in ("reject", "malformed"):
-            return "opus_reject"  # defensive; enrollment never follows these
+            # Advisory #4 — the caller resolves the row terminally
+            # (`skipped_review_reject`); a rejected review never improves
+            # on a later tick.
+            return "opus_reject"
         return await self._run_entry_chain(
             row.proposal_id, proposal_row, review, day_zero=False
         )
@@ -1467,19 +1577,27 @@ class AgentLoop:
         )
 
     async def _review_deferred_entry(
-        self, proposal_row: Any
+        self, proposal_row: Any, *, watchlist_row: Any
     ) -> tuple[Any, str | None]:
-        """Pay for the Opus review the full-book cost gate deferred.
+        """Pay for the Opus review the day-0 cost gates deferred.
 
         Returns `(review_row, None)` when the proposal is cleared to
         continue, or `(None, reason)` when the caller must leave the
-        watchlist row pending for another tick. `(None, None)` means no
-        review was ever due — the pre-gate path, unchanged.
+        watchlist row pending for another tick (or resolve it, for the
+        terminal `review_attempts_exhausted` reason). `(None, None)`
+        means no review was ever due — the pre-gate path, unchanged.
 
-        This runs only for rows enrolled as `review_skipped_full_book`:
-        with the gate off, `_execute`'s guard has already written
-        `pending_capacity` for every unreviewed proposal at/above the
-        threshold, so nothing reaches here without a review.
+        This runs for rows enrolled as `review_skipped_full_book` (the
+        full-book gate skip) and for sub-cv9 `pending_capacity` rows
+        rescued by `_execute`'s belt-and-braces enrollment; every other
+        enrolled row already carries its day-0 review.
+
+        Advisory #3 — attempts that FAIL (reviewer raised, or returned
+        without persisting a review row) are counted in the row's notes;
+        at `MAX_DEFERRED_REVIEW_ATTEMPTS` the caller resolves the row
+        `review_failed` instead of retrying every tick (~390/day)
+        forever. A still-locked book is NOT a failed attempt — nothing
+        was spent and nothing failed; expiry bounds that wait.
         """
         threshold = self._opus_review_threshold()
         if threshold is None or proposal_row.conviction is None:
@@ -1509,9 +1627,20 @@ class AgentLoop:
                 "threshold": threshold,
             },
         )
+        # Advisory #5 — the deferred review must see the SAME capped
+        # filing body a day-0 review would have: same helper, same cap
+        # (read off the analyzer instance, like the decision-id mirror),
+        # so the cap's savings hold on every review path.
+        from analyzer.sonnet import cap_filing_text
+
+        raw_text = cap_filing_text(
+            self._read_raw(filing),
+            cap=int(getattr(self._components.analyzer, "max_input_chars", 0) or 0),
+            filing_id=filing.id,
+        )
         try:
             await self._components.reviewer.review(
-                proposal_row, filing, self._read_raw(filing)
+                proposal_row, filing, raw_text
             )
         except Exception as e:  # noqa: BLE001 — a failed review is retryable
             log.error(
@@ -1523,7 +1652,9 @@ class AgentLoop:
                     "error_class": type(e).__name__,
                 },
             )
-            return None, "review_failed"
+            return None, self._bump_deferred_review_attempts(
+                watchlist_row, "review_failed"
+            )
 
         review = get_proposal_review_by_proposal_id(
             self._components.journal.db_path, proposal_row.id
@@ -1531,14 +1662,113 @@ class AgentLoop:
         if review is None:
             # The reviewer returned without persisting — never submit
             # unreviewed (FR-17). Row stays pending.
-            return None, "review_missing"
+            return None, self._bump_deferred_review_attempts(
+                watchlist_row, "review_missing"
+            )
         return review, None
 
-    def _enroll_review_skipped(self, proposal_id: int, proposal_row: Any) -> None:
-        """Park a full-book-skipped proposal on the watchlist.
+    def _bump_deferred_review_attempts(
+        self, watchlist_row: Any, reason: str
+    ) -> str:
+        """Advisory #3 — persist one failed deferred-review attempt on the
+        watchlist row's notes (`review_attempts=N`, survives restarts) and
+        return the reason the caller should surface:
+        `review_attempts_exhausted` once the budget is spent, else
+        `reason` unchanged (row stays pending). Best-effort: a failed
+        notes write logs and leaves the count as-was — the bound then
+        just takes one extra tick to reach.
+        """
+        from app.watchlist import (
+            MAX_DEFERRED_REVIEW_ATTEMPTS,
+            parse_review_attempts,
+            with_review_attempts,
+        )
+        from journal.repo import update_watchlist_notes
+
+        attempts = parse_review_attempts(watchlist_row.notes) + 1
+        try:
+            update_watchlist_notes(
+                self._components.journal.db_path,
+                watchlist_row.id,
+                with_review_attempts(watchlist_row.notes, attempts),
+            )
+        except Exception as e:  # noqa: BLE001 — never lose the retry itself
+            log.error(
+                "watchlist.review_attempts_persist_failed",
+                extra={
+                    "event": "watchlist.review_attempts_persist_failed",
+                    "watchlist_id": watchlist_row.id,
+                    "error": str(e),
+                },
+            )
+        log.info(
+            "watchlist.deferred_review_attempt_failed",
+            extra={
+                "event": "watchlist.deferred_review_attempt_failed",
+                "watchlist_id": watchlist_row.id,
+                "proposal_id": watchlist_row.proposal_id,
+                "reason": reason,
+                "attempts": attempts,
+                "max_attempts": MAX_DEFERRED_REVIEW_ATTEMPTS,
+            },
+        )
+        if attempts >= MAX_DEFERRED_REVIEW_ATTEMPTS:
+            return "review_attempts_exhausted"
+        return reason
+
+    def _record_review_skip(
+        self,
+        proposal_id: int,
+        *,
+        configured_threshold: int,
+        effective_threshold: int,
+    ) -> None:
+        """BLOCKING-1 — persist the analyzer's full-book skip decision.
+
+        Invoked synchronously by `SonnetAnalyzer.analyze` (via the
+        recorder seam wired in `__init__`) at the moment the gate skips
+        Opus, so the decision is durable BEFORE `_execute` runs and
+        survives a crash between analyze and execute. Writes the
+        `review_skipped_full_book` executions row — which `_execute`'s
+        idempotency check then honors, making the analyzer's single gate
+        evaluation the only one — and parks the proposal on the watchlist
+        for its deferred-review second chance.
+        """
+        proposal_row = get_proposal_by_id(
+            self._components.journal.db_path, proposal_id
+        )
+        if proposal_row is None:  # pragma: no cover — analyzer just stored it
+            log.error(
+                "agent.review_skip_proposal_missing",
+                extra={
+                    "event": "agent.review_skip_proposal_missing",
+                    "proposal_id": proposal_id,
+                },
+            )
+            return
+        log.info(
+            "agent.execution_review_skipped_full_book",
+            extra={
+                "event": "agent.execution_review_skipped_full_book",
+                "proposal_id": proposal_id,
+                "conviction": proposal_row.conviction,
+                "configured_threshold": configured_threshold,
+                "effective_threshold": effective_threshold,
+            },
+        )
+        self._write_rejected_execution(proposal_id, "review_skipped_full_book")
+        self._enroll_capital_blocked(
+            proposal_id, proposal_row, "review_skipped_full_book"
+        )
+
+    def _enroll_capital_blocked(
+        self, proposal_id: int, proposal_row: Any, reason: str
+    ) -> None:
+        """Park a capital-blocked proposal (gate skip or sub-cv9
+        `pending_capacity`) on the watchlist.
 
         `_maybe_enroll_watchlist` normally runs inside `_run_entry_chain`,
-        which this proposal never reaches — it was rejected before the
+        which these proposals never reach — they were rejected before the
         validator. Rebuild the working `TradeProposal` from the stored
         payload (no reviewer overlay: there is no review) so the same
         enrollment filters apply. Best-effort — a payload we cannot parse
@@ -1558,9 +1788,7 @@ class AgentLoop:
                 },
             )
             return
-        self._maybe_enroll_watchlist(
-            proposal_id, trade, "review_skipped_full_book", quote_last=None
-        )
+        self._maybe_enroll_watchlist(proposal_id, trade, reason, quote_last=None)
 
     def _attempt_displacement(
         self,
@@ -1925,7 +2153,7 @@ class AgentLoop:
             filing_id=filing.id,
             model_id=sonnet_model_id,
             prompt_version=prompt_version,
-            input_cap=self._components.analyzer._max_input_chars,  # noqa: SLF001
+            input_cap=self._components.analyzer.max_input_chars,
         )
 
     def _lookup_existing_proposal(

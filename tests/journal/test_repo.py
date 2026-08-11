@@ -504,6 +504,39 @@ def test_find_retro_candidate_excludes_already_executed(db: str) -> None:
     assert got is None
 
 
+def test_find_retro_candidate_excludes_review_skipped_full_book(db: str) -> None:
+    """BY DESIGN: a cv9 skipped by the full-book Opus-review gate
+    (`reject_reason='review_skipped_full_book'`) is NOT a retro-fill
+    candidate — retro keys on `pending_capacity` alone. The WATCHLIST is
+    the designated rescue path for gate skips (its deferred retry pays
+    for the review), and the AppConfig cross-field validator guarantees
+    it is on whenever the gate is. This test pins the exclusion as
+    intended behavior, not an accident of the SQL."""
+    from journal.models import ExecutionRow
+    from journal.repo import find_retro_candidate, insert_execution
+
+    pv = _seed_prompt(db)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0)
+    pid = _proposal(
+        db, prompt_version=pv, decision_id="d-fbg", conviction=9,
+        created_at=now - dt.timedelta(hours=1),
+        seed_pending_capacity=False,
+    )
+    insert_execution(
+        db,
+        ExecutionRow(
+            proposal_id=pid,
+            decision="rejected",
+            reject_reason="review_skipped_full_book",
+            submitted_orders_json="[]",
+        ),
+    )
+    got = find_retro_candidate(
+        db, min_conviction=9, not_older_than=now - dt.timedelta(hours=6)
+    )
+    assert got is None
+
+
 def test_find_retro_candidate_two_cv9_picks_most_recent(db: str) -> None:
     from journal.repo import find_retro_candidate
 

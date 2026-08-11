@@ -611,6 +611,426 @@ async def test_watchlist_retry_pays_the_deferred_review_before_entering(
 
 
 @pytest.mark.asyncio
+async def test_gate_skip_survives_broker_read_failure_after_the_analyzer_decision(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """BLOCKING-1, primary fix. The analyzer's gate read says full-book
+    and skips Opus for a cv6; every LATER account read raises (the
+    transient outage that used to make the loop's independent re-read
+    fall back to the base threshold and misfile the skip as
+    `pending_capacity` — invisible to retro-fill's cv9 floor AND to the
+    watchlist). Single-evaluation design: the analyzer's decision is
+    persisted at analyze time, so the proposal lands journaled
+    `review_skipped_full_book` and RESCUED on the watchlist."""
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+    account_reads = {"n": 0}
+    orig_get_account = fake_broker.get_account
+
+    def _account_fails_after_first_read():
+        account_reads["n"] += 1
+        if account_reads["n"] > 1:
+            raise RuntimeError("transient broker outage")
+        return orig_get_account()
+
+    fake_broker.get_account = _account_fails_after_first_read
+
+    await _drive(
+        db_path=db_path,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(full_book_gate=True, threshold=5, ks5_max_concurrent=1),
+        conviction=6,
+    )
+
+    assert _calls(fake_anthropic, "review") == []
+    assert _reject_reasons(db_path) == ["review_skipped_full_book"], (
+        "the analyzer's skip decision — not a divergent broker re-read — "
+        "must classify the missing review"
+    )
+    rows = get_pending_watchlist(db_path)
+    assert len(rows) == 1 and rows[0].symbol == "ACME", (
+        "the skipped proposal must be rescued, not stranded"
+    )
+    # The analyzer's single gate evaluation was the only account read.
+    assert account_reads["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_crash_window_fallback_rescues_pending_capacity_below_retro_floor(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """BLOCKING-1, belt-and-braces — the reviewer's exact divergence
+    scenario, forced through the fallback: the analyzer skips under
+    pressure but its recorder never runs (the crash window between store
+    and record, simulated by unwiring the seam), and the loop's own gate
+    re-read raises (`compute_book_pressure` → None → base threshold).
+    The resulting `pending_capacity` row sits below retro-fill's cv9
+    floor, so it must ALSO park on the watchlist — and the retry must
+    pay for the deferred review before entering (FR-17)."""
+    from app.loop import AgentLoop
+    from tests.integration.conftest import _opus_ratify_json, _valid_proposal_json
+
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+    account_reads = {"n": 0}
+    orig_get_account = fake_broker.get_account
+
+    def _account_fails_after_first_read():
+        account_reads["n"] += 1
+        if account_reads["n"] > 1:
+            raise RuntimeError("transient broker outage")
+        return orig_get_account()
+
+    fake_broker.get_account = _account_fails_after_first_read
+
+    f = make_filing(accession="0001234567-26-00BLK1")
+    insert_prefilter_decision(
+        db_path,
+        PrefilterDecisionRow(
+            filing_id=f.id, decision="accept", rule_fired="material_8k_bypass"
+        ),
+    )
+    queue: asyncio.Queue[FilingRow] = asyncio.Queue()
+    await queue.put(f)
+    fake_anthropic.responses_by_purpose = {
+        "analyze": [_valid_proposal_json(conviction=6, symbol="ACME")],
+        "review": [_opus_ratify_json()],
+    }
+    config = _config(full_book_gate=True, threshold=5, ks5_max_concurrent=1)
+    components = build_components(queue=queue, config=config)
+    loop_obj = AgentLoop(
+        components=components, config=config, shutdown_grace_seconds=10.0
+    )
+    # Simulate the crash window: the analyzer's skip decision is made but
+    # never recorded, so `_execute` must classify it from current truth.
+    components.analyzer.set_review_skip_recorder(None)
+    await _run_one_filing(loop_obj, queue)
+
+    assert _calls(fake_anthropic, "review") == []
+    assert _reject_reasons(db_path) == ["pending_capacity"]
+    rows = get_pending_watchlist(db_path)
+    assert len(rows) == 1
+    assert rows[0].notes == "reject_reason=pending_capacity"
+
+    # Capital frees: the retry pays the deferred review, then enters.
+    fake_broker.get_account = orig_get_account
+    fake_broker.positions = []
+    _cash_flush(fake_broker)
+    await loop_obj._process_watchlist(_market_now())
+    assert len(_calls(fake_anthropic, "review")) == 1
+    assert len(fake_broker.submitted_brackets) == 1
+    assert get_pending_watchlist(db_path) == []
+
+
+@pytest.mark.asyncio
+async def test_gate_on_with_watchlist_off_journals_without_crashing(
+    db_path, journal, fake_broker, fake_anthropic, build_components, make_filing
+) -> None:
+    """Runtime belt behind the AppConfig validator (which refuses this
+    combo at load time — see tests/config/test_loader.py): if a stub /
+    hand-built config reaches the loop with the gate on and the watchlist
+    off, nothing crashes, the skip journals `review_skipped_full_book`,
+    and no watchlist row is written."""
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+
+    await _drive(
+        db_path=db_path,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(
+            full_book_gate=True,
+            threshold=5,
+            ks5_max_concurrent=1,
+            watchlist_min_conviction=0,
+        ),
+        conviction=6,
+    )
+
+    assert _calls(fake_anthropic, "review") == []
+    assert _reject_reasons(db_path) == ["review_skipped_full_book"]
+    assert fake_broker.submitted_orders == []
+    assert get_pending_watchlist(db_path) == []
+
+
+@pytest.mark.asyncio
+async def test_deferred_review_raising_leaves_row_pending_and_counts_attempts(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """Advisory #3 — reviewer.review raising mid-retry: the row stays
+    pending, nothing is submitted, no extra executions row appears on the
+    next tick, and the per-row attempt counter (persisted in notes)
+    increments across ticks."""
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+
+    loop_obj = await _drive(
+        db_path=db_path,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(full_book_gate=True, threshold=5, ks5_max_concurrent=1),
+        conviction=6,
+    )
+    # Capital frees, but Opus is down: the fake raises on an empty queue.
+    fake_broker.positions = []
+    _cash_flush(fake_broker)
+    fake_anthropic.responses_by_purpose["review"] = []
+
+    await loop_obj._process_watchlist(_market_now())
+    rows = get_pending_watchlist(db_path)
+    assert len(rows) == 1, "row must stay pending after a failed review"
+    assert "review_attempts=1" in (rows[0].notes or "")
+    assert "reject_reason=review_skipped_full_book" in (rows[0].notes or "")
+    assert fake_broker.submitted_brackets == []
+
+    await loop_obj._process_watchlist(_market_now())
+    rows = get_pending_watchlist(db_path)
+    assert len(rows) == 1
+    assert "review_attempts=2" in (rows[0].notes or "")
+    assert fake_broker.submitted_brackets == []
+    # No double-spend of journal rows: still just the day-0 rejection.
+    assert _reject_reasons(db_path) == ["review_skipped_full_book"]
+    # Each tick attempted (and failed) exactly one review call.
+    assert len(_calls(fake_anthropic, "review")) == 2
+
+
+@pytest.mark.asyncio
+async def test_deferred_review_failures_resolve_terminally_after_five_attempts(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """Advisory #3 — the attempt budget is 5: the fifth consecutive
+    failure resolves the row `review_failed` instead of retrying
+    (~390/day) until expiry, and later ticks spend nothing."""
+    from app.watchlist import MAX_DEFERRED_REVIEW_ATTEMPTS
+
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+
+    loop_obj = await _drive(
+        db_path=db_path,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(full_book_gate=True, threshold=5, ks5_max_concurrent=1),
+        conviction=6,
+    )
+    fake_broker.positions = []
+    _cash_flush(fake_broker)
+    fake_anthropic.responses_by_purpose["review"] = []
+
+    for _ in range(MAX_DEFERRED_REVIEW_ATTEMPTS):
+        await loop_obj._process_watchlist(_market_now())
+
+    assert get_pending_watchlist(db_path) == []
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT status, notes, resolved_at FROM watchlist"
+        ).fetchone()
+    assert row["status"] == "review_failed"
+    assert f"review_attempts={MAX_DEFERRED_REVIEW_ATTEMPTS}" in row["notes"]
+    assert row["resolved_at"] is not None
+    assert fake_broker.submitted_brackets == []
+
+    # A resolved row is invisible to later ticks — no further spend.
+    await loop_obj._process_watchlist(_market_now())
+    assert len(_calls(fake_anthropic, "review")) == MAX_DEFERRED_REVIEW_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_deferred_review_reject_resolves_row_terminally(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """Advisory #4 — a deferred review that comes back reject resolves
+    the row `skipped_review_reject` immediately: the verdict won't change
+    on a later tick, and a pending row would block the symbol (one
+    pending row per symbol) and log daily until expiry."""
+    import json as _json
+
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+
+    loop_obj = await _drive(
+        db_path=db_path,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(full_book_gate=True, threshold=5, ks5_max_concurrent=1),
+        conviction=6,
+    )
+    fake_broker.positions = []
+    _cash_flush(fake_broker)
+    fake_anthropic.responses_by_purpose["review"] = [
+        _json.dumps(
+            {
+                "decision": "reject",
+                "rationale": (
+                    "The filing's catalyst is already reflected in the price "
+                    "action and the proposal's stop placement is unsound."
+                ),
+            }
+        )
+    ]
+
+    await loop_obj._process_watchlist(_market_now())
+
+    assert fake_broker.submitted_brackets == []
+    assert get_pending_watchlist(db_path) == []
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT status FROM watchlist").fetchone()
+        review_rows = conn.execute(
+            "SELECT decision FROM proposal_reviews"
+        ).fetchall()
+    assert row["status"] == "skipped_review_reject"
+    assert [r["decision"] for r in review_rows] == ["reject"]
+    # Resolved terminally: the next tick spends nothing further.
+    await loop_obj._process_watchlist(_market_now())
+    assert len(_calls(fake_anthropic, "review")) == 1
+
+
+@pytest.mark.asyncio
+async def test_deferred_review_input_is_capped_like_day_zero(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """Advisory #5 — the deferred (watchlist) review must see the SAME
+    capped filing body a day-0 review would have: cap applied, marker
+    appended, over-cap tail dropped."""
+    from pathlib import Path
+
+    from analyzer.sonnet import truncation_marker
+    from app.loop import AgentLoop
+    from tests.integration.conftest import _opus_ratify_json, _valid_proposal_json
+
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+
+    cap = 20_000
+    f = make_filing(accession="0001234567-26-00CAP1")
+    Path(f.raw_text_path).write_text(
+        ("material 8-K item section line\n" * 1_500) + "TAIL_SENTINEL",
+        encoding="utf-8",
+    )
+    insert_prefilter_decision(
+        db_path,
+        PrefilterDecisionRow(
+            filing_id=f.id, decision="accept", rule_fired="material_8k_bypass"
+        ),
+    )
+    queue: asyncio.Queue[FilingRow] = asyncio.Queue()
+    await queue.put(f)
+    fake_anthropic.responses_by_purpose = {
+        "analyze": [_valid_proposal_json(conviction=6, symbol="ACME")],
+        "review": [_opus_ratify_json()],
+    }
+    config = _config(full_book_gate=True, threshold=5, ks5_max_concurrent=1)
+    components = build_components(queue=queue, config=config)
+    components.analyzer._max_input_chars = cap  # ctor value in prod wiring
+    loop_obj = AgentLoop(
+        components=components, config=config, shutdown_grace_seconds=10.0
+    )
+    await _run_one_filing(loop_obj, queue)
+    assert len(get_pending_watchlist(db_path)) == 1
+
+    captured: list[str] = []
+    orig_review = components.reviewer.review
+
+    async def _spy_review(proposal, filing, raw_text):
+        captured.append(raw_text)
+        return await orig_review(proposal, filing, raw_text)
+
+    components.reviewer.review = _spy_review  # type: ignore[method-assign]
+
+    fake_broker.positions = []
+    _cash_flush(fake_broker)
+    await loop_obj._process_watchlist(_market_now())
+
+    assert len(captured) == 1
+    marker = truncation_marker(cap)
+    assert captured[0].endswith(marker)
+    assert "TAIL_SENTINEL" not in captured[0]
+    assert len(captured[0]) <= cap + len(marker)
+    assert len(fake_broker.submitted_brackets) == 1
+
+
+@pytest.mark.asyncio
+async def test_below_threshold_proposals_never_pay_the_gate_snapshot(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+    monkeypatch,
+) -> None:
+    """Advisory #7 — the effective bar is always >= the configured one,
+    so a cv4 (below the configured 5) can never need review: neither the
+    analyzer nor `_execute` may pay the gate's broker snapshot for it."""
+    import app.loop as loop_mod
+    import execution.review_gate as gate_mod
+
+    fake_broker.positions = [_position("WIDG")]
+    _cash_dry(fake_broker)
+
+    resolves = {"n": 0}
+    orig_resolve = gate_mod.resolve_review_threshold
+
+    def _counting_resolve(**kwargs):
+        resolves["n"] += 1
+        return orig_resolve(**kwargs)
+
+    monkeypatch.setattr(gate_mod, "resolve_review_threshold", _counting_resolve)
+    monkeypatch.setattr(loop_mod, "resolve_review_threshold", _counting_resolve)
+
+    await _drive(
+        db_path=db_path,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(full_book_gate=True, threshold=5, ks5_max_concurrent=1),
+        conviction=4,
+    )
+
+    assert resolves["n"] == 0, (
+        "below-threshold proposals must not trigger the gate's broker reads"
+    )
+    assert _calls(fake_anthropic, "review") == []
+    assert "review_skipped_full_book" not in _reject_reasons(db_path)
+
+
+@pytest.mark.asyncio
 async def test_watchlist_retry_while_still_locked_does_not_spend(
     db_path, journal, fake_broker, fake_anthropic, build_components, make_filing
 ) -> None:
