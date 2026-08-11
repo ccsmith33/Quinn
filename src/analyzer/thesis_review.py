@@ -102,7 +102,7 @@ class _AnthropicClientPort(Protocol):
         request: ApiRequest,
         *,
         model_id: str,
-        purpose: Literal["analyze", "review", "replay", "audit"],
+        purpose: Literal["analyze", "review", "thesis_review", "replay", "audit"],
         decision_id: str,
         max_tokens: int | None = None,
     ) -> str: ...
@@ -221,11 +221,15 @@ class ThesisReviewer:
         )
         # Build a unique decision_id per thesis-review schedule so llm_calls
         # rows stay distinct from proposal-review rows for the same proposal.
+        # purpose="thesis_review" (2026-08-04 cost-ledger fix): the event-
+        # review layer journals under its own tag — riding "review" made it
+        # indistinguishable from Opus proposal reviews, so every purpose-
+        # keyed spend rollup undercounted the layer to zero.
         decision_id = f"{_DECISION_ID_PREFIX}{ctx.schedule_id:08d}"
         raw = await self._client.call(
             request,
             model_id=self._opus_model_id,
-            purpose="review",
+            purpose="thesis_review",
             decision_id=decision_id,
             max_tokens=self._max_output_tokens,
         )
@@ -283,10 +287,11 @@ class ThesisReviewer:
 
     def _read_telemetry(self, decision_id: str) -> CallTelemetry:
         rows = get_llm_calls_by_decision_id(self._db_path, decision_id)
-        review_rows = [r for r in rows if r.purpose == "review"]
+        review_rows = [r for r in rows if r.purpose == "thesis_review"]
         if not review_rows:
             raise RuntimeError(
-                f"no llm_calls row for decision_id={decision_id!r} purpose=review"
+                f"no llm_calls row for decision_id={decision_id!r} "
+                "purpose=thesis_review"
             )
         last = review_rows[-1]
         return CallTelemetry(

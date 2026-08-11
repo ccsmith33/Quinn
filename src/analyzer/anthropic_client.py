@@ -32,8 +32,13 @@ log = get_logger(__name__)
 
 # "postmortem" / "synthesis" are the desk-journal Haiku calls (LLM memory
 # layer) — journaled through the same llm_calls telemetry as trading calls.
+# "thesis_review" is the Feature A open-position event-review layer
+# (2026-08-04 cost-ledger fix: it used to ride the "review" tag, which
+# made it indistinguishable from Opus proposal reviews in every
+# purpose-keyed spend rollup).
 Purpose = Literal[
-    "analyze", "review", "replay", "audit", "postmortem", "synthesis"
+    "analyze", "review", "thesis_review", "replay", "audit",
+    "postmortem", "synthesis",
 ]
 
 # Retry policy per S5.2 AC-3: full-jitter exponential backoff,
