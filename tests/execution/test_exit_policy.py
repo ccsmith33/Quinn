@@ -740,9 +740,11 @@ def test_stages_apply_to_preexisting_state_on_restart(db: str) -> None:
 
     _tick(db, broker, trail_stages=stages)
 
-    # gain = (21.42 − 18.31)/18.31 ≈ 17% ≥ 15 → width 8% → 21.42×0.92.
+    # gain = (21.42 − 18.31)/18.31 ≈ 17% ≥ 15 → width 8% → 21.42×0.92 =
+    # 19.7064, quantized DOWN to the cent (hotfix 2026-08-11 — trail
+    # components floor instead of round-half).
     assert len(broker.replaced) == 1
-    assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.71)
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.70)
     state = get_exit_policy_state(db, execution_id=eid)
     assert state is not None
     assert state.trail_distance_pct == pytest.approx(15.0)  # base preserved
@@ -750,26 +752,28 @@ def test_stages_apply_to_preexisting_state_on_restart(db: str) -> None:
 
 def test_live_scenario_base_trail_floor(db: str) -> None:
     """TENX-shaped control: entry 18.31, initial risk 16.99% of entry →
-    default width clamps to 15. HWM 21.42 → floor 21.42×0.85 = 18.21."""
+    default width clamps to 15. HWM 21.42 → floor 21.42×0.85 = 18.207,
+    quantized DOWN to 18.20 (hotfix 2026-08-11)."""
     _seed_position(db, entry_fill=18.31, stop_price=15.20, qty=50)
     broker = _FakeBroker(last=21.42)
 
     _tick(db, broker)
 
     assert len(broker.replaced) == 1
-    assert broker.replaced[0]["new_stop_price"] == pytest.approx(18.21)
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(18.20)
 
 
 def test_live_scenario_staged_floor(db: str) -> None:
     """Same position with stages [(15, 8)]: gain 17% ≥ 15 → width 8 →
-    floor 21.42×0.92 = 19.71 (vs 18.21 flat — the TENX giveback fix)."""
+    floor 21.42×0.92 = 19.7064 → 19.70 quantized down (vs 18.20 flat —
+    the TENX giveback fix)."""
     _seed_position(db, entry_fill=18.31, stop_price=15.20, qty=50)
     broker = _FakeBroker(last=21.42)
 
     _tick(db, broker, trail_stages=[TrailStage(gain_pct=15.0, trail_pct=8.0)])
 
     assert len(broker.replaced) == 1
-    assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.71)
+    assert broker.replaced[0]["new_stop_price"] == pytest.approx(19.70)
 
 
 # ---------------------------------------------------------------------------
@@ -1560,3 +1564,250 @@ def test_stale_entry_cancel_failure_does_not_stop_tick(db: str) -> None:
     assert broker.canceled == []
     # Ratchet still engaged + fired for the open ACME position.
     assert len(broker.replaced) == 1
+
+
+# ---------------------------------------------------------------------------
+# Hotfix 2026-08-11 — broker-valid price quantization (Alpaca 42210000:
+# ATRC's sub-penny avg fill 37.3297 leaked raw into the breakeven floor;
+# the PATCH was rejected and retried at the identical price every tick)
+# + ratchet-stuck escalation logging.
+# ---------------------------------------------------------------------------
+
+
+def test_subpenny_entry_floor_targets_next_cent_and_replace_succeeds(
+    db: str,
+) -> None:
+    """The ATRC incident, replayed: entry fill 37.3297, floor active →
+    the floored target is exactly 37.33 (ceil to the next cent — the
+    floor invariant stop >= entry demands up, not down) and the atomic
+    replace goes through instead of being rejected as sub-penny."""
+    eid, _ = _seed_position(
+        db, entry_fill=37.3297, stop_price=33.60, trail_distance_pct=15.0
+    )
+    broker = _FakeBroker(last=42.0)  # gain 12.5% ≥ 12 → floor binds
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == 37.33  # exact, clean 2dp
+    new_stop = [
+        o for o in get_orders_for_execution(db, eid) if o.role == "trailing_stop"
+    ][-1]
+    assert new_stop.stop_price == 37.33
+
+
+def test_floor_boundary_entry_exactly_two_dp_is_unchanged(db: str) -> None:
+    """Boundary: entry exactly 37.3300. Ceil must be the identity (no
+    drift to 37.34 from binary-float noise) and the floor invariant
+    stop >= entry holds exactly."""
+    _seed_position(
+        db, entry_fill=37.33, stop_price=33.60, trail_distance_pct=15.0
+    )
+    broker = _FakeBroker(last=42.0)
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == 37.33
+    assert broker.replaced[0]["new_stop_price"] >= 37.33  # stop >= entry
+
+
+def test_pke_style_two_dp_entry_unchanged_by_quantization(db: str) -> None:
+    """PKE escaped the incident because its fill was exactly 2dp — the
+    quantized floor must submit that same clean price, unshifted."""
+    _seed_position(
+        db, entry_fill=24.85, stop_price=22.00, trail_distance_pct=15.0
+    )
+    broker = _FakeBroker(last=28.0)  # gain 12.68% ≥ 12 → floor binds
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == 24.85
+
+
+def test_subpenny_trail_target_rounds_down_to_cent(db: str) -> None:
+    """Trail-derived component: 111.05 × 0.95 = 105.4975 must round
+    DOWN to 105.49 (a protective sell-stop a fraction lower is
+    semantically identical and always broker-valid) — never round-half
+    UP to 105.50."""
+    _seed_position(db, trail_distance_pct=5.0)
+    broker = _FakeBroker(last=111.05)
+
+    _tick(db, broker)
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == 105.49
+
+
+def test_selfheal_fresh_stop_is_quantized(db: str) -> None:
+    """PATCH-fails-against-dead-order arm: the FRESH stop submitted by
+    the self-heal must carry the quantized floor (37.33), not the raw
+    sub-penny entry."""
+    _seed_position(
+        db, entry_fill=37.3297, stop_price=33.60, trail_distance_pct=15.0
+    )
+    broker = _FakeBrokerWithLookup(last=42.0)
+    broker.fail_next_replace()
+    broker.seed_order(
+        SubmittedOrder(
+            broker_order_id="stop-eps-acc-1",
+            client_order_id="cid-stop",
+            symbol="ACME",
+            side="sell",
+            qty=100,
+            order_type="stop",
+            status="canceled",  # dead — PATCH doomed, heal submits fresh
+            submitted_at=NOW,
+            stop_price=33.60,
+        )
+    )
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == 37.33
+
+
+def test_engaged_naked_heal_stop_is_quantized(db: str) -> None:
+    """Engaged-state naked-heal arm (_heal_one_naked): fresh stop for a
+    trail-armed position that lost its broker stop is floored at the
+    quantized entry (37.33), never sub-penny."""
+    eid, stop_id = _seed_position(
+        db,
+        entry_fill=37.3297,
+        stop_price=33.60,
+        trail_distance_pct=15.0,
+        stop_final_status="canceled",
+    )
+    upsert_exit_policy_state(
+        db,
+        ExitPolicyStateRow(
+            execution_id=eid,
+            symbol="ACME",
+            trail_distance_pct=15.0,
+            trail_engaged=True,
+            high_water_mark=42.0,
+            stop_order_journal_id=stop_id,
+        ),
+    )
+    broker = _FakeBrokerWithLookup(last=41.0)
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == 37.33
+
+
+def test_stateless_heal_engagement_stop_is_quantized(db: str) -> None:
+    """Stateless-heal engagement arm: the freshly-armed trailing stop
+    for a sub-penny entry is submitted at the quantized floor 37.33."""
+    _seed_position(
+        db,
+        entry_fill=37.3297,
+        stop_price=33.60,
+        trail_distance_pct=15.0,
+        stop_final_status="canceled",
+    )
+    broker = _FakeBrokerFull(last=42.0)
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == 37.33
+
+
+def test_stateless_heal_restored_original_stop_is_quantized(db: str) -> None:
+    """Below-activation stateless heal restores the original stop
+    level. entry − initial_risk reconstructs 33.48 through floats as
+    33.4799…96 — the quantizer's noise guard must submit exactly 33.48,
+    not eat a cent."""
+    _seed_position(
+        db,
+        entry_fill=37.3297,
+        stop_price=33.48,
+        stop_final_status="canceled",
+    )
+    broker = _FakeBrokerFull(last=39.0)  # below activation (41.1794)
+    broker.positions = [_broker_position("ACME")]
+    broker.open_orders = []
+
+    _tick(db, broker, breakeven_floor_gain_pct=12.0)
+
+    assert len(broker.submitted) == 1
+    assert broker.submitted[0].stop_price == 33.48
+
+
+def test_ratchet_stuck_escalates_after_three_identical_failures(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Failure-loop hygiene: identical-target replace failures log
+    ERROR twice, then the THIRD escalates once as `ratchet_stuck`
+    (ERROR — the ops/alerting key) and demotes further identical
+    retries to DEBUG. The retry itself is unchanged."""
+    _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+    ticker = ExitPolicyTicker(
+        journal=_Journal(db), broker=broker, now_fn=lambda: NOW
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="execution.exit_policy"):
+        for _ in range(4):
+            broker.fail_next_replace()
+            ticker.run_tick()
+
+    failed = [
+        r for r in caplog.records
+        if getattr(r, "event", "") == "exit_policy.ratchet_replace_failed"
+    ]
+    assert [r.levelno for r in failed] == [
+        logging.ERROR, logging.ERROR, logging.DEBUG, logging.DEBUG
+    ]
+    stuck = [
+        r for r in caplog.records
+        if getattr(r, "event", "") == "exit_policy.ratchet_stuck"
+    ]
+    assert len(stuck) == 1  # escalates ONCE, not per tick
+    assert stuck[0].levelno == logging.ERROR
+    assert stuck[0].consecutive_failures == 3  # type: ignore[attr-defined]
+    assert stuck[0].target_stop_price == 99.0  # type: ignore[attr-defined]
+
+
+def test_ratchet_stuck_streak_resets_when_target_moves(
+    db: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A new target ends the demotion: after a stuck streak at 99.0, a
+    higher quote produces target 108.0 — its first failure logs ERROR
+    again (fresh streak, no second `ratchet_stuck`), and a subsequent
+    clean tick replaces at the new target."""
+    _seed_position(db)
+    broker = _FakeBroker(last=110.0)
+    ticker = ExitPolicyTicker(
+        journal=_Journal(db), broker=broker, now_fn=lambda: NOW
+    )
+    with caplog.at_level(logging.DEBUG, logger="execution.exit_policy"):
+        for _ in range(3):
+            broker.fail_next_replace()
+            ticker.run_tick()  # streak: ERROR, ERROR, stuck+DEBUG
+
+        broker.set_last("ACME", 120.0)  # target moves to 108.0
+        broker.fail_next_replace()
+        ticker.run_tick()
+
+    failed = [
+        r for r in caplog.records
+        if getattr(r, "event", "") == "exit_policy.ratchet_replace_failed"
+    ]
+    assert failed[-1].levelno == logging.ERROR  # fresh streak at new target
+    assert failed[-1].target_stop_price == 108.0  # type: ignore[attr-defined]
+    stuck = [
+        r for r in caplog.records
+        if getattr(r, "event", "") == "exit_policy.ratchet_stuck"
+    ]
+    assert len(stuck) == 1  # only the 99.0 streak escalated
+
+    ticker.run_tick()  # broker healthy again → the retry lands
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == 108.0

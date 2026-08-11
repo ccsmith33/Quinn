@@ -56,6 +56,7 @@ from execution.protection import (
     cancel_protective_legs,
     restore_protection,
 )
+from execution.quantize import quantize_price
 from journal.exit_policy import get_exit_policy_state, set_stop_order_journal_id
 from journal.models import (
     ChoppingBlockRow,
@@ -786,6 +787,14 @@ class ThesisReviewCoordinator:
         `close` wearing an adjust_stop costume, and it would fire on
         the next tick.
         """
+        # LLM-provided price — quantize defensively BEFORE validation so
+        # the checks and every downstream submission (atomic replace,
+        # dead-stop OCO rebuild, protection restore) agree on one clean,
+        # broker-valid value (Alpaca 42210000; ATRC hotfix 2026-08-11).
+        # DOWN: a protective sell-stop a fraction lower is semantically
+        # identical and never loosens the raise-only check by more than
+        # the increment the broker would have rejected anyway.
+        new_stop_price = quantize_price(new_stop_price, direction="down")
         orders = get_orders_for_execution(self._journal.db_path, execution_id)
         entry = next((o for o in orders if o.role == "entry"), None)
         old_stop = self._get_live_protective_order(
@@ -1249,6 +1258,12 @@ class ThesisReviewCoordinator:
         operation never terminates with fewer protective orders than it
         started with.
         """
+        # LLM-provided price — quantize defensively at the seam (Alpaca
+        # 42210000). UP for a raise-only sell LIMIT: a TP a fraction
+        # higher preserves both the raise-only check and the R:R floor
+        # (rounding down could break the floor by a hair → spurious
+        # reject) and is always broker-valid.
+        new_tp_price = quantize_price(new_tp_price, direction="up")
         orders = get_orders_for_execution(self._journal.db_path, execution_id)
         entry = next((o for o in orders if o.role == "entry"), None)
         tp_row = self._get_live_protective_order(

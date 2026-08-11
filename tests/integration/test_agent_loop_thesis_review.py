@@ -1448,6 +1448,73 @@ async def test_adjust_stop_journals_replacement_chain(
 
 
 @pytest.mark.asyncio
+async def test_adjust_stop_quantizes_llm_subpenny_price(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Hotfix 2026-08-11 (Alpaca 42210000): an LLM-provided sub-penny
+    stop (105.0037) is quantized DOWN to a broker-valid 105.00 before
+    validation and submission — a protective sell-stop a fraction lower
+    is semantically identical; sub-penny would be rejected."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path, entry_at=now - dt.timedelta(days=15), sonnet_pv=sonnet_pv
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_stop_response(105.0037), now,
+    )
+
+    await coordinator.run_tick()
+
+    assert len(broker.replaced) == 1
+    assert broker.replaced[0]["new_stop_price"] == 105.0
+    new_stop = next(
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "stop" and o.final_status is None
+    )
+    assert new_stop.stop_price == 105.0
+
+
+@pytest.mark.asyncio
+async def test_adjust_tp_quantizes_llm_subpenny_price(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Hotfix 2026-08-11 (Alpaca 42210000): an LLM-provided sub-penny
+    TP (180.0042) is quantized UP to 180.01 — up preserves the
+    raise-only and R:R-floor checks, and a sell limit a fraction higher
+    is always broker-valid."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=150.0,
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+
+    broker = _FakeBrokerWithCancelTracking(last_price=145.0)
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_tp_response(180.0042), now,
+    )
+
+    await coordinator.run_tick()
+
+    assert len(broker.replaced_limits) == 1
+    assert broker.replaced_limits[0]["new_limit_price"] == 180.01
+    new_tp = next(
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "take_profit" and o.final_status is None
+    )
+    assert new_tp.limit_price == 180.01
+
+
+@pytest.mark.asyncio
 async def test_adjust_stop_rejects_stop_at_or_above_current_price(
     db_path: str, journal, prompt_builder
 ) -> None:

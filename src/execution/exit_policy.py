@@ -34,6 +34,7 @@ from broker.protocol import BrokerAdapter, OrderRequest
 from config.calendar import ET
 from config.loader import TrailStage
 from execution.protection import DEAD_ORDER_STATUSES
+from execution.quantize import quantize_price
 from journal.exit_policy import (
     ExitPolicyStateRow,
     get_exit_policy_state,
@@ -59,6 +60,13 @@ _PROTECTIVE_ROLES = ("stop", "trailing_stop")
 # distances are schema-bounded (0.5–20) and pass through unclamped.
 _DEFAULT_TRAIL_CLAMP_LO = 1.0
 _DEFAULT_TRAIL_CLAMP_HI = 15.0
+
+# Consecutive identical-target replace failures before the ratchet
+# escalates once (`exit_policy.ratchet_stuck`, ERROR — the ops/alerting
+# key) and demotes further identical-target `ratchet_replace_failed`
+# logs to DEBUG until the target moves (hotfix 2026-08-11: ATRC retried
+# a broker-invalid sub-penny target at ERROR every tick forever).
+_RATCHET_STUCK_THRESHOLD = 3
 
 
 class _JournalLike(Protocol):
@@ -148,6 +156,10 @@ class ExitPolicyTicker:
         self._trail_stages = tuple(trail_stages)
         self._breakeven_floor_gain_pct = breakeven_floor_gain_pct
         self._now_fn = now_fn
+        # Per-execution (target, consecutive-failure count) for the
+        # replace-failure loop hygiene. In-memory only: a restart
+        # resetting the streak just means up to 3 more ERROR lines.
+        self._ratchet_failures: dict[int, tuple[float, int]] = {}
         self._record_order_outcome = record_order_outcome or (
             lambda order_id, final_status, *, fill_price, fill_qty, fill_at:
             _default_record_order_outcome(
@@ -339,7 +351,14 @@ class ExitPolicyTicker:
             entry_price=entry_price,
             high_water=high_water,
         )
-        trail_target = round(high_water * (1.0 - effective_pct / 100.0), 2)
+        # Trail-derived component rounds DOWN to the increment (a
+        # protective sell-stop a fraction lower is semantically
+        # identical); the breakeven floor rounds entry UP inside
+        # `_breakeven_floor`. Their max is always a clean, broker-valid
+        # price (ATRC hotfix 2026-08-11 — Alpaca 42210000).
+        trail_target = quantize_price(
+            high_water * (1.0 - effective_pct / 100.0), direction="down"
+        )
         target = self._breakeven_floor(
             trail_target, entry_price=entry_price, high_water=high_water
         )
@@ -404,8 +423,35 @@ class ExitPolicyTicker:
                         trail_stop=trail_target,
                         floored_stop=target,
                     )
+                self._ratchet_failures.pop(execution_id, None)
                 return
-            log.error(
+            # Failure-loop hygiene: the retry itself is unchanged (next
+            # tick recomputes and re-PATCHes), but after
+            # `_RATCHET_STUCK_THRESHOLD` consecutive failures at the
+            # SAME target the loop escalates once (`ratchet_stuck`,
+            # ERROR — distinct event for ops/alerting) and further
+            # identical-target failures log at DEBUG until the target
+            # moves.
+            prev = self._ratchet_failures.get(execution_id)
+            count = prev[1] + 1 if prev is not None and prev[0] == target else 1
+            self._ratchet_failures[execution_id] = (target, count)
+            if count == _RATCHET_STUCK_THRESHOLD:
+                log.error(
+                    "exit_policy.ratchet_stuck",
+                    extra={
+                        "event": "exit_policy.ratchet_stuck",
+                        "execution_id": execution_id,
+                        "symbol": symbol,
+                        "old_broker_order_id": live_stop.broker_order_id,
+                        "target_stop_price": target,
+                        "consecutive_failures": count,
+                        "error": str(e),
+                    },
+                )
+            log_fn = (
+                log.debug if count >= _RATCHET_STUCK_THRESHOLD else log.error
+            )
+            log_fn(
                 "exit_policy.ratchet_replace_failed",
                 extra={
                     "event": "exit_policy.ratchet_replace_failed",
@@ -413,11 +459,13 @@ class ExitPolicyTicker:
                     "symbol": symbol,
                     "old_broker_order_id": live_stop.broker_order_id,
                     "target_stop_price": target,
+                    "consecutive_failures": count,
                     "error": str(e),
                 },
             )
             return
 
+        self._ratchet_failures.pop(execution_id, None)
         # Journal chain identical to §3.3: fresh live row, old completed
         # 'replaced' via the §7.4 single-writer.
         new_row_id = insert_order(
@@ -590,7 +638,9 @@ class ExitPolicyTicker:
             high_water=high_water,
         )
         target = self._breakeven_floor(
-            round(high_water * (1.0 - effective_pct / 100.0), 2),
+            quantize_price(
+                high_water * (1.0 - effective_pct / 100.0), direction="down"
+            ),
             entry_price=entry_price,
             high_water=high_water,
         )
@@ -750,7 +800,9 @@ class ExitPolicyTicker:
                 trail_pct, entry_price=entry_price, high_water=last
             )
             target = self._breakeven_floor(
-                round(last * (1.0 - effective_pct / 100.0), 2),
+                quantize_price(
+                    last * (1.0 - effective_pct / 100.0), direction="down"
+                ),
                 entry_price=entry_price,
                 high_water=last,
             )
@@ -782,7 +834,12 @@ class ExitPolicyTicker:
         # Below activation — restore the ORIGINAL entry-time stop level
         # (entry_price − initial_risk is exactly the earliest journaled
         # stop's price; `_initial_geometry` derived it from that row).
-        original_stop = round(entry_price - initial_risk, 4)
+        # That price was broker-valid once, but the float subtraction
+        # round-trip can drift off the increment grid — quantize DOWN
+        # (protective sell-stop a hair lower is semantically identical).
+        original_stop = quantize_price(
+            entry_price - initial_risk, direction="down"
+        )
         if original_stop <= 0:
             log.warning(
                 "exit_policy.selfheal_skipped",
@@ -842,8 +899,17 @@ class ExitPolicyTicker:
         ratchet's pointer. Loud by design — this only runs when an open
         position lost (or never had) broker-side protection. Returns the
         new journal row id, or None when the submit failed."""
-        stop_price = target if target < last else round(
-            last * (1.0 - self._min_step_pct / 100.0), 2
+        # Submission seam: everything broker-bound is quantized DOWN to
+        # a valid increment here as well. A floor-derived target is
+        # already clean 2dp (`_breakeven_floor` ceils entry), so the
+        # down-quantize is the identity for it — the floor invariant
+        # (stop >= entry) survives.
+        stop_price = (
+            quantize_price(target, direction="down")
+            if target < last
+            else quantize_price(
+                last * (1.0 - self._min_step_pct / 100.0), direction="down"
+            )
         )
         client_order_id = (
             f"trail-heal-{execution_id}-{self._now_fn().timestamp():.0f}"
@@ -995,6 +1061,12 @@ class ExitPolicyTicker:
         price. Derived from config + current HWM every call, so a config
         change applies to already-open positions. Off (returns `target`
         unchanged) when the threshold is 0 or the entry price is unknown.
+
+        The floor component is the ENTRY FILL, which can be sub-penny
+        (ATRC 37.3297 — Alpaca rejects it, 42210000): quantize UP to the
+        next valid increment. Up, not down, because the floor invariant
+        is stop >= entry — ceiling preserves it; flooring would break it
+        by a hair.
         """
         if self._breakeven_floor_gain_pct <= 0.0:
             return target
@@ -1003,7 +1075,7 @@ class ExitPolicyTicker:
         threshold = entry_price * (1.0 + self._breakeven_floor_gain_pct / 100.0)
         if high_water < threshold:
             return target
-        return max(target, entry_price)
+        return max(target, quantize_price(entry_price, direction="up"))
 
     def _log_breakeven_floor_applied(
         self,
