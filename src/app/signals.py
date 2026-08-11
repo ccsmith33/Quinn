@@ -1,10 +1,17 @@
 """S5.6 AC-6 — SIGTERM / SIGINT handling.
 
-Installed once at process boot. Both signals flip the loop's
-`shutdown_requested` flag and return. They do NOT call `sys.exit` or
-`loop.stop()` — the consumer task observes the flag at well-defined
-yield points so the in-flight pipeline always finishes cleanly (no
-torn writes, no orphan proposals without their executions row).
+Installed once at process boot. Both signals request a graceful
+shutdown and return. They do NOT call `sys.exit` or `loop.stop()` —
+the consumer task observes the shutdown flag at well-defined yield
+points so the in-flight pipeline always finishes cleanly (no torn
+writes, no orphan proposals without their executions row).
+
+The handler prefers `loop_obj.request_shutdown()` (flag + a `None`
+sentinel on the ingestion queue) so an IDLE consumer blocked on
+`queue.get()` wakes immediately instead of hanging until the next
+filing arrives (systemd would otherwise escalate SIGTERM → SIGKILL
+after its stop timeout). Objects without that method — e.g. test
+stubs — get the legacy flag-only behavior.
 """
 
 from __future__ import annotations
@@ -19,7 +26,9 @@ log = get_logger(__name__)
 
 
 def install_shutdown_signal_handlers(loop_obj: Any) -> None:
-    """Wire SIGTERM and SIGINT to flip `loop_obj.shutdown_requested`.
+    """Wire SIGTERM and SIGINT to `loop_obj.request_shutdown()` (flag +
+    queue sentinel), falling back to flipping
+    `loop_obj.shutdown_requested` on objects without that method.
 
     The handler runs in the asyncio event loop where possible (so the
     flag flip is observed promptly by the consumer). When asyncio's
@@ -36,7 +45,13 @@ def install_shutdown_signal_handlers(loop_obj: Any) -> None:
             "shutdown signal received",
             extra={"event": "shutdown_signal_received", "signal": sig_name},
         )
-        loop_obj.shutdown_requested = True
+        request = getattr(loop_obj, "request_shutdown", None)
+        if request is None:
+            # Legacy / stub loop objects without the sentinel wake:
+            # fall back to flag-only, exactly the pre-fix behavior.
+            loop_obj.shutdown_requested = True
+            return
+        request()
 
     if running is not None:
         for sig, name in (

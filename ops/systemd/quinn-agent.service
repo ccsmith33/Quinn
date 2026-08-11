@@ -14,6 +14,11 @@ WorkingDirectory=/opt/quinn/app
 ExecStart=/opt/quinn/app/.venv/bin/python -m src.app
 Restart=on-failure
 RestartSec=10
+# Backstop only: graceful shutdown should complete in seconds — the
+# SIGTERM handler wakes the idle consumer with a queue sentinel
+# (AgentLoop.request_shutdown) and teardown is bounded by the loop's
+# own grace window. 120s guards a future wedge before SIGKILL.
+TimeoutStopSec=120
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

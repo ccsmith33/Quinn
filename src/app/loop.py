@@ -128,6 +128,28 @@ class AgentLoop:
     def state(self) -> AgentState:
         return self._state
 
+    def request_shutdown(self) -> None:
+        """Graceful-shutdown trigger used by the SIGTERM/SIGINT handler.
+
+        Sets `shutdown_requested` AND wakes an idle consumer parked on
+        `ingestion_queue.get()` by enqueueing the `None` sentinel the
+        consumer already understands — the same flag + sentinel pattern
+        every integration test uses to terminate `run()`. Flag-only (the
+        pre-fix behavior) left a quiet box blocked in `queue.get()` until
+        the next filing arrived, so systemd escalated SIGTERM → SIGKILL
+        (~90s hang) and `_shutdown()` (RSS stop, reconciler stop, cursor
+        persist) never ran.
+
+        Safety: the handler runs on the event-loop thread (installed via
+        `add_signal_handler`), so `put_nowait` is safe here; the queue is
+        unbounded, so it can never raise `QueueFull`. Calling this more
+        than once just queues extra sentinels — the consumer exits on the
+        first one and any leftovers are inert (flag semantics unchanged:
+        an in-flight filing still finishes its pipeline).
+        """
+        self.shutdown_requested = True
+        self._components.ingestion_queue.put_nowait(None)  # type: ignore[arg-type]
+
     async def run(self) -> int:
         """Boot, run the consumer task + reconciler, return on shutdown.
 

@@ -13,6 +13,7 @@ import signal
 
 import pytest
 
+from app.loop import AgentLoop
 from journal.models import FilingRow
 from journal.repo import connect
 
@@ -117,5 +118,173 @@ async def test_agent_loop_sigterm_completes_in_flight(
         "both fully-processed proposals must have execution rows — no orphan proposal"
     )
     assert f3.id not in executed_filing_ids
-    # f3 is still in the queue.
+    # f3 is still in the queue, followed by the None sentinel the SIGTERM
+    # handler enqueued (request_shutdown) to wake an idle consumer. The
+    # consumer exited on the flag check after f2's pipeline, so neither
+    # was consumed.
+    remaining = []
+    while not queue.empty():
+        remaining.append(queue.get_nowait())
+    assert len(remaining) == 2
+    assert remaining[0] is not None and remaining[0].id == f3.id
+    assert remaining[1] is None
+
+
+async def _await_completion(runner: asyncio.Task, timeout: float = 5.0) -> int:
+    """Await `runner` WITHOUT cancelling it on timeout.
+
+    `asyncio.wait_for` would cancel the task at timeout; `AgentLoop.run`
+    catches CancelledError at `await consumer` and still tears down
+    gracefully with rc=0 — exactly the false-pass that would hide the
+    original never-wakes bug. `asyncio.wait` leaves a hung runner hung,
+    so the timeout is observable; we then cancel only to keep the event
+    loop clean before failing the test.
+    """
+    done, pending = await asyncio.wait({runner}, timeout=timeout)
+    if pending:
+        runner.cancel()
+        try:
+            await runner
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # noqa: BLE001 — already failing; keep the loop clean
+            pass
+        pytest.fail(
+            f"AgentLoop.run() did not complete within {timeout}s of the "
+            "shutdown request — the idle consumer was never woken"
+        )
+    return runner.result()
+
+
+class _StubRssLoop:
+    """RSS discovery stand-in exposing the surface `AgentLoop` touches:
+    `start()` (sets `_task`), `stop()`, and the `_task` attribute."""
+
+    def __init__(self) -> None:
+        self._task: asyncio.Task | None = None
+        self.started = False
+        self.stopped = False
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_sigterm_wakes_idle_consumer_and_runs_shutdown(
+    db_path: str,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+) -> None:
+    """The restart-hang fix (load-bearing): SIGTERM while the consumer is
+    IDLE — blocked on an EMPTY `ingestion_queue.get()` — must complete
+    `run()` promptly via the handler's sentinel wake, and `_shutdown()`
+    must actually run (RSS stop + reconciler stop invoked). Pre-fix, the
+    handler only set the flag: nobody woke `queue.get()`, so the process
+    hung until systemd's SIGKILL and teardown never executed.
+    """
+    import dataclasses
+
+    from app.state import AgentState
+
+    queue: asyncio.Queue[FilingRow] = asyncio.Queue()
+    stub_rss = _StubRssLoop()
+    discovered: asyncio.Queue = asyncio.Queue()
+    components = dataclasses.replace(
+        build_components(queue=queue),
+        rss_discovery_loop=stub_rss,
+        detail_fetcher=object(),  # pump never dequeues an item before cancel
+        discovered_queue=discovered,
+    )
+    loop = AgentLoop(components=components, shutdown_grace_seconds=10.0)
+
+    runner = asyncio.create_task(loop.run())
+
+    # Wait until boot finished and the consumer is parked on the empty queue.
+    for _ in range(200):
+        if loop.state is AgentState.IDLE:
+            break
+        await asyncio.sleep(0.01)
+    assert loop.state is AgentState.IDLE
+    await asyncio.sleep(0.05)
+
+    os.kill(os.getpid(), signal.SIGTERM)
+
+    # Pre-fix the consumer stayed blocked on queue.get() and run() never
+    # returned. NOTE: `asyncio.wait` (not `wait_for`) is load-bearing —
+    # `wait_for`'s timeout path CANCELS the runner, and `run()` swallows
+    # CancelledError at `await consumer` and proceeds to `_shutdown()`,
+    # which would mask the hang as a clean rc=0.
+    rc = await _await_completion(runner)
+    assert rc == 0
+    assert loop.shutdown_requested is True
+    assert loop.state is AgentState.STOPPED
+    # _shutdown() ran its teardown: RSS discovery stopped (cursor persist
+    # lives inside stop() in prod) and the reconciler stopped.
+    assert stub_rss.stopped is True
+    assert components.reconciler.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_request_shutdown_wakes_idle_consumer_directly(
+    db_path: str,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+) -> None:
+    """`AgentLoop.request_shutdown()` alone (no OS signal) wakes an idle
+    consumer: flag set + None sentinel on the ingestion queue."""
+    from app.state import AgentState
+
+    queue: asyncio.Queue[FilingRow] = asyncio.Queue()
+    components = build_components(queue=queue)
+    loop = AgentLoop(components=components, shutdown_grace_seconds=10.0)
+
+    runner = asyncio.create_task(loop.run())
+    for _ in range(200):
+        if loop.state is AgentState.IDLE:
+            break
+        await asyncio.sleep(0.01)
+    assert loop.state is AgentState.IDLE
+
+    loop.request_shutdown()
+
+    rc = await _await_completion(runner)
+    assert rc == 0
+    assert components.reconciler.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_double_request_shutdown_is_harmless(
+    db_path: str,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+) -> None:
+    """Two sentinels (e.g. SIGTERM followed by SIGINT, or a repeated
+    SIGTERM from systemd) must not wedge or error: the consumer exits on
+    the first None; the second stays inert in the queue."""
+    from app.state import AgentState
+
+    queue: asyncio.Queue[FilingRow] = asyncio.Queue()
+    components = build_components(queue=queue)
+    loop = AgentLoop(components=components, shutdown_grace_seconds=10.0)
+
+    runner = asyncio.create_task(loop.run())
+    for _ in range(200):
+        if loop.state is AgentState.IDLE:
+            break
+        await asyncio.sleep(0.01)
+
+    loop.request_shutdown()
+    loop.request_shutdown()  # double sentinel while already shutting down
+
+    rc = await _await_completion(runner)
+    assert rc == 0
+    assert loop.state is AgentState.STOPPED
+    # Exactly one leftover sentinel — consumed nothing else, raised nothing.
     assert queue.qsize() == 1
+    assert queue.get_nowait() is None
