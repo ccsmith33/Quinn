@@ -577,6 +577,54 @@ def test_resize_still_unfundable_aborts_before_any_order(db: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# (d2) full book — the KS-5 recount must not count the victim's slot
+# ---------------------------------------------------------------------------
+
+
+def test_full_book_presize_excludes_victim_from_ks5_count(db: str) -> None:
+    """Prod 2026-08 (REPL Aug 7 / SLN Aug 10): with the book at the KS-5
+    cap the pre-size re-run counted the victim's own slot and re-rejected
+    `ks5_concurrent_limit`, aborting every full-book displacement. The
+    eviction frees the victim's slot, so the sizer must see the book
+    WITHOUT the victim."""
+    broker = _RecordingBroker()
+    _seed_victim(db, symbol="WIDG", entry_at=AGED)
+    positions = [_position("WIDG", unrealized_pct=-5.0)] + [
+        _position(f"FIL{i}", unrealized_pct=12.0) for i in range(9)
+    ]
+    cfg = _cfg(ks5_max_concurrent=10)  # book 10/10 — full
+    # Sanity: the plain day-0 sizer rejects on KS-5 at this book — the
+    # exact reject the agent loop now hands to displacement.
+    plain = SizingEngine().size(
+        _proposal(conviction=8), _account(), positions, _quote(), cfg
+    )
+    assert isinstance(plain, SizingRejected)
+    assert plain.reason == "ks5_concurrent_limit"
+
+    result = _attempt(_engine(db, broker), positions=positions, cfg=cfg)
+    assert isinstance(result, SizingAccepted)
+    # WIDG at -5%: mv 1900 → credit 1710; available 350 + 1710 − 300
+    # floor = 1760 ≥ tier ask 700 (cv8 mid) → qty = floor(700/60) = 11.
+    assert result.qty == 11
+    assert [(o.symbol, o.side) for o in broker.submitted] == [("WIDG", "sell")]
+
+
+def test_full_book_recount_still_counts_non_victim_positions(db: str) -> None:
+    """Only the victim's slot is freed. A book OVER the cap by two (the
+    equity-tier-drop shape) is still full after one eviction, so the
+    re-size re-rejects and the displacement aborts BEFORE any order."""
+    broker = _RecordingBroker()
+    _seed_victim(db, symbol="WIDG", entry_at=AGED)
+    positions = [_position("WIDG", unrealized_pct=-5.0)] + [
+        _position(f"FIL{i}", unrealized_pct=12.0) for i in range(10)
+    ]
+    cfg = _cfg(ks5_max_concurrent=10)  # 11 held: minus victim is 10 ≥ cap
+    result = _attempt(_engine(db, broker), positions=positions, cfg=cfg)
+    assert result is None
+    assert broker.submitted == []
+
+
+# ---------------------------------------------------------------------------
 # (e) one displacement per trading day (hard cap)
 # ---------------------------------------------------------------------------
 

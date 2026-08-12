@@ -963,13 +963,22 @@ class AgentLoop:
         )
         if isinstance(sizing, SizingRejected):
             # DISPLACEMENT (default OFF) — a HIGH-conviction proposal
-            # rejected by the KS-7 cash path may evict the weakest
+            # rejected by a CAPITAL gate may evict the weakest
             # qualifying open position and fund itself from the sale
-            # proceeds. Every other reject reason — and every failure
-            # inside the displacement path — leaves the normal rejection
-            # standing, journal reason unchanged.
+            # proceeds. Eviction frees BOTH a KS-5 slot and cash, so the
+            # hook fires on `ks7_cash_reserve` AND — full-book fix
+            # 2026-08-12 (REPL Aug 7 / SLN Aug 10: cv8s died as
+            # `ks5_concurrent_limit` because KS-5 is checked before KS-7
+            # in the sizer, so at a full book the ks7-only hook was
+            # unreachable) — on `ks5_concurrent_limit`. Every other
+            # reject reason — and every failure inside the displacement
+            # path — leaves the normal rejection standing, journal
+            # reason unchanged.
             displaced = None
-            if day_zero and sizing.reason == "ks7_cash_reserve":
+            if day_zero and sizing.reason in (
+                "ks7_cash_reserve",
+                "ks5_concurrent_limit",
+            ):
                 displaced = self._attempt_displacement(
                     proposal_id=proposal_id,
                     trade=trade,
@@ -1261,17 +1270,25 @@ class AgentLoop:
         Ordering / safety contract:
           - feature off (`watchlist_min_conviction = 0`) → return before
             any journal read: no table writes, no tick work;
-          - regular market hours only (entries are day orders — retrying
-            off-hours would queue stale-priced entries);
-          - PRIORITY: if the consumer has queued or in-flight day-0
-            pipeline work, the whole pass defers to the next tick so
-            fresh same-day signals are always processed first;
-          - per row: expiry (trading days, stamped at enrollment) →
-            held-symbol skip → chase guard (strictly above the ceiling
-            skips; exactly AT the ceiling is allowed) → entry through
-            the NORMAL execution chain. A failed entry leaves the row
-            pending — no status change, and the retry-blocked log fires
-            at most once per ET day per row.
+          - EXPIRY SWEEP FIRST, on EVERY tick, before the market-hours
+            and priority gates below. Prod incident 2026-08-12: 36 rows
+            (some enrolled Aug 4 with a 3-trading-day expiry) were still
+            pending on Aug 12 because the expiry check sat behind those
+            gates — a busy full-book session (day-0 work queued or in
+            flight on nearly every in-hours tick) plus the off-hours
+            early return starved it indefinitely. Expiry is a pure
+            journal write (no broker, no quotes, no LLM), so it must
+            resolve regardless of book, capital, or market state;
+          - retries: regular market hours only (entries are day orders —
+            retrying off-hours would queue stale-priced entries);
+          - retry PRIORITY: if the consumer has queued or in-flight
+            day-0 pipeline work, the retry portion defers to the next
+            tick so fresh same-day signals are always processed first;
+          - per retryable row: held-symbol skip → chase guard (strictly
+            above the ceiling skips; exactly AT the ceiling is allowed)
+            → entry through the NORMAL execution chain. A failed entry
+            leaves the row pending — no status change, and the
+            retry-blocked log fires at most once per ET day per row.
         """
         from app.watchlist import chase_exceeded, ensure_utc, watchlist_enabled
         from config.calendar import ET, is_market_hours
@@ -1280,19 +1297,44 @@ class AgentLoop:
         cfg = getattr(self._config, "execution", None)
         if cfg is None or not watchlist_enabled(cfg):
             return
-        if not is_market_hours(now):
-            return
-        if (
-            not self._components.ingestion_queue.empty()
-            or self._state == AgentState.PROCESSING
-        ):
-            return
 
         from journal.repo import get_pending_watchlist, resolve_watchlist_row
 
         db = self._components.journal.db_path
         rows = get_pending_watchlist(db)
         if not rows:
+            return
+
+        # EXPIRY SWEEP — unconditional (see contract above). Runs before
+        # the market-hours / priority / broker gates so an expired row
+        # can never outlive its window because the book was busy.
+        retryable = []
+        for row in rows:
+            if row.id is None:  # pragma: no cover — SELECT always has ids
+                continue
+            if now >= ensure_utc(row.expires_at):
+                resolve_watchlist_row(db, row.id, status="expired")
+                self._watchlist_retry_log_dates.pop(row.id, None)
+                log.info(
+                    "watchlist.expired",
+                    extra={
+                        "event": "watchlist.expired",
+                        "watchlist_id": row.id,
+                        "proposal_id": row.proposal_id,
+                        "symbol": row.symbol,
+                    },
+                )
+                continue
+            retryable.append(row)
+        if not retryable:
+            return
+
+        if not is_market_hours(now):
+            return
+        if (
+            not self._components.ingestion_queue.empty()
+            or self._state == AgentState.PROCESSING
+        ):
             return
         try:
             held = {
@@ -1310,21 +1352,8 @@ class AgentLoop:
             )
             return
 
-        for row in rows:
-            if row.id is None:  # pragma: no cover — SELECT always has ids
-                continue
-            if now >= ensure_utc(row.expires_at):
-                resolve_watchlist_row(db, row.id, status="expired")
-                self._watchlist_retry_log_dates.pop(row.id, None)
-                log.info(
-                    "watchlist.expired",
-                    extra={
-                        "event": "watchlist.expired",
-                        "watchlist_id": row.id,
-                        "proposal_id": row.proposal_id,
-                        "symbol": row.symbol,
-                    },
-                )
+        for row in retryable:
+            if row.id is None:  # pragma: no cover — sweep already skipped
                 continue
             if row.symbol in held:
                 resolve_watchlist_row(db, row.id, status="skipped_held")
@@ -1801,16 +1830,18 @@ class AgentLoop:
         pending_buys: list[OpenOrder],
         pending_entry_spend: float,
     ) -> SizingAccepted | None:
-        """DISPLACEMENT — deterministic KS-7 escape hatch (default OFF).
+        """DISPLACEMENT — deterministic capital escape hatch (default
+        OFF).
 
-        When a high-conviction proposal cannot fund one share above the
-        KS-7 reserve floor, evict the weakest qualifying open position
-        and size the entry against the haircut sale proceeds (see
-        `execution.displacement`). Returns the displacement
+        When a high-conviction proposal is capital-rejected — KS-7 cash
+        floor, or KS-5 with the book full (full-book fix 2026-08-12) —
+        evict the weakest qualifying open position and size the entry
+        against the haircut sale proceeds with the victim's slot freed
+        (see `execution.displacement`). Returns the displacement
         `SizingAccepted` — the victim's sell already ACCEPTED at the
         broker — or None, in which case the caller journals the normal
-        `ks7_cash_reserve` rejection, reason unchanged. Never raises:
-        any error inside the path degrades to the normal rejection.
+        capital rejection, reason unchanged. Never raises: any error
+        inside the path degrades to the normal rejection.
         """
         cfg = getattr(self._config, "execution", None)
         if cfg is None or not getattr(cfg, "displacement_enabled", False):

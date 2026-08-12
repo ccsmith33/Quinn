@@ -1,10 +1,16 @@
 """DISPLACEMENT — evict the weakest qualifying position to fund a
-HIGH-conviction entry that KS-7 would otherwise reject for lack of cash.
+HIGH-conviction entry that the capital gates would otherwise reject.
 
 Default OFF (`ExecutionConfig.displacement_enabled`). When enabled, the
 agent loop invokes `DisplacementEngine.attempt()` after — and only after
-— the sizing engine rejected a proposal with `ks7_cash_reserve` (cash
-cannot fund one share above the reserve floor). The engine then:
+— the sizing engine rejected a proposal with a capital-class reason:
+`ks7_cash_reserve` (cash cannot fund one share above the reserve floor)
+or `ks5_concurrent_limit` (book full — fix 2026-08-12: KS-5 is checked
+BEFORE KS-7 in `SizingEngine.size`, so at a full book every capital
+reject reads `ks5_concurrent_limit` and a ks7-only hook never fires;
+REPL Aug 7 / SLN Aug 10 cv8s died that way in prod). Eviction frees
+BOTH the victim's KS-5 slot and its cash, so one hook serves either
+constraint. The engine then:
 
   1. gates on conviction (`displacement_min_conviction`) and the hard
      ONE-per-trading-day cap (code constant, not configurable);
@@ -33,9 +39,9 @@ cannot fund one share above the reserve floor). The engine then:
 
 SELL-BEFORE-BUY GUARANTEE: the `SizingAccepted` is returned only after
 the broker ACCEPTED the victim's sell. If the sell submission fails for
-any reason, `attempt()` returns None and the loop's normal
-`ks7_cash_reserve` rejection stands (journal reason unchanged) — the buy
-can never submit without the sell having been accepted first.
+any reason, `attempt()` returns None and the loop's normal capital
+rejection stands (journal reason unchanged) — the buy can never submit
+without the sell having been accepted first.
 
 Deterministic only: no LLM calls anywhere in this path.
 """
@@ -204,7 +210,8 @@ class DisplacementEngine:
         pending_buys: list[OpenOrder] | None = None,
         pending_entry_spend: float = 0.0,
     ) -> SizingAccepted | None:
-        """Run the full displacement decision for a ks7-rejected proposal.
+        """Run the full displacement decision for a capital-rejected
+        (`ks7_cash_reserve` / `ks5_concurrent_limit`) proposal.
 
         Returns the `SizingAccepted` for the new entry (victim sale
         already accepted at the broker) or None — the caller's normal
@@ -249,11 +256,27 @@ class DisplacementEngine:
         # ZERO orders submitted — never evict a position the proceeds of
         # which cannot fund the replacement. All other gates (KS-4/5/6,
         # tier rates) run unchanged inside the sizer.
+        #
+        # FULL-BOOK FIX (2026-08-12, REPL/SLN): the eviction frees BOTH
+        # cash AND the victim's KS-5 slot, so the sizer must see the
+        # book WITHOUT the victim. This pre-size runs BEFORE the
+        # victim's sell is submitted (sell-before-buy demands sizing
+        # first), and even after the sell is broker-ACKed the victim
+        # stays in `get_positions()` until the sell fills — so counting
+        # it here re-trips KS-5 at a full book, the very reject this
+        # displacement rescues. Only the victim's slot is credited: the
+        # rest of the held ∪ pending-entry union counts unchanged, and
+        # the victim's sell itself can never re-add a phantom slot
+        # because `SizingEngine.size` counts entry BUYs only (pending
+        # SELLs are excluded from the union by design).
         credit = cfg.displacement_proceeds_haircut * victim.market_value
+        book_after_eviction = [
+            p for p in open_positions if p.symbol != victim.symbol
+        ]
         sizing = sizer.size(
             proposal,
             account,
-            list(open_positions),
+            book_after_eviction,
             quote,
             cfg,
             pending_buys=pending_buys,

@@ -855,6 +855,201 @@ async def test_feature_off_tick_does_no_work(
 
 
 # ---------------------------------------------------------------------------
+# Expiry starvation regression (prod 2026-08-12: 36 pending rows — some
+# enrolled Aug 4 with a 3-trading-day expiry — still pending on Aug 12.
+# The day-0 priority gate and the market-hours gate sat IN FRONT of the
+# expiry check, so a busy full-book session never resolved a single
+# expired row. The expiry sweep must run on every tick, before every
+# other gate.)
+# ---------------------------------------------------------------------------
+
+
+def _force_all_pending_expired(db_path: str) -> None:
+    """Backdate every pending row's expires_at to yesterday (the prod
+    shape: enrollment happened days ago; expiry long past)."""
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE watchlist SET expires_at = ? WHERE status = 'pending'",
+            (dt.datetime.now(dt.UTC) - dt.timedelta(days=1),),
+        )
+
+
+def _insert_second_pending_row(db_path: str, symbol: str = "ZETA") -> None:
+    """A second pending row on another symbol (FK reuses the enrolled
+    proposal — the sweep only reads watchlist columns)."""
+    from journal.models import WatchlistRow
+    from journal.repo import insert_watchlist_row
+
+    with connect(db_path) as conn:
+        pid = conn.execute(
+            "SELECT id FROM proposals ORDER BY id DESC LIMIT 1"
+        ).fetchone()["id"]
+    insert_watchlist_row(
+        db_path,
+        WatchlistRow(
+            proposal_id=pid,
+            symbol=symbol,
+            conviction=8,
+            reference_price=50.0,
+            expires_at=dt.datetime.now(dt.UTC) + dt.timedelta(days=1),
+        ),
+    )
+
+
+def _statuses(db_path) -> list[str]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT status FROM watchlist ORDER BY id ASC"
+        ).fetchall()
+    return [r["status"] for r in rows]
+
+
+def _fill_book_full(fake_broker) -> None:
+    """10 healthy holdings — the KS-5 cap in these tests' config."""
+    fake_broker.positions = [
+        Position(
+            symbol=f"FIL{i}",
+            qty=10,
+            avg_entry_price=50.0,
+            market_value=550.0,
+            unrealized_pnl=50.0,
+        )
+        for i in range(10)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expired_rows_resolve_despite_queued_day0_work_and_full_book(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """The prod shape: multiple pending rows past expiry, book full at
+    KS-5, cash at the floor, AND fresh day-0 work queued — all expired
+    rows must still resolve `expired` on the next tick, with zero broker
+    order submissions."""
+    loop_obj = await _enroll_via_ks7(
+        db_path=db_path,
+        fake_broker=fake_broker,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(),
+    )
+    _insert_second_pending_row(db_path)
+    _force_all_pending_expired(db_path)
+    _fill_book_full(fake_broker)
+    # Book full + fresh day-0 work waiting: the retry pass must defer,
+    # but the expiry sweep must NOT.
+    loop_obj.components.ingestion_queue.put_nowait(object())
+
+    await loop_obj._process_watchlist(_market_now())
+
+    assert _statuses(db_path) == ["expired", "expired"]
+    assert fake_broker.submitted_brackets == []
+
+
+@pytest.mark.asyncio
+async def test_expired_rows_resolve_while_state_processing(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """A day-0 pipeline in flight (state PROCESSING) defers retries only
+    — expiry still resolves on the same tick."""
+    from app.state import AgentState
+
+    loop_obj = await _enroll_via_ks7(
+        db_path=db_path,
+        fake_broker=fake_broker,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(),
+    )
+    _force_all_pending_expired(db_path)
+    loop_obj._state = AgentState.PROCESSING
+
+    await loop_obj._process_watchlist(_market_now())
+
+    assert _statuses(db_path) == ["expired"]
+    assert fake_broker.submitted_brackets == []
+
+
+@pytest.mark.asyncio
+async def test_expired_rows_resolve_outside_market_hours(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """Expiry is a pure journal write — it needs no quotes and no open
+    market, so an expired row resolves on the first tick past
+    expires_at even off-hours (rows expire at 16:00 ET; waiting for the
+    next session just re-creates the starvation window)."""
+    loop_obj = await _enroll_via_ks7(
+        db_path=db_path,
+        fake_broker=fake_broker,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(),
+    )
+    _force_all_pending_expired(db_path)
+    # Next Saturday at/after today — always past the backdated expiry.
+    d = dt.datetime.now(dt.UTC).date()
+    while d.weekday() != 5:
+        d += dt.timedelta(days=1)
+    saturday = dt.datetime.combine(d, dt.time(15, 0), tzinfo=dt.UTC)
+    assert saturday.weekday() == 5
+
+    await loop_obj._process_watchlist(saturday)
+
+    assert _statuses(db_path) == ["expired"]
+    assert fake_broker.submitted_brackets == []
+
+
+@pytest.mark.asyncio
+async def test_expired_rows_resolve_when_broker_positions_unavailable(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """A broker outage blocks the retry pass (held-symbol view needed)
+    but must not block expiry — the sweep touches only the journal."""
+    loop_obj = await _enroll_via_ks7(
+        db_path=db_path,
+        fake_broker=fake_broker,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        config=_config(),
+    )
+    _force_all_pending_expired(db_path)
+
+    def _boom() -> list[Position]:
+        raise RuntimeError("simulated broker outage")
+
+    fake_broker.get_positions = _boom
+
+    await loop_obj._process_watchlist(_market_now())
+
+    assert _statuses(db_path) == ["expired"]
+    assert fake_broker.submitted_brackets == []
+
+
+# ---------------------------------------------------------------------------
 # Review advisories A1/A2 — broker-failure idempotency + displacement interplay
 # ---------------------------------------------------------------------------
 
