@@ -1070,7 +1070,14 @@ class ThesisReviewCoordinator:
         tp_row = self._get_live_protective_order(
             execution_id=execution_id, roles=("take_profit",)
         )
-        tp_price: float | None = tp_row.limit_price if tp_row is not None else None
+        # Hotfix 2026-08-11 (Alpaca 42210000): defensive read-side
+        # quantization (UP — sell limit) for TP rows journaled before
+        # the write-side fix.
+        tp_price: float | None = (
+            quantize_price(tp_row.limit_price, direction="up")
+            if tp_row is not None and tp_row.limit_price is not None
+            else None
+        )
         tp_was_live = False
         if tp_row is not None:
             try:
@@ -1487,11 +1494,17 @@ class ThesisReviewCoordinator:
         # (hotfix for 40310000 "insufficient qty available" errors).
         time.sleep(0.15)
 
+        # Hotfix 2026-08-11 (Alpaca 42210000): the stop half re-uses the
+        # journaled price verbatim — quantize DOWN defensively for rows
+        # written before the write-side fix (new_tp_price was quantized
+        # on entry to _apply_adjust_take_profit). The rebuilt journal
+        # row records the quantized value actually sent (§3.1 honesty).
+        stop_price = quantize_price(stop_row.stop_price, direction="down")
         try:
             stop_resp, tp_resp = self._broker.submit_oco_sell(
                 symbol=symbol,
                 qty=entry_qty,
-                stop_price=stop_row.stop_price,
+                stop_price=stop_price,
                 limit_price=new_tp_price,
                 client_order_id=f"thesis-adjtp-oco-{schedule_id}",
             )
@@ -1535,7 +1548,7 @@ class ThesisReviewCoordinator:
                 order_type="stop",
                 qty=entry_qty,
                 tif="gtc",
-                stop_price=stop_row.stop_price,
+                stop_price=stop_price,
                 broker_order_id=stop_resp.broker_order_id,
                 submitted_at=stop_resp.submitted_at,
                 final_status=None,
@@ -1577,7 +1590,7 @@ class ThesisReviewCoordinator:
                 "event": "thesis_coordinator.tp_added_to_stop_only_position",
                 "execution_id": execution_id,
                 "symbol": symbol,
-                "stop_price": stop_row.stop_price,
+                "stop_price": stop_price,
                 "new_tp_price": new_tp_price,
                 "old_stop_broker_order_id": stop_row.broker_order_id,
                 "new_stop_broker_order_id": stop_resp.broker_order_id,
@@ -1606,11 +1619,16 @@ class ThesisReviewCoordinator:
         alerts the operator within one cycle."""
         if stop_row.stop_price is None or stop_row.stop_price <= 0:
             return False
+        # Hotfix 2026-08-11 (Alpaca 42210000): defensive read-side
+        # quantization (DOWN — protective stop) for rows journaled
+        # before the write-side fix. The replacement journal row records
+        # the quantized value actually sent (§3.1 honesty).
+        stop_price = quantize_price(stop_row.stop_price, direction="down")
         try:
             restored, _ = self._broker.submit_oco_sell(
                 symbol=symbol,
                 qty=qty,
-                stop_price=stop_row.stop_price or 0.0,
+                stop_price=stop_price,
                 limit_price=None,
                 client_order_id=client_order_id,
             )
@@ -1621,7 +1639,7 @@ class ThesisReviewCoordinator:
                     "event": "thesis_coordinator.protection_restore_failed",
                     "execution_id": execution_id,
                     "symbol": symbol,
-                    "stop_price": stop_row.stop_price,
+                    "stop_price": stop_price,
                     "error": str(e),
                 },
             )
@@ -1636,7 +1654,7 @@ class ThesisReviewCoordinator:
                 order_type="stop",
                 qty=qty,
                 tif="gtc",
-                stop_price=stop_row.stop_price,
+                stop_price=stop_price,
                 broker_order_id=restored.broker_order_id,
                 submitted_at=restored.submitted_at,
                 final_status=None,

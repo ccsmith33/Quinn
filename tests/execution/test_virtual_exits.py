@@ -807,3 +807,60 @@ def test_scanner_local_pending_not_incremented_on_transient_failure() -> None:
     assert report.submitted == 1
     assert report.deferred_ev == 0
     assert report.deferred_403 == 0
+
+
+# ---------------------------------------------------------------------------
+# Hotfix 2026-08-11 (Alpaca 42210000) — broker-bound prices quantized: the
+# TP limit at submit (read-side, for pre-fix journal rows) and the
+# deferred_sells trigger_price at rest (it is a raw last-trade print,
+# sub-penny by nature).
+# ---------------------------------------------------------------------------
+
+
+def test_scanner_tp_limit_price_quantized_up() -> None:
+    """A pre-fix virtual_exits row can hold a sub-penny tp_price — the
+    submitted limit is quantized UP to the penny grid (26.4312 → 26.44)."""
+    exits = [_ve(id=7, role="tp", stop_price=None, tp_price=26.4312, qty=5)]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(quotes={"AAPL": 27.0})
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    report = s.run_tick()
+    assert report.submitted == 1
+    assert b.submitted[0].limit_price == 26.44
+
+
+def test_defer_writes_quantized_tp_trigger_price() -> None:
+    """EV-lost defer of a tp row stores the trigger (a raw last print,
+    115.0537) quantized UP at rest — the S-PDT-5 replayer resubmits it
+    verbatim as a limit price, so the row must be clean in the journal."""
+    exits = [_ve(id=1, role="tp", stop_price=None, tp_price=110.0, qty=5)]
+    account = AccountSnapshot(
+        equity=22_300.0, cash=5_000.0, buying_power=44_600.0,
+        long_market_value=17_300.0, daypl=0.0,
+        snapshot_at=dt.datetime(2026, 5, 7, 14, 30, tzinfo=dt.UTC),
+        last_equity=22_000.0, daytrade_count=3,  # budget=0 → defer
+    )
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(account=account, quotes={"AAPL": 115.0537})
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    s.run_tick()
+    assert len(j.deferred_sells) == 1
+    assert j.deferred_sells[0].trigger_price == 115.06
+
+
+def test_defer_writes_quantized_stop_trigger_price() -> None:
+    """pdt_403 defer of a stop row quantizes the raw last print DOWN
+    (protective convention; the stop replay is a market order, so the
+    stored value is audit-only)."""
+    exits = [_ve(id=99, role="stop", stop_price=100.0, qty=5)]
+    j = _FakeJournal(exits=exits)
+    b = _FakeBroker(
+        quotes={"AAPL": 99.0463},
+        submit_raises={
+            "pdt-vexit-99": PDTBudgetExceeded("client cannot day-trade")
+        },
+    )
+    s = VirtualExitScanner(broker=b, journal=j, pdt_state=_active())
+    s.run_tick()
+    assert len(j.deferred_sells) == 1
+    assert j.deferred_sells[0].trigger_price == 99.04

@@ -46,6 +46,7 @@ from execution.pdt_budget import (
     PDTState,
     compute_budget_remaining,
 )
+from execution.quantize import quantize_price
 from journal.models import DeferredSellRow, OrderRow, VirtualExitRow
 from observability.log_port import get_logger
 
@@ -153,7 +154,11 @@ def _to_sell_request(r: VirtualExitRow) -> OrderRequest:
             qty=r.qty,
             order_type="limit",
             tif="day",
-            limit_price=r.tp_price,
+            # Hotfix 2026-08-11 (Alpaca 42210000): rows written before
+            # the write-side quantization (orders.py) may carry a raw
+            # sub-penny price — quantize UP defensively at replay (sell
+            # limit a hair higher is always broker-valid).
+            limit_price=quantize_price(r.tp_price, direction="up"),
             client_order_id=f"pdt-vexit-{r.id}",
         )
     raise ValueError(f"unsupported virtual_exit role: {r.role!r}")
@@ -442,7 +447,17 @@ class VirtualExitScanner:
                 symbol=r.symbol,
                 qty=r.qty,
                 role=r.role,  # 'stop' or 'tp' on the active row.
-                trigger_price=trigger_price,
+                # Hotfix 2026-08-11 (Alpaca 42210000): `trigger_price`
+                # is a raw last-trade print — sub-penny by nature — and
+                # the S-PDT-5 replayer resubmits a 'tp' row's trigger
+                # verbatim as a limit price. Quantize at rest, per role:
+                # tp UP (sell limit a hair higher is broker-valid),
+                # stop DOWN (protective convention; the stop replay is a
+                # market order, so the stored value is audit-only).
+                trigger_price=quantize_price(
+                    trigger_price,
+                    direction="up" if r.role == "tp" else "down",
+                ),
                 ev_at_defer=ev,
                 deferred_reason=reason,  # type: ignore[arg-type]
             )
@@ -519,7 +534,11 @@ def _to_replay_request(d: DeferredSellRow) -> OrderRequest:
         return OrderRequest(
             symbol=d.symbol, side="sell", qty=d.qty,
             order_type="limit", tif="day",
-            limit_price=d.trigger_price,  # the TP threshold the row was deferred at
+            # The TP threshold the row was deferred at. Hotfix
+            # 2026-08-11 (Alpaca 42210000): quantize UP at replay too —
+            # rows deferred before the write-side fix hold raw last-
+            # trade prints, which are sub-penny by nature.
+            limit_price=quantize_price(d.trigger_price, direction="up"),
             client_order_id=f"pdt-replay-{d.id}",
         )
     raise ValueError(f"unsupported deferred_sells role: {d.role!r}")

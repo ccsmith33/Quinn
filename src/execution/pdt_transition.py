@@ -68,6 +68,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from broker.protocol import OrderRequest, Position, Quote, SubmittedOrder
+from execution.quantize import quantize_price
 from journal.models import DeferredSellRow, OrderRow, VirtualExitRow
 from observability.log_port import get_logger
 
@@ -464,11 +465,18 @@ class PDTTransitionConverter:
     ) -> None:
         assert stop.id is not None
         assert stop.stop_price is not None  # caller-checked
-        limit_price = tp.tp_price if tp is not None else None
+        # Hotfix 2026-08-11 (Alpaca 42210000): defensive read-side
+        # quantization — virtual_exits rows written before the
+        # write-side fix may carry sub-penny prices. Stop DOWN, TP UP.
+        limit_price = (
+            quantize_price(tp.tp_price, direction="up")
+            if tp is not None and tp.tp_price is not None
+            else None
+        )
         stop_so, tp_so = self._broker.submit_oco_sell(
             symbol=stop.symbol,
             qty=stop.qty,
-            stop_price=stop.stop_price,
+            stop_price=quantize_price(stop.stop_price, direction="down"),
             limit_price=limit_price,
             client_order_id=_client_id(stop.id),
         )
@@ -528,7 +536,9 @@ class PDTTransitionConverter:
             qty=tp.qty,
             order_type="limit",
             tif="gtc",
-            limit_price=tp.tp_price,
+            # Hotfix 2026-08-11 (Alpaca 42210000): defensive read-side
+            # quantization for pre-fix virtual_exits rows.
+            limit_price=quantize_price(tp.tp_price, direction="up"),
             client_order_id=_client_id(tp.id),
         )
         resp = self._broker.submit_order(req)

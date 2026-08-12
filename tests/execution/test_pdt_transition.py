@@ -867,3 +867,49 @@ def test_drain_covers_breached_stop_sibling_tp_deferred_rows() -> None:
     assert report.converted_market == 1
     assert report.invalidated_deferred == 2
     assert {d for d, _ in journal.skipped_deferred} == {7, 8}
+
+
+# ---------------------------------------------------------------------------
+# Hotfix 2026-08-11 (Alpaca 42210000) — defensive read-side quantization:
+# virtual_exits rows written before the write-side fix (orders.py) may
+# carry sub-penny prices; conversion must submit grid-clean values.
+# ---------------------------------------------------------------------------
+
+
+def test_oco_conversion_quantizes_subpenny_journal_prices() -> None:
+    """Stop DOWN (17.8567 → 17.85), TP UP (26.4312 → 26.44) on the OCO
+    conversion of a sub-penny virtual-exit pair."""
+    exits = [
+        _vexit(
+            1, execution_id=42, symbol="AAPL", role="stop", stop_price=17.8567
+        ),
+        _vexit(2, execution_id=42, symbol="AAPL", role="tp", tp_price=26.4312),
+    ]
+    broker = _FakeBroker(
+        positions=[_position("AAPL")], quotes={"AAPL": _quote("AAPL", 20.0)}
+    )
+    journal = _FakeJournal(exits)
+    report = _run(broker, journal)
+
+    assert report.converted_oco == 1
+    assert broker.oco_calls[0]["stop_price"] == 17.85
+    assert broker.oco_calls[0]["limit_price"] == 26.44
+
+
+def test_tp_only_conversion_quantizes_subpenny_price() -> None:
+    """TP-only conversion quantizes the sub-penny journal price UP."""
+    exits = [
+        _vexit(
+            1, execution_id=42, symbol="AAPL", role="stop",
+            stop_price=17.85, state="submitted",
+        ),
+        _vexit(2, execution_id=42, symbol="AAPL", role="tp", tp_price=26.4312),
+    ]
+    broker = _FakeBroker(
+        positions=[_position("AAPL")], quotes={"AAPL": _quote("AAPL", 20.0)}
+    )
+    journal = _FakeJournal(exits)
+    report = _run(broker, journal)
+
+    assert report.converted_tp_limit == 1
+    assert broker.submitted[0].limit_price == 26.44

@@ -578,3 +578,19 @@ def test_replayer_emits_run_log(
     ]
     assert len(runs) == 1
     assert runs[0].replayed_count == 1
+
+
+def test_replayer_tp_limit_price_quantized_up() -> None:
+    """Hotfix 2026-08-11 (Alpaca 42210000): a deferred_sells row written
+    before the write-side fix carries a raw sub-penny last print as its
+    trigger — the replayed TP limit is quantized UP (110.0537 → 110.06)
+    instead of being rejected as sub-penny."""
+    j = _FakeJournal(
+        unreplayed=[_drow(id=23, role="tp", trigger_price=110.0537)]
+    )
+    b = _FakeBroker()
+    r = DeferredSellReplayer(broker=b, journal=j, now_fn=_now_premarket)
+    r.run()
+    submitted = b.submitted[0]
+    assert submitted.order_type == "limit"
+    assert submitted.limit_price == 110.06

@@ -1515,6 +1515,99 @@ async def test_adjust_tp_quantizes_llm_subpenny_price(
 
 
 @pytest.mark.asyncio
+async def test_dead_stop_oco_rebuild_quantizes_journaled_subpenny_tp(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Hotfix 2026-08-11 follow-up (Alpaca 42210000, read-side): the
+    dead-stop OCO rebuild replays the journaled TP price verbatim — a
+    pre-fix sub-penny row (150.0037) must go out quantized UP (150.01),
+    and the rebuilt journal row records what was actually sent."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        take_profit_price=150.0037,  # sub-penny journal row (pre-fix era)
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+    old_tp_row = next(
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "take_profit"
+    )
+
+    broker = _FakeBrokerWithCancelTracking(last_price=110.0)
+    broker.fail_next_replace()
+    broker.seed_order(
+        _live_order("orig-stop-ACME", status="expired", stop_price=90.0)
+    )
+    broker.seed_order(
+        _live_order(
+            "orig-tp-ACME", order_type="limit", status="accepted",
+            limit_price=150.0037,
+        )
+    )
+    broker.positions = [_broker_position("ACME")]
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_stop_response(105.0), now,
+    )
+
+    await coordinator.run_tick()
+
+    assert len(broker.submitted_oco) == 1
+    oco = broker.submitted_oco[0]
+    assert oco["stop_price"] == 105.0
+    assert oco["limit_price"] == 150.01  # quantized UP, not raw 150.0037
+    new_tp = next(
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "take_profit" and o.id != old_tp_row.id
+    )
+    assert new_tp.limit_price == 150.01
+
+
+@pytest.mark.asyncio
+async def test_add_tp_oco_quantizes_journaled_subpenny_stop(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Hotfix 2026-08-11 follow-up (Alpaca 42210000, read-side): the
+    add-TP-to-stop-only OCO re-places the journaled stop price verbatim
+    — a pre-fix sub-penny row (90.0037) must go out quantized DOWN
+    (90.00), and the rebuilt journal row records what was sent."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        stop_loss_price=90.0037,  # sub-penny journal row (pre-fix era)
+        take_profit_price=None,  # stop-only shape
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+    old_stop_row = next(
+        o for o in _orders_for_execution(db_path, eid) if o.role == "stop"
+    )
+
+    broker = _FakeBrokerWithCancelTracking(last_price=145.0)
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_tp_response(180.0), now,
+    )
+
+    await coordinator.run_tick()
+
+    assert len(broker.submitted_oco) == 1
+    oco = broker.submitted_oco[0]
+    assert oco["stop_price"] == 90.0  # quantized DOWN, not raw 90.0037
+    assert oco["limit_price"] == 180.0
+    new_stop = next(
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "stop" and o.id != old_stop_row.id
+    )
+    assert new_stop.stop_price == 90.0
+
+
+@pytest.mark.asyncio
 async def test_adjust_stop_rejects_stop_at_or_above_current_price(
     db_path: str, journal, prompt_builder
 ) -> None:
@@ -2048,6 +2141,56 @@ async def test_adjust_tp_on_stop_only_position_restores_stop_when_oco_fails(
     follow_ups = _pending_schedules(db_path, eid, now)
     assert len(follow_ups) == 1
     assert follow_ups[0]["scheduled_reason"] == "adjust_take_profit"
+
+
+@pytest.mark.asyncio
+async def test_broker_restore_stop_quantizes_journaled_subpenny_stop(
+    db_path: str, journal, prompt_builder
+) -> None:
+    """Hotfix 2026-08-11 follow-up (Alpaca 42210000, read-side): the
+    incident-only rollback path `_broker_restore_stop` re-places the
+    journaled stop price verbatim after a failed OCO — a pre-fix
+    sub-penny row (90.0037) must be restored quantized DOWN (90.00), at
+    the broker AND in the replacement journal row. A raw resubmit would
+    be rejected (42210000) and leave the position naked — the exact
+    failure mode this rollback exists to prevent."""
+    sonnet_pv, _ = _seed_prompts(db_path, prompt_builder)
+    now = dt.datetime(2026, 5, 6, 14, 0, 0, tzinfo=dt.UTC)
+    _, eid = _setup_open_position(
+        db_path,
+        entry_at=now - dt.timedelta(days=15),
+        stop_loss_price=90.0037,  # sub-penny journal row (pre-fix era)
+        take_profit_price=None,  # stop-only shape
+        sonnet_pv=sonnet_pv,
+    )
+    _due_schedule(db_path, eid, now)
+    old_stop_row = next(
+        o for o in _orders_for_execution(db_path, eid) if o.role == "stop"
+    )
+
+    broker = _FakeBrokerWithCancelTracking(last_price=145.0)
+    broker.fail_next_oco()  # cancel succeeds, OCO fails → restore branch
+    coordinator = _make_coordinator(
+        db_path, journal, prompt_builder, broker,
+        _adjust_tp_response(180.0), now,
+    )
+
+    await coordinator.run_tick()
+
+    # The restore re-placed a plain GTC stop, quantized DOWN.
+    assert broker.canceled == ["orig-stop-ACME"]
+    assert any(op == "submit_oco_failed" for op, _ in broker.call_log)
+    assert len(broker.submitted_oco) == 1  # the restore call
+    restore = broker.submitted_oco[0]
+    assert restore["stop_price"] == 90.0  # not raw 90.0037
+    assert restore["limit_price"] is None
+    # §3.1 honesty: the restored journal row records the sent value.
+    restored_stop = next(
+        o for o in _orders_for_execution(db_path, eid)
+        if o.role == "stop" and o.final_status is None
+        and o.id != old_stop_row.id
+    )
+    assert restored_stop.stop_price == 90.0
 
 
 @pytest.mark.asyncio

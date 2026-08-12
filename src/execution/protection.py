@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from execution.quantize import quantize_price
 from journal.models import OrderRow
 from journal.repo import connect, insert_order
 from observability.log_port import get_logger
@@ -197,12 +198,24 @@ def restore_protection(
         return None  # no stop to restore (TP-only positions keep their exit
         # via the still-live rows; downside restoration is the money path)
 
+    # Hotfix 2026-08-11 (Alpaca 42210000): defensive read-side
+    # quantization — journal rows written before the write-side fix may
+    # carry sub-penny prices. Stop DOWN, TP UP (role-preserving
+    # directions; clean prices are identity). The replacement journal
+    # rows below record the quantized values actually sent (§3.1
+    # honesty), never the raw originals.
+    stop_price = quantize_price(stop_leg.stop_price, direction="down")
+    tp_price = (
+        quantize_price(tp_leg.limit_price, direction="up")
+        if tp_leg is not None and tp_leg.limit_price is not None
+        else None
+    )
     try:
         stop_resp, tp_resp = broker.submit_oco_sell(
             symbol=stop_leg.symbol,
             qty=stop_leg.qty,
-            stop_price=stop_leg.stop_price,
-            limit_price=tp_leg.limit_price if tp_leg is not None else None,
+            stop_price=stop_price,
+            limit_price=tp_price,
             client_order_id=client_order_id,
         )
     except Exception as e:  # noqa: BLE001
@@ -212,7 +225,7 @@ def restore_protection(
                 "event": "protection.restore_failed",
                 "execution_id": execution_id,
                 "symbol": stop_leg.symbol,
-                "stop_price": stop_leg.stop_price,
+                "stop_price": stop_price,
                 "error": str(e),
                 "error_class": type(e).__name__,
             },
@@ -229,7 +242,7 @@ def restore_protection(
             order_type="stop",
             qty=stop_leg.qty,
             tif="gtc",
-            stop_price=stop_leg.stop_price,
+            stop_price=stop_price,
             broker_order_id=stop_resp.broker_order_id,
             submitted_at=stop_resp.submitted_at,
             final_status=None,
@@ -247,7 +260,7 @@ def restore_protection(
                 order_type="limit",
                 qty=tp_leg.qty,
                 tif="gtc",
-                limit_price=tp_leg.limit_price,
+                limit_price=tp_price,
                 broker_order_id=tp_resp.broker_order_id,
                 submitted_at=tp_resp.submitted_at,
                 final_status=None,
@@ -260,8 +273,8 @@ def restore_protection(
             "event": "protection.restored",
             "execution_id": execution_id,
             "symbol": stop_leg.symbol,
-            "stop_price": stop_leg.stop_price,
-            "tp_price": tp_leg.limit_price if tp_leg is not None else None,
+            "stop_price": stop_price,
+            "tp_price": tp_price,
             "broker_order_id": stop_resp.broker_order_id,
         },
     )
