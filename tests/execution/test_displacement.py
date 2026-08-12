@@ -624,6 +624,29 @@ def test_full_book_recount_still_counts_non_victim_positions(db: str) -> None:
     assert broker.submitted == []
 
 
+def test_victim_is_never_the_proposal_symbol(db: str) -> None:
+    """Pins the self-symbol victim guard (`_qualify_victim` rejects
+    `pos.symbol == new_symbol`). Load-bearing since the full-book fix:
+    KS-5 rejects BEFORE KS-6 in the sizer, so a full-book proposal for
+    an ALREADY-HELD symbol reaches displacement — and the pre-size
+    excludes the victim from the book it hands the sizer, which would
+    also blind the KS-6 re-check to the held position. One deleted
+    guard line away from selling ACME to buy ACME (a wash trade), so it
+    gets its own test: ACME is the weakest, aged, unarmed, sub-cutoff —
+    the ONLY reason it cannot be the victim is that it IS the proposal."""
+    broker = _RecordingBroker()
+    _seed_victim(db, symbol="ACME", entry_at=AGED)
+    positions = [_position("ACME", unrealized_pct=-10.0)] + [
+        _position(f"FIL{i}", unrealized_pct=12.0) for i in range(9)
+    ]
+    cfg = _cfg(ks5_max_concurrent=10)  # full book; ACME the only
+    # journal-lineage candidate — and the proposal's own symbol
+    result = _attempt(_engine(db, broker), positions=positions, cfg=cfg)
+    assert result is None
+    assert broker.submitted == []
+    assert broker.canceled == []  # no protective leg touched either
+
+
 # ---------------------------------------------------------------------------
 # (e) one displacement per trading day (hard cap)
 # ---------------------------------------------------------------------------

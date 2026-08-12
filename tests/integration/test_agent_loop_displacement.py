@@ -42,20 +42,22 @@ from journal.repo import (
 )
 
 
-def _execution_cfg(*, enabled: bool) -> ExecutionConfig:
-    return ExecutionConfig(
-        broker_mode="paper",
-        ks4_pct_cap=0.15,
-        ks4_absolute_cap_usd=1000.0,
-        ks5_max_concurrent=10,
-        ks7_cash_reserve_pct=0.03,
-        sizing_mid_pct=0.07,
-        sizing_high_pct=0.10,
-        displacement_enabled=enabled,
-        displacement_min_conviction=8,
-        displacement_proceeds_haircut=0.90,
-        displacement_victim_max_gain_pct=5.0,
-    )
+def _execution_cfg(*, enabled: bool, **overrides: object) -> ExecutionConfig:
+    base: dict[str, object] = {
+        "broker_mode": "paper",
+        "ks4_pct_cap": 0.15,
+        "ks4_absolute_cap_usd": 1000.0,
+        "ks5_max_concurrent": 10,
+        "ks7_cash_reserve_pct": 0.03,
+        "sizing_mid_pct": 0.07,
+        "sizing_high_pct": 0.10,
+        "displacement_enabled": enabled,
+        "displacement_min_conviction": 8,
+        "displacement_proceeds_haircut": 0.90,
+        "displacement_victim_max_gain_pct": 5.0,
+    }
+    base.update(overrides)
+    return ExecutionConfig(**base)
 
 
 def _seed_victim_widg(db_path: str, make_filing) -> int:
@@ -188,6 +190,7 @@ async def _run_full_book_filing(
     accession: str,
     conviction: int,
     displacement_enabled: bool,
+    **exec_overrides: object,
 ):
     """Drive one ACME filing through the loop against a FULL book
     (victim WIDG + 9 fillers = 10/10 on ks5_max_concurrent=10) with cash
@@ -230,7 +233,9 @@ async def _run_full_book_filing(
 
     components = build_components(queue=queue)
     config = SimpleNamespace(
-        execution=_execution_cfg(enabled=displacement_enabled),
+        execution=_execution_cfg(
+            enabled=displacement_enabled, **exec_overrides
+        ),
         analyzer=SimpleNamespace(opus_review_conviction_threshold=7),
     )
     loop_obj = AgentLoop(
@@ -327,6 +332,48 @@ async def test_full_book_cv7_below_gate_no_displacement(
     assert len(rows) == 1
     assert rows[0]["decision"] == "rejected"
     assert rows[0]["reject_reason"] == "ks5_concurrent_limit"
+    assert fake_broker.submitted_orders == []
+
+
+@pytest.mark.asyncio
+async def test_full_book_cv7_failed_displacement_enrolls_watchlist(
+    db_path,
+    journal,
+    fake_broker,
+    fake_anthropic,
+    build_components,
+    make_filing,
+) -> None:
+    """Sibling of the cv7-below-gate test: that one pins the JOURNAL
+    half (the ks5 rejection row); this pins the ENROLLMENT half — with
+    the watchlist feature on, a full-book ks5 reject that displacement
+    declined to rescue still parks the proposal for the deferred
+    retry (`ks5_concurrent_limit` is capital-class)."""
+    from journal.repo import get_pending_watchlist
+
+    await _run_full_book_filing(
+        db_path=db_path,
+        fake_broker=fake_broker,
+        fake_anthropic=fake_anthropic,
+        build_components=build_components,
+        make_filing=make_filing,
+        accession="0001234567-26-000996",
+        conviction=7,
+        displacement_enabled=True,
+        watchlist_min_conviction=6,
+    )
+
+    rows = get_pending_watchlist(db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.symbol == "ACME"
+    assert row.conviction == 7
+    assert row.status == "pending"
+    # reference_price is the decision-time NBBO last the sizer used.
+    assert row.reference_price == pytest.approx(100.0)
+    assert "reject_reason=ks5_concurrent_limit" in (row.notes or "")
+    # Displacement declined (cv7 < min conviction 8): nothing at the
+    # broker — the enrollment is the only side effect beyond the row.
     assert fake_broker.submitted_orders == []
 
 
