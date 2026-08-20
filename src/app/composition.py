@@ -226,6 +226,10 @@ def compose_agent(
         ks4_pct_cap=config.execution.ks4_pct_cap,
         db_path=journal.db_path,
         max_output_tokens=config.analyzer.opus_max_output_tokens,
+        # Evidence symmetry — the reviewer's defensive backstop uses the
+        # same filing-body ceiling the day-0 analyzer applies. All call
+        # paths cap upstream; this guards future uncapped call sites.
+        max_input_chars=config.analyzer.analyzer_max_input_chars,
     )
 
     # Broker — the SOLE credential seam. AlpacaBroker validates

@@ -984,6 +984,17 @@ async def test_deferred_review_input_is_capped_like_day_zero(
     assert len(captured[0]) <= cap + len(marker)
     assert len(fake_broker.submitted_brackets) == 1
 
+    # Evidence symmetry — the FULL capped body reaches the Opus request's
+    # block 3 (the per-call user message), not a 2,000-char cover-page
+    # slice. The reviewer must judge the same case file the analyst read.
+    review_calls = [c for c in fake_anthropic.calls if c["purpose"] == "review"]
+    assert len(review_calls) == 1
+    block3 = "".join(
+        b.text for m in review_calls[0]["request"].messages for b in m.content
+    )
+    assert captured[0].rstrip() in block3
+    assert "TAIL_SENTINEL" not in block3
+
 
 @pytest.mark.asyncio
 async def test_below_threshold_proposals_never_pay_the_gate_snapshot(

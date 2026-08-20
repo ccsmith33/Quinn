@@ -125,14 +125,20 @@ class _FakePromptBuilder:
     calls: list[dict[str, Any]] = field(default_factory=list)
 
     def build_opus_proposal_review(
-        self, proposal: ProposalRow, source_text_summary: str
+        self, proposal: ProposalRow, source_filing_text: str
     ) -> Any:
-        self.calls.append({"proposal": proposal, "summary": source_text_summary})
+        self.calls.append(
+            {"proposal": proposal, "source_filing_text": source_filing_text}
+        )
         from prompts.loader import ApiRequest, Block, Message
 
+        # Mirror the real builder: the filing text rides in block 3 (the
+        # per-call user message), so client-side spies see what Opus sees.
         return ApiRequest(
             system=[Block(text="block1", cache_control={"type": "ephemeral"})],
-            messages=[Message(role="user", content=[Block(text="block3")])],
+            messages=[
+                Message(role="user", content=[Block(text=f"block3\n{source_filing_text}")])
+            ],
             prompt_version=self.prompt_version,
         )
 
@@ -619,3 +625,190 @@ async def test_persisted_review_row_in_journal(
     assert mods["size_pct_of_capital"] == pytest.approx(0.07)
     assert row.input_tokens == 1000
     assert row.cost_usd == pytest.approx(0.0123)
+
+
+# ---------------------------------------------------------------------------
+# Evidence symmetry — the reviewer sees the full capped filing text, not a
+# 2,000-char cover-page slice (NPK 2026-08-14 / AGPU 2026-08-17 regression).
+# ---------------------------------------------------------------------------
+
+def _make_reviewer(
+    db: str,
+    client: _FakeAnthropicClient,
+    builder: _FakePromptBuilder,
+    store: _FakeProposalStore,
+    *,
+    max_input_chars: int = 0,
+) -> Any:
+    from analyzer.opus import OpusReviewer
+
+    return OpusReviewer(
+        client=client,
+        store=store,
+        prompt_builder=builder,
+        opus_model_id="claude-opus-4-7",
+        ks4_pct_cap=0.20,
+        db_path=db,
+        max_input_chars=max_input_chars,
+    )
+
+
+@pytest.mark.asyncio
+async def test_reviewer_receives_full_capped_text_not_2k_snippet(
+    db: str, proposal: ProposalRow, filing: FilingRow
+) -> None:
+    """The full (upstream-capped) filing body must reach the Opus request.
+    An 8-K's substance lives in Exhibit 99.1, past the 2,000-char cover
+    page — the sentinel planted at ~40k chars must survive to the client
+    call, both in the builder input and in the request's block 3."""
+    from analyzer.sonnet import cap_filing_text
+
+    body = ("cover page line\n" * 200) + ("exhibit filler\n" * 2_500)
+    body += "EXHIBIT_99_1_SENTINEL: net revenue of $214.7 million\n"
+    body += "tail after sentinel\n" * 100
+    capped = cap_filing_text(body, cap=60_000, filing_id=filing.id)
+    assert len(capped) > 2_000  # the fix is meaningless otherwise
+    assert "EXHIBIT_99_1_SENTINEL" in capped
+
+    client = _FakeAnthropicClient(db_path=db, responses=[_ratify_response()])
+    store = _FakeProposalStore()
+    builder = _FakePromptBuilder()
+    reviewer = _make_reviewer(db, client, builder, store, max_input_chars=60_000)
+
+    await reviewer.review(proposal, filing, raw_text=capped)
+
+    # Builder input carries the whole capped body, not a 2k slice.
+    assert len(builder.calls) == 1
+    filing_context = builder.calls[0]["source_filing_text"]
+    assert "EXHIBIT_99_1_SENTINEL" in filing_context
+    assert capped.rstrip() in filing_context
+    # And it survives into the request the client actually sends.
+    request = client.calls[0]["request"]
+    block3 = "".join(b.text for m in request.messages for b in m.content)
+    assert "EXHIBIT_99_1_SENTINEL" in block3
+    assert capped.rstrip() in block3
+
+
+@pytest.mark.asyncio
+async def test_short_filing_passes_through_unchanged(
+    db: str, proposal: ProposalRow, filing: FilingRow
+) -> None:
+    """A filing shorter than the old 2,000-char slice is unaffected by the
+    fix — it reaches the builder verbatim."""
+    body = "Item 8.01 Other Events. Short filing body under two thousand chars."
+    client = _FakeAnthropicClient(db_path=db, responses=[_ratify_response()])
+    store = _FakeProposalStore()
+    builder = _FakePromptBuilder()
+    reviewer = _make_reviewer(db, client, builder, store, max_input_chars=60_000)
+
+    await reviewer.review(proposal, filing, raw_text=body)
+
+    filing_context = builder.calls[0]["source_filing_text"]
+    assert body in filing_context
+
+
+@pytest.mark.asyncio
+async def test_precapped_input_is_not_retruncated(
+    db: str, proposal: ProposalRow, filing: FilingRow
+) -> None:
+    """Upstream-capped text (cap + truncation marker) passes through the
+    defensive backstop byte-identical — no double truncation, no stacked
+    markers."""
+    from analyzer.sonnet import cap_filing_text, truncation_marker
+
+    cap = 20_000
+    capped = cap_filing_text("filing line\n" * 5_000, cap=cap, filing_id=filing.id)
+    assert capped.endswith(truncation_marker(cap))
+
+    client = _FakeAnthropicClient(db_path=db, responses=[_ratify_response()])
+    store = _FakeProposalStore()
+    builder = _FakePromptBuilder()
+    reviewer = _make_reviewer(db, client, builder, store, max_input_chars=cap)
+
+    await reviewer.review(proposal, filing, raw_text=capped)
+
+    filing_context = builder.calls[0]["source_filing_text"]
+    assert capped.rstrip() in filing_context
+    assert filing_context.count("[NOTE: Filing truncated") == 1
+
+
+@pytest.mark.asyncio
+async def test_defensive_cap_trims_uncapped_input(
+    db: str, proposal: ProposalRow, filing: FilingRow
+) -> None:
+    """Belt-and-braces: a call site that forgets to cap gets trimmed at the
+    wired ceiling (same helper + marker as day-0)."""
+    from analyzer.sonnet import truncation_marker
+
+    cap = 20_000
+    raw = ("uncapped filing line\n" * 3_000) + "TAIL_SENTINEL"
+    client = _FakeAnthropicClient(db_path=db, responses=[_ratify_response()])
+    store = _FakeProposalStore()
+    builder = _FakePromptBuilder()
+    reviewer = _make_reviewer(db, client, builder, store, max_input_chars=cap)
+
+    await reviewer.review(proposal, filing, raw_text=raw)
+
+    filing_context = builder.calls[0]["source_filing_text"]
+    assert "TAIL_SENTINEL" not in filing_context
+    assert truncation_marker(cap).rstrip() in filing_context
+
+
+@pytest.mark.asyncio
+async def test_unwired_cap_falls_back_to_safety_net(
+    db: str, proposal: ProposalRow, filing: FilingRow
+) -> None:
+    """With max_input_chars unwired (0), a pathological body is trimmed at
+    the generous safety-net constant rather than shipped whole."""
+    from analyzer.opus import _UNWIRED_SAFETY_CAP_CHARS
+    from analyzer.sonnet import truncation_marker
+
+    raw = "x" * (_UNWIRED_SAFETY_CAP_CHARS + 50_000) + "TAIL_SENTINEL"
+    client = _FakeAnthropicClient(db_path=db, responses=[_ratify_response()])
+    store = _FakeProposalStore()
+    builder = _FakePromptBuilder()
+    reviewer = _make_reviewer(db, client, builder, store, max_input_chars=0)
+
+    await reviewer.review(proposal, filing, raw_text=raw)
+
+    filing_context = builder.calls[0]["source_filing_text"]
+    assert "TAIL_SENTINEL" not in filing_context
+    assert truncation_marker(_UNWIRED_SAFETY_CAP_CHARS).rstrip() in filing_context
+
+
+@pytest.mark.asyncio
+async def test_retry_augmentation_preserves_full_filing_text(
+    db: str, proposal: ProposalRow, filing: FilingRow
+) -> None:
+    """The malformed-response retry appends its corrective instruction to
+    block 3 without disturbing the (now much longer) filing text."""
+    from analyzer.opus import OpusRatified
+    from analyzer.sonnet import cap_filing_text
+
+    capped = cap_filing_text(
+        ("exhibit body line\n" * 3_000) + "EXHIBIT_99_1_SENTINEL\n",
+        cap=60_000,
+        filing_id=filing.id,
+    )
+    client = _FakeAnthropicClient(
+        db_path=db, responses=["not json", _ratify_response()]
+    )
+    store = _FakeProposalStore()
+    builder = _FakePromptBuilder()
+    reviewer = _make_reviewer(db, client, builder, store, max_input_chars=60_000)
+
+    result = await reviewer.review(proposal, filing, raw_text=capped)
+    assert isinstance(result, OpusRatified)
+    assert len(client.calls) == 2
+
+    retry_request = client.calls[1]["request"]
+    retry_block3 = "".join(b.text for m in retry_request.messages for b in m.content)
+    assert "EXHIBIT_99_1_SENTINEL" in retry_block3
+    assert "[SYSTEM RETRY]" in retry_block3
+    # Correction is appended AFTER the filing text, never in place of it.
+    assert retry_block3.index("EXHIBIT_99_1_SENTINEL") < retry_block3.index(
+        "[SYSTEM RETRY]"
+    )
+    # Token/cost journaling unaffected: telemetry still round-trips.
+    assert store.reviews[0]["telemetry"].input_tokens == 1000
+    assert store.reviews[0]["telemetry"].cost_usd == pytest.approx(0.0123)

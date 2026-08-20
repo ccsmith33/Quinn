@@ -199,7 +199,7 @@ class PromptBuilder:
         )
 
     def build_opus_proposal_review(
-        self, proposal: ProposalRow, source_text_summary: str
+        self, proposal: ProposalRow, source_filing_text: str
     ) -> ApiRequest:
         ctx_summary = (
             f"decision_id={proposal.decision_id}\n"
@@ -209,7 +209,7 @@ class PromptBuilder:
         return self._build(
             name=ACTIVE_OPUS_PROPOSAL_REVIEW_PROMPT,
             block2_text=ctx_summary,
-            block3_text=self._proposal_payload(proposal, source_text_summary),
+            block3_text=self._proposal_payload(proposal, source_filing_text),
         )
 
     def build_opus_thesis_review(
@@ -466,7 +466,11 @@ class PromptBuilder:
         )
         return truncated + _FILING_BODY_TRUNCATION_MARKER
 
-    def _proposal_payload(self, proposal: ProposalRow, source_text_summary: str) -> str:
+    def _proposal_payload(self, proposal: ProposalRow, source_filing_text: str) -> str:
+        # Label says what the block IS: the filing text (capped upstream at
+        # the analyzer's input ceiling), not a summary. Block 3 is per-call
+        # and NOT part of the prompt-version hash (`_composed_system_bytes`
+        # covers system blocks only), so this label edit rolls nothing.
         return (
             f"# Proposal under review\n"
             f"symbol: {proposal.symbol}\n"
@@ -475,8 +479,8 @@ class PromptBuilder:
             f"conviction: {proposal.conviction}\n"
             f"thesis: {proposal.thesis}\n"
             f"---\n"
-            f"# Source filing summary\n"
-            f"{source_text_summary}\n"
+            f"# Source filing\n"
+            f"{source_filing_text}\n"
             f"---\n"
             f"# Original raw response\n"
             f"{proposal.raw_response}\n"

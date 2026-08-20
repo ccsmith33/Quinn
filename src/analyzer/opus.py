@@ -28,9 +28,19 @@ from journal.repo import get_llm_calls_by_decision_id
 from observability.log_port import get_logger
 from prompts.loader import ApiRequest
 
+from .sonnet import cap_filing_text, truncation_marker
 from .telemetry import CallTelemetry
 
 log = get_logger(__name__)
+
+# Belt-and-braces ceiling for the filing text handed to the reviewer when the
+# analyzer input cap is not wired (`max_input_chars=0`, feature off). Every
+# call path already caps via `cap_filing_text` before handing raw_text over
+# (sonnet day-0 `_apply_input_cap`, `AgentLoop._review_deferred_entry`,
+# `RetroFillCoordinator.run_tick`), so this only fires on a future call site
+# that forgets to. Generous by design: the reviewer must see the same case
+# file as the analyst, never a re-truncated one.
+_UNWIRED_SAFETY_CAP_CHARS = 400_000
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +122,7 @@ class _AnthropicClientPort(Protocol):
 
 class _PromptBuilderPort(Protocol):
     def build_opus_proposal_review(
-        self, proposal: ProposalRow, source_text_summary: str
+        self, proposal: ProposalRow, source_filing_text: str
     ) -> ApiRequest: ...
 
 
@@ -133,6 +143,7 @@ class OpusReviewer:
         ks4_pct_cap: float,
         db_path: str,
         max_output_tokens: int | None = None,
+        max_input_chars: int = 0,
     ) -> None:
         self._client = client
         self._store = store
@@ -142,6 +153,11 @@ class OpusReviewer:
         self._db_path = db_path
         # S5.6 carry-fwd S5.4 reviewer / D-052 — Opus per-call token cap.
         self._max_output_tokens = max_output_tokens
+        # Evidence-symmetry fix — same filing-body ceiling the day-0
+        # analyzer applies (`analyzer.analyzer_max_input_chars`). Callers
+        # already cap; this is the defensive backstop. 0 = unwired, fall
+        # back to `_UNWIRED_SAFETY_CAP_CHARS`.
+        self._max_input_chars = max_input_chars
 
     async def review(
         self,
@@ -149,8 +165,9 @@ class OpusReviewer:
         source_filing: FilingRow,
         raw_text: str,
     ) -> OpusReviewResult:
+        raw_text = self._defensive_cap(source_filing, raw_text)
         request = self._builder.build_opus_proposal_review(
-            proposal, _filing_summary(source_filing, raw_text)
+            proposal, _filing_context(source_filing, raw_text)
         )
         raw = await self._client.call(
             request,
@@ -203,6 +220,31 @@ class OpusReviewer:
             telemetry=telemetry,
         )
         return result
+
+    def _defensive_cap(self, filing: FilingRow, raw_text: str) -> str:
+        """Backstop cap on the filing text — callers cap upstream.
+
+        Every call path applies `cap_filing_text` at the analyzer's cap
+        before calling `review()`, so a properly capped body (at most
+        cap + truncation-marker length) passes through byte-identical —
+        re-capping it would truncate the upstream marker and stack a
+        second one. Only a body that exceeds cap + marker (an uncapped
+        future call site, or an unwired cap with a pathological filing)
+        gets trimmed here.
+        """
+        cap = self._max_input_chars or _UNWIRED_SAFETY_CAP_CHARS
+        if len(raw_text) <= cap + len(truncation_marker(cap)):
+            return raw_text
+        log.warning(
+            "opus.review.uncapped_input",
+            extra={
+                "event": "opus.review.uncapped_input",
+                "filing_id": filing.id,
+                "chars": len(raw_text),
+                "cap": cap,
+            },
+        )
+        return cap_filing_text(raw_text, cap=cap, filing_id=filing.id)
 
     def _read_telemetry(self, decision_id: str) -> CallTelemetry:
         rows = get_llm_calls_by_decision_id(self._db_path, decision_id)
@@ -376,13 +418,16 @@ def _augment_request_for_retry(request: ApiRequest, *, prior_error: str) -> ApiR
     )
 
 
-def _filing_summary(filing: FilingRow, raw_text: str) -> str:
-    """Compact filing summary fed into Opus's block-3 (review payload).
+def _filing_context(filing: FilingRow, raw_text: str) -> str:
+    """Filing context fed into Opus's block-3 (review payload).
 
-    Kept short: Opus reviews the proposal, not the filing in full — the
-    filing context is for cross-checking the analyst's thesis.
+    Evidence symmetry: the reviewer sees the SAME capped filing body the
+    analyzer saw (`cap_filing_text` at `analyzer_max_input_chars`), not a
+    2,000-char cover-page slice. For 8-Ks the substance usually lives in
+    Exhibit 99.1, well past 2k — a reviewer fed only the cover page rejects
+    sound proposals as "asserted, not corroborated" (NPK 2026-08-14, AGPU
+    2026-08-17). The judge must see the analyst's case file.
     """
-    snippet = raw_text[:2000].rstrip()
     return (
         f"# Source filing\n"
         f"accession_number: {filing.accession_number}\n"
@@ -391,7 +436,7 @@ def _filing_summary(filing: FilingRow, raw_text: str) -> str:
         f"filed_at: {filing.filed_at.isoformat()}\n"
         f"item_codes: {filing.item_codes or '[]'}\n"
         f"---\n"
-        f"{snippet}\n"
+        f"{raw_text.rstrip()}\n"
     )
 
 

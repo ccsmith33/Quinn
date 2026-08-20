@@ -668,15 +668,26 @@ async def test_retro_fill_skips_when_no_slack(
 async def test_retro_review_input_is_capped_like_day_zero(
     db_path: str,
     journal,
+    prompt_builder,
+    proposal_store,
+    fake_anthropic,
     tmp_path: Path,
 ) -> None:
     """Advisory #5 — retro-fill's Opus review sees the SAME capped filing
     body a day-0 analysis would have (shared `cap_filing_text` helper:
     cap applied, marker appended, over-cap tail dropped). Without this,
     every retro review shipped the full untruncated filing and the cap's
-    savings silently stopped applying off the day-0 path."""
-    from analyzer.sonnet import truncation_marker
+    savings silently stopped applying off the day-0 path.
+
+    End-to-end through the REAL OpusReviewer + PromptBuilder: the FULL
+    capped body must reach the Opus request's block 3, not a 2,000-char
+    cover-page slice (evidence-symmetry fix)."""
+    from analyzer.opus import OpusReviewer
+    from analyzer.sonnet import cap_filing_text, truncation_marker
+    from app.composition import register_composed_prompt_versions
     from app.retro_fill import RetroFillCoordinator
+
+    register_composed_prompt_versions(prompt_builder, db_path)
 
     raw_dir = tmp_path / "raw-cap"
     raw_dir.mkdir()
@@ -693,21 +704,23 @@ async def test_retro_review_input_is_capped_like_day_zero(
         created_at=now - dt.timedelta(hours=2),
     )
     cap = 20_000
-    Path(filing.raw_text_path).write_text(
-        ("material 8-K item section line\n" * 1_500) + "TAIL_SENTINEL",
-        encoding="utf-8",
+    raw_body = ("material 8-K item section line\n" * 1_500) + "TAIL_SENTINEL"
+    Path(filing.raw_text_path).write_text(raw_body, encoding="utf-8")
+
+    fake_anthropic.responses_by_purpose = {"review": [_opus_ratify_json()]}
+    reviewer = OpusReviewer(
+        client=fake_anthropic,
+        store=proposal_store,
+        prompt_builder=prompt_builder,
+        opus_model_id="claude-opus-4-7",
+        ks4_pct_cap=0.20,
+        db_path=db_path,
+        max_input_chars=cap,
     )
-
-    captured: list[str] = []
-
-    class _SpyReviewer:
-        async def review(self, proposal, source_filing, raw_text):
-            captured.append(raw_text)
-            raise RuntimeError("input captured — abort tick here")
 
     coordinator = RetroFillCoordinator(
         journal=journal,
-        opus_reviewer=_SpyReviewer(),
+        opus_reviewer=reviewer,
         ks5_max_concurrent=5,
         now_fn=lambda: now,
         max_input_chars=cap,
@@ -719,11 +732,19 @@ async def test_retro_review_input_is_capped_like_day_zero(
     coordinator.set_executor(_noop_executor)
     await coordinator.run_tick()
 
+    # The Opus request carries the capped body — whole, once, marker intact.
+    review_calls = [c for c in fake_anthropic.calls if c["purpose"] == "review"]
+    assert len(review_calls) == 1
+    block3 = "".join(
+        b.text for m in review_calls[0]["request"].messages for b in m.content
+    )
+    expected_capped = cap_filing_text(raw_body, cap=cap, filing_id=filing.id)
     marker = truncation_marker(cap)
-    assert len(captured) == 1
-    assert captured[0].endswith(marker)
-    assert "TAIL_SENTINEL" not in captured[0]
-    assert len(captured[0]) <= cap + len(marker)
+    assert expected_capped.endswith(marker)
+    assert len(expected_capped) <= cap + len(marker)
+    assert expected_capped in block3          # FULL capped body, end-to-end
+    assert "TAIL_SENTINEL" not in block3      # over-cap tail dropped
+    assert block3.count("[NOTE: Filing truncated") == 1  # no re-truncation
 
 
 # ---------------------------------------------------------------------------
